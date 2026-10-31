@@ -1,0 +1,47 @@
+[Unit]
+Description=Patchriot owned-agent relay (%i)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=patchriot-agent
+Group=patchriot-agent
+# Docker access is privileged; this account must be trusted by the host owner.
+SupplementaryGroups=docker
+ExecStart=/opt/patchriot-agent/patchriot-relay connect --state-dir /var/lib/patchriot-agent/%i --agents --agent-config /etc/patchriot-agent/%i.json
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/patchriot-agent/%i
+MemoryMax=128M
+CPUQuota=20%
+TasksMax=32
+# Loopback dispatcher/model by default. Allow the exact private model IP in a
+# local drop-in if needed. Agent containers still have network=none.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
