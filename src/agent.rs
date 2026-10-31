@@ -268,7 +268,14 @@ async fn supervise(
                                 if let Err(reason) = broker.chat(&request) {
                                     eprintln!("agent request rejected: {reason}");
                                     report.outcome = "invalid_model_request";
+                                    report.failure_reason = Some(reason);
                                     break 'running;
+                                }
+                                if request.body.as_ref()
+                                    .and_then(|body| body["max_tokens"].as_u64())
+                                    .is_some_and(|tokens| tokens > crate::inference::MAX_TOKENS)
+                                {
+                                    eprintln!("runtime output request capped at {} tokens", crate::inference::MAX_TOKENS);
                                 }
                                 report.inference_calls += 1;
                                 eprintln!("agent requested model call {}", report.inference_calls);

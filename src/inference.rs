@@ -295,11 +295,13 @@ impl Broker {
             .get("max_tokens")
             .map_or(Some(MAX_TOKENS), Value::as_u64)
             .ok_or("invalid output limit")?;
-        if !(1..=MAX_TOKENS).contains(&tokens) {
-            return Err("output limit exceeded");
+        if tokens == 0 {
+            return Err("invalid output limit");
         }
         body.remove("options");
-        body.insert("max_tokens".into(), json!(tokens));
+        // Runtime retries may request a larger completion after truncation. The
+        // relay owns the ceiling: forward a bounded request without raising it.
+        body.insert("max_tokens".into(), json!(tokens.min(MAX_TOKENS)));
         body.insert("reasoning_effort".into(), json!("none"));
         Ok(Value::Object(body))
     }
@@ -480,7 +482,7 @@ pub(crate) mod tests {
         assert!(prepared.get("options").is_none());
         for (key, value) in [
             ("model", json!("another-model")),
-            ("max_tokens", json!(193)),
+            ("max_tokens", json!(0)),
             ("max_tokens", json!(-1)),
             ("max_tokens", json!(1.2)),
             ("reasoning_effort", json!("high")),
@@ -672,6 +674,26 @@ pub(crate) mod tests {
         assert_eq!(requests[3]["body"]["max_tokens"], 128);
         assert_eq!(requests[3]["body"]["reasoning_effort"], "none");
         assert!(requests[3]["body"].get("options").is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_retries_cannot_raise_the_output_ceiling() {
+        let replies = vec![(200, "text/event-stream", b"data: [DONE]\n\n".to_vec()); 2];
+        let (origin, fixture) = server(replies);
+        let mut broker = broker();
+        broker.origin = origin;
+        for requested in [MAX_TOKENS + 1, u64::MAX] {
+            let mut request = chat();
+            request.body.as_mut().unwrap()["max_tokens"] = json!(requested);
+            let frames = collect(broker.clone(), request).await;
+            assert!(matches!(frames.last(), Some(Frame::End { .. })));
+        }
+        let requests = fixture.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request["body"]["max_tokens"], MAX_TOKENS);
+            assert_eq!(request["body"]["model"], "owned-model:pilot");
+        }
     }
 
     #[tokio::test]
