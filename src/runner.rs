@@ -108,18 +108,31 @@ impl OwnedChild {
         }
     }
 
-    fn terminate_group(&mut self) -> io::Result<()> {
+    fn terminate_group(&mut self, _deadline: Instant) -> io::Result<()> {
         if self.reaped {
             return Ok(());
         }
-        match kill_process_group(self.pid, Signal::KILL) {
+        let result = kill_process_group(self.pid, Signal::KILL);
+        // Darwin filters zombies before signaling a group. An exiting task can
+        // return EPERM just before waitid observes its exit. Retry while retaining
+        // the PID; never treat denial on a live task as confirmed cleanup.
+        #[cfg(target_os = "macos")]
+        let result = {
+            let mut result = result;
+            while result == Err(rustix::io::Errno::PERM) {
+                if self.exited()? {
+                    return Ok(());
+                }
+                if Instant::now() >= _deadline {
+                    break;
+                }
+                std::thread::sleep(POLL);
+                result = kill_process_group(self.pid, Signal::KILL);
+            }
+            result
+        };
+        match result {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            // Darwin filters zombies before signaling a group and returns EPERM
-            // when no signalable members remain. Our owned fixtures cannot change
-            // identity; require an exited leader here, and closed pipes below.
-            // This exception must not be used for arbitrary customer programs.
-            #[cfg(target_os = "macos")]
-            Err(rustix::io::Errno::PERM) if self.exited()? => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
@@ -134,8 +147,8 @@ impl OwnedChild {
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         if !self.reaped {
-            let _ = self.terminate_group();
             let deadline = Instant::now() + CLEANUP_LIMIT;
+            let _ = self.terminate_group(deadline);
             while Instant::now() < deadline {
                 match self.reap() {
                     Ok(Some(_)) | Err(_) => break,
@@ -284,8 +297,8 @@ pub fn run(
 
     // Also clean up pipe-holding descendants after a normal leader exit. This
     // covers our fixtures; hostile programs can escape groups, so need a sandbox.
-    child.terminate_group()?;
     let cleanup_started = Instant::now();
+    child.terminate_group(cleanup_started + CLEANUP_LIMIT)?;
     let mut status = None;
     while cleanup_started.elapsed() < CLEANUP_LIMIT {
         if status.is_none() {
