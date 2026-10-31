@@ -6,7 +6,7 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
-**Working today:** pairing, manual approval, presence, pause/resume, revocation and queued checks of an owned example. Choose fast fixture tests or an isolated Hermes agent using your local model. Customer targets are not accepted.
+**Working today:** pairing, approval, presence, local controls and queued checks of an owned example. An additional opt-in accepts private website snapshots for offline review. Hermes uses your local model inside an isolated container; active target testing is not enabled.
 
 ## Try the owned example
 
@@ -52,15 +52,15 @@ With **three approved devices** connected in the same mode, choose **Reviews →
 
 Results are saved locally before submission and retried after connection loss. Agent leases renew while healthy, with a fixed ten-minute ceiling per attempt and 35-minute review deadline. The relay uses a monotonic clock, reserves time for shutdown and stops when it cannot renew. Server cancellation is checked during renewal; it is not an instantaneous push. Local signals interrupt a running agent directly.
 
-Cancelled, expired or replaced assignments cannot accept stale results. Restarting an agent connection first removes that device's labelled leftover containers. A runner/configuration error stops the agent connection for inspection. The state directory keeps one private `last-agent-check.json` (at most 2 MiB), overwritten on each completed or interrupted check, to diagnose tool failures. Keep state directories out of Git and shared backups.
+Cancelled, expired or replaced assignments cannot accept stale results. Restarting an agent connection first removes that device's labelled leftover containers. A runner/configuration error stops the agent connection for inspection. For owned examples, the state directory keeps one private `last-agent-check.json` (at most 2 MiB) for diagnosis. Website snapshots and their tool transcripts are not written to that file. A bounded pending report is saved until acknowledged. Keep state directories out of Git and shared backups.
 
 ## Execution boundary
 
 The current runner clears inherited environment, uses a temporary directory and limits each fixture to **3 seconds and 8 KiB of combined output**. It terminates its process group on timeout or cancellation.
 
-**Fixture mode** uses process supervision and accepts only compiled-in examples. **Agent mode** uses the container boundary below; it never falls back to host execution. The server supplies only the known scenario and lease. The operator controls the pinned image and local model endpoint.
+**Fixture mode** uses process supervision and accepts only compiled-in examples. **Agent mode** uses the container boundary below; it never falls back to host execution. The server supplies a known scenario, lease and—only with explicit opt-in—a saved website snapshot. The operator controls the pinned image and local model endpoint.
 
-Private customer work will require approved operators and tested isolation. Assigned operators and permitted model providers can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
+Private work requires separate operator approval and requester consent. Assigned operators can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
 
 <details>
 <summary><strong>Test the sandbox (operators)</strong></summary>
@@ -108,7 +108,7 @@ The operator's configuration has five fields; replace the example image and mode
 
 Use an Ollama model that supports tools and a 64,000-token context. Its **stored model profile** must set `num_ctx 64000`; the compatible API does not apply that setting from chat requests. Inspect `/api/tags` for the digest and `/api/show` for the parameters. The relay checks both before starting. Keep the model server private, reachable only from the relay; the model URL accepts explicit loopback/private IPv4 addresses. This verifies the server's declaration, not remotely attested weights.
 
-After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept website requests. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
+After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept owned-example checks submitted through the website. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
 
 **Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
 
@@ -117,6 +117,20 @@ Configure the model server's separate CPU/RAM limits as well; the limits above c
 If the runtime retries with a larger output request, the relay caps it at 192 tokens. Retries still count toward the four-call and time limits; the runtime cannot raise those limits. A truncated or missing tool result remains unresolved.
 
 </details>
+
+## Opt in to private website reviews
+
+First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review requires adapter version 2; older images cannot opt in.
+
+```sh
+cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --website-reviews
+```
+
+An admin must allow **private reviews** for the device. The requester then selects three exact devices, sees their operators and declared models, and consents to sharing one snapshot and the earlier reports. This flag does not bypass those permissions. Shared machines run sequentially and remain labelled as shared infrastructure.
+
+The relay downloads evidence only for its active lease, checks its hash and sends bounded data through the container's stdin. Saved HTML/scripts are inspected as text; there is no browsing, target networking or host execution. Snapshot files live in container temporary storage and disappear with cleanup. Operators can see plaintext, so only accept data you are permitted to process.
+
+Each role gets at most four model calls, 512 output tokens per call and ten minutes. Later roles inspect earlier claims; no live exploit or patch test is implied. The server checks quotations against the original snapshot. **A complete report is not a security certificate.** Invalid reports and unsupported quotations remain unresolved. Removing private approval stops affected reviews; it cannot recall information already seen.
 
 ## Check the controls
 

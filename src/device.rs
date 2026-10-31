@@ -19,6 +19,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 type Error = Box<dyn std::error::Error>;
+// Includes one pending structured result. Never store the website snapshot here.
+const MAX_STATE: u64 = 128 * 1024;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -67,7 +69,7 @@ fn state_lock(directory: &Path) -> Result<File, Error> {
 
 fn read_config(directory: &Path) -> Result<Config, Error> {
     let file = private_open(&directory.join("relay.json"), false)?;
-    if file.metadata()?.len() > 16 * 1024 {
+    if file.metadata()?.len() > MAX_STATE {
         return Err("state file too large".into());
     }
     let config: Config = serde_json::from_reader(file)?;
@@ -80,11 +82,15 @@ fn read_config(directory: &Path) -> Result<Config, Error> {
 }
 
 fn write_config(directory: &Path, config: &Config) -> Result<(), Error> {
+    let bytes = serde_json::to_vec_pretty(config)?;
+    if bytes.len() as u64 + 1 > MAX_STATE {
+        return Err("state file too large".into());
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
-    serde_json::to_writer_pretty(&mut temporary, config)?;
+    temporary.write_all(&bytes)?;
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary.persist(directory.join("relay.json"))?;
@@ -165,6 +171,17 @@ fn post<T: Serialize, R: DeserializeOwned>(
     path: &str,
     payload: T,
 ) -> Result<R, Error> {
+    post_with_limit(client, config, key, path, payload, 16 * 1024)
+}
+
+fn post_with_limit<T: Serialize, R: DeserializeOwned>(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    key: &DeviceKey,
+    path: &str,
+    payload: T,
+    maximum: u64,
+) -> Result<R, Error> {
     let signed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs()
@@ -183,8 +200,8 @@ fn post<T: Serialize, R: DeserializeOwned>(
     }
     // Treat even a configured server's output as bounded input; redirects are disabled.
     let mut bytes = Vec::new();
-    response.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 16 * 1024 {
+    response.take(maximum + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum {
         return Err("dispatcher response exceeded limit".into());
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -391,7 +408,7 @@ fn send_result(directory: &Path, client: &reqwest::blocking::Client) -> Result<(
             }
             println!(
                 "{}",
-                serde_json::json!({"event":if result.result.mode().is_fixture() { "fixture_result_accepted" } else { "agent_result_accepted" },"mode":result.result.mode(),"lease_id":result.lease_id,"fixture_matches":accepted.fixture_matches,"replayed":accepted.replayed})
+                serde_json::json!({"event":if result.result.mode().is_fixture() { "fixture_result_accepted" } else { "agent_result_accepted" },"mode":result.result.mode(),"lease_id":result.lease_id,"fixture_matches":accepted.fixture_matches,"evidence_complete":accepted.evidence_complete,"replayed":accepted.replayed})
             );
             clear_assignment(directory)?;
         }
@@ -415,6 +432,7 @@ fn work_tick(
     client: &reqwest::blocking::Client,
     stop: &Arc<AtomicBool>,
     agent: Option<&crate::agent::Settings>,
+    website_reviews: bool,
 ) -> Result<(), Error> {
     send_result(directory, client)?;
     let (config, key) = {
@@ -439,13 +457,32 @@ fn work_tick(
         &format!("/v1/devices/{id}/work/poll"),
         WorkPoll {
             sequence: config.work_sequence,
+            website_reviews,
         },
     )?;
     let Some(assignment) = reply.assignment else {
         clear_assignment(directory)?;
         return Ok(());
     };
-    if (assignment.mode == ReviewMode::OwnedAgent) != agent.is_some() {
+    let allowed = match assignment.mode {
+        ReviewMode::OwnedFixture => {
+            agent.is_none()
+                && assignment.scenario == FixtureScenario::AccessControlV1
+                && assignment.website.is_none()
+        }
+        ReviewMode::OwnedAgent => {
+            agent.is_some()
+                && assignment.scenario == FixtureScenario::AccessControlV1
+                && assignment.website.is_none()
+        }
+        ReviewMode::WebsiteAgent => {
+            agent.is_some()
+                && website_reviews
+                && assignment.scenario == FixtureScenario::WebsiteSnapshotV1
+                && assignment.website.is_some()
+        }
+    };
+    if !allowed {
         return Err("assignment mode does not match the opted-in local runtime".into());
     }
     {
@@ -657,6 +694,25 @@ fn agent_work(
         });
         let stop_monitor = StopMonitor(&done);
         let result = (|| {
+            let website = if let Some(website) = &assignment.website {
+                let saved = post_with_limit(
+                    client,
+                    &config,
+                    &read_key(directory)?,
+                    &format!("/v1/devices/{device_id}/work/evidence"),
+                    patchriot_protocol::website_reviews::ReadWorkEvidence {
+                        lease_id: assignment.lease_id,
+                    },
+                    5 * 1024 * 1024,
+                )?;
+                Some(crate::agent::website::Task {
+                    role: assignment.role,
+                    snapshot_sha256: website.snapshot_sha256.clone(),
+                    evidence: saved,
+                })
+            } else {
+                None
+            };
             let check = crate::agent::run(
                 settings,
                 Some(crate::agent::Assignment {
@@ -664,11 +720,14 @@ fn agent_work(
                     lease_id: assignment.lease_id,
                     declared_model,
                 }),
+                website.as_ref(),
                 &|| stop.load(Ordering::Relaxed) || window.stopped_at(Instant::now()),
             )?;
             // Keep one bounded private trace for operator diagnosis. It is never
             // printed or sent to the website; only typed observations are sent.
-            write_agent_report(directory, &check.report)?;
+            if let Some(report) = &check.report {
+                write_agent_report(directory, report)?;
+            }
             if stop.load(Ordering::Relaxed)
                 || window.stopped_at(Instant::now())
                 || !locally_ready(directory, assignment.lease_id)
@@ -682,7 +741,7 @@ fn agent_work(
                 let mut latest = read_config(directory)?;
                 latest.pending_result = Some(CompleteWork {
                     lease_id: assignment.lease_id,
-                    result: WorkResult::Agent(check.result),
+                    result: check.result,
                 });
                 write_config(directory, &latest)?;
             }
@@ -708,6 +767,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
     let mut once = false;
     let mut fixtures = false;
     let mut agents = false;
+    let mut website_reviews = false;
     let mut args = args[1..].iter();
     while let Some(name) = args.next() {
         if name == "--once" && action == "connect" && !once {
@@ -720,6 +780,10 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
         }
         if name == "--agents" && action == "connect" && !agents {
             agents = true;
+            continue;
+        }
+        if name == "--website-reviews" && action == "connect" && !website_reviews {
+            website_reviews = true;
             continue;
         }
         let allowed = name == "--state-dir"
@@ -772,7 +836,10 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             );
         }
         "connect" => {
-            if fixtures && agents || agents != options.contains_key("--agent-config") {
+            if fixtures && agents
+                || agents != options.contains_key("--agent-config")
+                || website_reviews && !agents
+            {
                 return Err(
                     "choose --fixtures or --agents --agent-config PATH; each is explicit opt-in"
                         .into(),
@@ -790,6 +857,12 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                 .get("--agent-config")
                 .map(|path| crate::agent::Settings::load(Path::new(path)))
                 .transpose()?;
+            if website_reviews {
+                settings
+                    .as_ref()
+                    .ok_or("website reviews require an agent configuration")?
+                    .require_website_adapter()?;
+            }
             let daemon_lock = private_open(&directory.join("daemon.lock"), true)?;
             daemon_lock
                 .try_lock()
@@ -816,7 +889,13 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                             crate::agent::recover(settings, id)?;
                             recovered = true;
                         }
-                        work_tick(&directory, &client, &stop, settings.as_ref())?;
+                        work_tick(
+                            &directory,
+                            &client,
+                            &stop,
+                            settings.as_ref(),
+                            website_reviews,
+                        )?;
                     }
                     Ok(())
                 });
@@ -857,6 +936,35 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_website_outbox_survives_restart_and_oversized_writes_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let finding = serde_json::json!({"title":"Observed fixture", "support":"needs_live_test", "explanation":"x".repeat(1200), "suggested_action":"x".repeat(800), "citations":[{"resource_sha256":"a".repeat(64),"quote":"x".repeat(300)}]});
+        let result = serde_json::json!({"kind":"website_agent_v1", "execution":{"state":"completed", "declared_model":"local", "model":"local", "model_digest":"a".repeat(64), "image_digest":format!("sha256:{}","b".repeat(64)), "duration_ms":1000,"inference_calls":2,"terminal_calls":1,"cleanup_confirmed":true},"snapshot_sha256":"c".repeat(64),"inspected_snapshot_sha256":"c".repeat(64),"assessment":{"summary":"x".repeat(1200),"findings":[finding.clone(),finding.clone(),finding],"limitations":["x".repeat(500),"x".repeat(500),"x".repeat(500),"x".repeat(500),"x".repeat(500)]},"raw_summary":"\"".repeat(4000)});
+        let mut config: Config = serde_json::from_value(serde_json::json!({"schema_version":1,"dispatcher":"https://dispatcher.invalid/","audience":"test","introduction":{"label":"Owned fixture","runtime":"hermes","runtime_version":"test","declared_model":"local","compute_group":"shared","slots":1},"pairing_id":null,"device_id":Uuid::nil(),"sequence":1,"paused":false,"active_assignment":null,"pending_result":{"lease_id":Uuid::nil(),"result":result}})).unwrap();
+        let WorkResult::Website(pending) = &config.pending_result.as_ref().unwrap().result else {
+            panic!("wrong result");
+        };
+        assert!(pending.valid());
+        write_config(directory.path(), &config).unwrap();
+        let path = directory.path().join("relay.json");
+        let before = fs::read(&path).unwrap();
+        assert!(before.len() > 16 * 1024);
+        assert!(
+            read_config(directory.path())
+                .unwrap()
+                .pending_result
+                .is_some()
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        config.introduction.label = "x".repeat(MAX_STATE as usize);
+        assert!(write_config(directory.path(), &config).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn lease_time_excludes_transit_and_late_replies_cannot_revive_expired_work() {

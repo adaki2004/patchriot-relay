@@ -48,6 +48,7 @@ pub struct Broker {
     show: Value,
     tags: Value,
     version: Value,
+    max_tokens: u64,
 }
 
 pub fn origin(value: &str) -> Result<String, &'static str> {
@@ -100,6 +101,16 @@ async fn bounded_json(mut response: reqwest::Response) -> Result<Value, &'static
 }
 
 impl Broker {
+    /// A small structured website report needs more space than the two-sentence
+    /// example. Neither the server nor the model may choose this ceiling.
+    pub fn website_budget(mut self) -> Self {
+        self.max_tokens = 512;
+        self
+    }
+
+    pub fn max_tokens(&self) -> u64 {
+        self.max_tokens
+    }
     /// A serving profile may retain the original model name as its parent.
     /// This catches accidental configuration swaps, not a dishonest model server.
     pub fn matches_declaration(&self, declared: &str) -> bool {
@@ -186,6 +197,7 @@ impl Broker {
             show: json!({"model_info":show["model_info"],"parameters":show["parameters"],"capabilities":show["capabilities"],"details":show["details"]}),
             tags: json!({"models":[tag]}),
             version: json!({"version":version["version"]}),
+            max_tokens: MAX_TOKENS,
         })
     }
 
@@ -293,7 +305,7 @@ impl Broker {
         }
         let tokens = body
             .get("max_tokens")
-            .map_or(Some(MAX_TOKENS), Value::as_u64)
+            .map_or(Some(self.max_tokens), Value::as_u64)
             .ok_or("invalid output limit")?;
         if tokens == 0 {
             return Err("invalid output limit");
@@ -301,7 +313,7 @@ impl Broker {
         body.remove("options");
         // Runtime retries may request a larger completion after truncation. The
         // relay owns the ceiling: forward a bounded request without raising it.
-        body.insert("max_tokens".into(), json!(tokens.min(MAX_TOKENS)));
+        body.insert("max_tokens".into(), json!(tokens.min(self.max_tokens)));
         body.insert("reasoning_effort".into(), json!("none"));
         Ok(Value::Object(body))
     }
@@ -437,6 +449,7 @@ pub(crate) mod tests {
             show: json!({}),
             tags: json!({}),
             version: json!({}),
+            max_tokens: MAX_TOKENS,
         }
     }
     #[test]
@@ -447,6 +460,16 @@ pub(crate) mod tests {
         broker.show = json!({"details":{"parent_model":"owned-base:small"}});
         assert!(broker.matches_declaration("owned-base:small"));
         assert!(!broker.matches_declaration("owned-base:large"));
+    }
+    #[test]
+    fn website_budget_is_explicit_and_runtime_cannot_increase_it() {
+        let mut request = chat();
+        request.body.as_mut().unwrap()["max_tokens"] = json!(u64::MAX);
+        assert_eq!(broker().chat(&request).unwrap()["max_tokens"], 192);
+        assert_eq!(
+            broker().website_budget().chat(&request).unwrap()["max_tokens"],
+            512
+        );
     }
     fn chat() -> Request {
         Request {

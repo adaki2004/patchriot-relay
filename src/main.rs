@@ -1,5 +1,4 @@
-//! Pairing, owned fixtures and an explicit sandboxed local-agent check.
-//! Customer targets are not accepted by this prototype.
+//! Pairing, owned fixtures and opt-in isolated agent reviews of saved evidence.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("The fixture runner currently supports Linux and macOS only.");
@@ -25,7 +24,7 @@ patchriot-relay init --state-dir PATH --dispatcher URL --audience NAME --label N
   [--runtime hermes --runtime-version VERSION --model MODEL]
 patchriot-relay pair --state-dir PATH
 patchriot-relay connect --state-dir PATH [--once] [--fixtures]
-patchriot-relay connect --state-dir PATH --agents --agent-config PATH [--once]
+patchriot-relay connect --state-dir PATH --agents --agent-config PATH [--once] [--website-reviews]
 patchriot-relay status --state-dir PATH
 patchriot-relay pause --state-dir PATH
 patchriot-relay resume --state-dir PATH

@@ -2,12 +2,16 @@
 import http.client
 import io
 import json
+import hashlib
+from pathlib import Path
+import tempfile
 import sys
 import threading
 import unittest
 from unittest.mock import patch
 
 import adapter
+import inspect_site
 
 
 class BridgeTests(unittest.TestCase):
@@ -65,6 +69,50 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 adapter.event("result", text="x" * adapter.MAX_REQUEST)
         self.assertEqual(json.loads(wire.getvalue()), {"type": "event", "event": "phase", "data": {"name": "agent_ready"}})
+
+
+class WebsiteTests(unittest.TestCase):
+    def snapshot(self):
+        return {"homepage": {"kind": "homepage", "url": "https://example.com/", "sha256": "a" * 64,
+                             "headers": {"content-security-policy": "default-src 'self'"},
+                             "text": "<h1>Owned fixture é</h1>"}, "resources": [], "scripts": [],
+                "script_limit_reached": False}
+
+    def task(self):
+        snapshot = json.dumps(self.snapshot(), ensure_ascii=False, separators=(",", ":"))
+        return {"kind": "website_snapshot_v1", "role": "investigator", "snapshot_json": snapshot,
+                "snapshot_sha256": hashlib.sha256(snapshot.encode()).hexdigest(), "previous_reports": []}
+
+    def test_initial_frame_preserves_exact_evidence_bytes_and_leaves_model_frames_unread(self):
+        task = self.task()
+        stream = io.BytesIO(json.dumps(task).encode() + b'\n{"id":1}\n')
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(adapter.website_input(stream, Path(folder)), "investigator")
+            self.assertEqual((Path(folder) / "snapshot.json").read_bytes(), task["snapshot_json"].encode())
+            self.assertEqual(stream.readline(), b'{"id":1}\n')
+
+    def test_corrupt_or_unsupported_input_is_not_written(self):
+        for field, value in [("snapshot_sha256", "0" * 64), ("kind", "shell"), ("role", "admin")]:
+            task = self.task()
+            task[field] = value
+            with tempfile.TemporaryDirectory() as folder:
+                with self.assertRaises(ValueError):
+                    adapter.website_input(io.BytesIO(json.dumps(task).encode() + b"\n"), Path(folder))
+                self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_inspector_treats_target_code_as_text_and_discloses_shortened_coverage(self):
+        snapshot = self.snapshot()
+        snapshot["homepage"]["text"] = "raise RuntimeError('must not execute target')" + "é" * 4000
+        snapshot["resources"] = [dict(snapshot["homepage"], kind="external_script") for _ in range(8)]
+        snapshot["scripts"] = [{"status": "skipped"}]
+        raw = json.dumps(snapshot, ensure_ascii=False).encode()
+        report = json.loads(inspect_site.inspect(raw, [{"role": "investigator", "evidence_complete": False, "assessment": {"summary": "Untrusted previous claim."}}]))
+        self.assertEqual(report["snapshot_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(report["omitted_resources"], 3)
+        self.assertEqual(report["skipped_scripts"], 1)
+        self.assertTrue(report["resources"][0]["excerpt_truncated"])
+        self.assertIn("must not execute target", report["resources"][0]["excerpt"])
+        self.assertFalse(report["previous_reports"][0]["evidence_complete"])
 
 
 if __name__ == "__main__":

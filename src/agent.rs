@@ -6,7 +6,9 @@ use crate::{
     inference::{Broker, Frame, MAX_REQUEST, Request},
     process::Outcome,
 };
-use patchriot_protocol::{AgentFixtureObservation, AgentOutcome, AgentResult, AgentResultKind};
+use patchriot_protocol::{
+    AgentFixtureObservation, AgentOutcome, AgentResult, AgentResultKind, WorkResult,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -24,6 +26,8 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+
+pub mod website;
 
 const IMAGE_ENTRY: [&str; 2] = ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"];
 const TMPFS: [(&str, &str); 3] = [
@@ -52,6 +56,16 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub fn require_website_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let docker = Docker::new(&self.docker_socket)?;
+        let image = docker.inspect("image", &self.image)?;
+        if image["Id"] != self.image
+            || image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "2"
+        {
+            return Err("website reviews require the pinned version 2 agent adapter image".into());
+        }
+        Ok(())
+    }
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let mut bytes = Vec::new();
         std::fs::File::open(path)?
@@ -77,8 +91,10 @@ pub struct Assignment<'a> {
 }
 
 pub struct Check {
-    pub result: AgentResult,
-    pub report: Value,
+    pub result: WorkResult,
+    /// Detailed traces are retained only for the bundled owned example. Customer
+    /// snapshots and tool transcripts are not saved to a relay diagnostic file.
+    pub report: Option<Value>,
 }
 
 /// Remove only this device's labelled leftovers before polling after a restart.
@@ -162,6 +178,7 @@ async fn supervise(
     broker: Broker,
     cancelled: &impl Fn() -> bool,
     timeout: Duration,
+    input: Option<Vec<u8>>,
 ) -> io::Result<AgentRun> {
     if cancelled() {
         return Ok(AgentRun {
@@ -180,6 +197,21 @@ async fn supervise(
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("missing agent input"))?;
+    if let Some(input) = input {
+        // The adapter consumes one bounded frame before starting its model bridge.
+        // This carries data, never a shell command or a host-mounted file.
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), stdin.write_all(&input)).await,
+            Ok(Ok(()))
+        ) {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            return Ok(AgentRun {
+                outcome: "agent_input_stalled",
+                ..AgentRun::default()
+            });
+        }
+    }
     let mut stdout = child
         .stdout
         .take()
@@ -273,9 +305,9 @@ async fn supervise(
                                 }
                                 if request.body.as_ref()
                                     .and_then(|body| body["max_tokens"].as_u64())
-                                    .is_some_and(|tokens| tokens > crate::inference::MAX_TOKENS)
+                                    .is_some_and(|tokens| tokens > broker.max_tokens())
                                 {
-                                    eprintln!("runtime output request capped at {} tokens", crate::inference::MAX_TOKENS);
+                                    eprintln!("runtime output request capped at {} tokens", broker.max_tokens());
                                 }
                                 report.inference_calls += 1;
                                 eprintln!("agent requested model call {}", report.inference_calls);
@@ -355,7 +387,7 @@ async fn supervise(
     Ok(report)
 }
 
-fn policy(container: &Value, image: &str, model: &str) -> bool {
+fn policy(container: &Value, image: &str, args: &[&str]) -> bool {
     let h = &container["HostConfig"];
     let c = &container["Config"];
     container["Image"] == image
@@ -400,7 +432,7 @@ fn policy(container: &Value, image: &str, model: &str) -> bool {
         && c["User"] == "65534:65534"
         && c["WorkingDir"] == "/work"
         && c["Entrypoint"] == json!(IMAGE_ENTRY)
-        && c["Cmd"] == json!([model])
+        && c["Cmd"] == json!(args)
         && c["Tty"] == false
         && c["OpenStdin"] == true
 }
@@ -413,7 +445,7 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
-    let check = run(&settings, None, &|| cancelled.load(Ordering::Relaxed))?;
+    let check = run(&settings, None, None, &|| cancelled.load(Ordering::Relaxed))?;
     serde_json::to_writer_pretty(io::stdout().lock(), &check.report)?;
     println!();
     Ok(u8::from(!check.result.matches_fixture()))
@@ -422,6 +454,7 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
 pub fn run(
     settings: &Settings,
     assignment: Option<Assignment<'_>>,
+    website: Option<&website::Task>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Check, Box<dyn std::error::Error>> {
     if cancelled() {
@@ -433,7 +466,12 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "1"
+        || !["1", "2"].contains(
+            &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
+                .as_str()
+                .unwrap_or(""),
+        )
+        || website.is_some() && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "2"
         || !no_entries(&image["Config"]["OnBuild"])
         || !no_entries(&image["Config"]["Healthcheck"])
     {
@@ -447,6 +485,16 @@ pub fn run(
         &settings.model,
         &settings.model_digest,
     ))?;
+    let broker = if website.is_some() {
+        broker.website_budget()
+    } else {
+        broker
+    };
+    let input = website.map(website::Task::input).transpose()?;
+    let mut args = vec![settings.model.as_str()];
+    if website.is_some() {
+        args.push("--website");
+    }
     if let Some(assignment) = &assignment
         && !broker.matches_declaration(assignment.declared_model)
     {
@@ -520,7 +568,7 @@ pub fn run(
         command.extend(["--tmpfs".into(), format!("{path}:{options}")]);
     }
     command.push(settings.image.clone());
-    command.push(settings.model.clone());
+    command.extend(args.iter().map(|arg| (*arg).to_owned()));
     let result = (|| -> Result<_, Box<dyn std::error::Error>> {
         if docker
             .control(&command.iter().map(String::as_str).collect::<Vec<_>>())?
@@ -532,7 +580,7 @@ pub fn run(
         if !policy(
             &docker.inspect("container", &owned.name)?,
             &settings.image,
-            &settings.model,
+            &args,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -547,6 +595,7 @@ pub fn run(
             broker,
             cancelled,
             Duration::from_secs(600),
+            input,
         ))?;
         if report.outcome != "completed" {
             let _ = docker.control(&["container", "kill", &owned.name]);
@@ -559,7 +608,7 @@ pub fn run(
             && state["State"]["OOMKilled"] == false
             && report.events.iter().any(|e| {
                 e["event"] == "result"
-                    && e["data"]["observed_fixture_regression"] == true
+                    && (website.is_some() || e["data"]["observed_fixture_regression"] == true)
                     && e["data"]["completed"] == true
             });
         Ok((report, stopped, state["State"]["OOMKilled"].clone(), passed))
@@ -569,6 +618,23 @@ pub fn run(
         return Err("agent cleanup could not be confirmed; inspect containers labelled io.patchriot.agent-check=1".into());
     }
     let (report, stopped, oom, passed) = result?;
+    if let Some(task) = website {
+        let result = website::evidence(
+            &report,
+            settings,
+            assignment.as_ref().map(|a| a.declared_model),
+            task,
+            passed,
+            cleanup,
+        );
+        if !result.valid() {
+            return Err("website evidence exceeded the report limits".into());
+        }
+        return Ok(Check {
+            result: WorkResult::Website(result),
+            report: None,
+        });
+    }
     let evidence = evidence(
         &report,
         settings,
@@ -580,8 +646,10 @@ pub fn run(
         return Err("agent evidence exceeded the report limits".into());
     }
     Ok(Check {
-        report: json!({"schema_version":1,"mode":"owned_agent_check","evidence_source":"agent_reported_owned_example_not_independent_verification","container":owned.name,"model":settings.model,"model_digest":settings.model_digest,"image":settings.image,"policy_verified":true,"network":"none; bounded model requests over pipes","container_stopped":stopped,"oom_killed":oom,"cleanup_confirmed":cleanup,"passed":evidence.matches_fixture(),"run":report}),
-        result: evidence,
+        report: Some(
+            json!({"schema_version":1,"mode":"owned_agent_check","evidence_source":"agent_reported_owned_example_not_independent_verification","container":owned.name,"model":settings.model,"model_digest":settings.model_digest,"image":settings.image,"policy_verified":true,"network":"none; bounded model requests over pipes","container_stopped":stopped,"oom_killed":oom,"cleanup_confirmed":cleanup,"passed":evidence.matches_fixture(),"run":report}),
+        ),
+        result: WorkResult::Agent(evidence),
     })
 }
 
@@ -667,7 +735,7 @@ fn evidence(
 mod tests {
     use super::*;
 
-    fn settings() -> Settings {
+    pub(super) fn settings() -> Settings {
         Settings {
             docker_socket: "/var/run/docker.sock".into(),
             image: format!("sha256:{}", "b".repeat(64)),
@@ -741,6 +809,7 @@ mod tests {
             crate::inference::tests::broker(),
             &|| cancelled.load(Ordering::Relaxed),
             timeout,
+            None,
         )
         .await
         .unwrap()
@@ -828,7 +897,7 @@ mod tests {
     }
     #[test]
     fn docker_configuration_must_preserve_the_execution_boundary() {
-        assert!(policy(&container(), "owned-image", "owned-model"));
+        assert!(policy(&container(), "owned-image", &["owned-model"]));
         for (pointer, value) in [
             ("/HostConfig/NetworkMode", json!("host")),
             ("/HostConfig/ReadonlyRootfs", json!(false)),
@@ -844,14 +913,14 @@ mod tests {
             let mut value_container = container();
             *value_container.pointer_mut(pointer).unwrap() = value;
             assert!(
-                !policy(&value_container, "owned-image", "owned-model"),
+                !policy(&value_container, "owned-image", &["owned-model"]),
                 "{pointer}"
             );
         }
         for key in ["Binds", "Devices", "CapAdd", "PortBindings"] {
             let mut value = container();
             value["HostConfig"][key] = json!(["unexpected"]);
-            assert!(!policy(&value, "owned-image", "owned-model"), "{key}");
+            assert!(!policy(&value, "owned-image", &["owned-model"]), "{key}");
         }
     }
 }
