@@ -542,8 +542,8 @@ pub fn run(
         &settings.model_digest,
         settings.max_attempt_seconds,
     ))?;
-    let broker = if website.is_some() {
-        broker.for_website_review()
+    let broker = if let Some(task) = website {
+        broker.for_website_review(&task.evidence.snapshot)
     } else {
         broker
     };

@@ -176,7 +176,12 @@ mod tests {
 
     #[test]
     fn prose_alone_wrong_commands_and_fabricated_quotes_do_not_complete_evidence() {
-        let task = task();
+        let mut task = task();
+        let mut other = task.evidence.snapshot.homepage.clone();
+        other.sha256 = "e".repeat(64);
+        other.text = "different resource".into();
+        task.evidence.snapshot.resources.push(other);
+        task.snapshot_sha256 = snapshot_hash(&task.evidence.snapshot).unwrap();
         let settings = super::super::tests::settings();
         let assessment = json!({"summary":"Observed saved page text.","findings":[{"title":"Page content", "support":"observed_in_snapshot", "explanation":"Text appears in the snapshot.", "suggested_action":"Inspect runtime behavior separately.", "citations":[{"resource_sha256":"d".repeat(64),"quote":"owned é"}]}],"limitations":["No browser execution or exploit reproduction."]});
         let mut run = AgentRun {
@@ -216,6 +221,14 @@ mod tests {
         let result = evidence(&run, &settings, None, &task, true, true);
         assert!(result.assessment.is_some());
         assert!(!result.evidence_complete(&task.evidence.snapshot));
+        // Even a hash from the permitted generation choices is insufficient:
+        // the quotation must occur in that particular captured resource.
+        fake["findings"][0]["citations"][0]["resource_sha256"] = json!("e".repeat(64));
+        run.events[1]["data"]["final_response"] = json!(fake.to_string());
+        assert!(
+            !evidence(&run, &settings, None, &task, true, true)
+                .evidence_complete(&task.evidence.snapshot)
+        );
         let mut fake = assessment;
         fake["findings"][0]["citations"][0]["quote"] = json!("invented");
         run.events[1]["data"]["final_response"] = json!(fake.to_string());

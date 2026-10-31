@@ -1,9 +1,10 @@
 //! A per-run inference boundary. The agent has no network: it asks over its
 //! pipes. Only the configured local model and a few read-only probes are served.
 
+use patchriot_protocol::websites::WebsiteSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{net::IpAddr, time::Duration};
+use std::{collections::BTreeSet, net::IpAddr, time::Duration};
 use tokio::sync::mpsc;
 
 pub const MAX_REQUEST: usize = 65_536;
@@ -104,7 +105,14 @@ pub struct Broker {
 
 /// Generation guidance, not evidence validation. A model can produce this shape
 /// with invented claims or quotations; the normal result checks still apply.
-fn website_response_format() -> Value {
+fn website_response_format(snapshot: &WebsiteSnapshot) -> Value {
+    // The model selects a captured resource instead of inventing or copying a
+    // 64-character identifier. Only hashes enter the schema, never target text
+    // or earlier agents' claims. Exact quote/source checks remain authoritative.
+    let resource_hashes: BTreeSet<_> = std::iter::once(&snapshot.homepage)
+        .chain(&snapshot.resources)
+        .map(|resource| resource.sha256.as_str())
+        .collect();
     json!({
         "type": "json_schema",
         "json_schema": {
@@ -131,7 +139,7 @@ fn website_response_format() -> Value {
                                         "type": "object", "additionalProperties": false,
                                         "required": ["resource_sha256", "quote"],
                                         "properties": {
-                                            "resource_sha256": {"type": "string"},
+                                            "resource_sha256": {"type": "string", "enum": resource_hashes},
                                             "quote": {"type": "string"}
                                         }
                                     }
@@ -198,9 +206,9 @@ async fn bounded_json(mut response: reqwest::Response) -> Result<Value, &'static
 impl Broker {
     /// Website reports use a fixed format and need more space than the
     /// two-sentence example. The runtime cannot change the schema or ceiling.
-    pub fn for_website_review(mut self) -> Self {
+    pub fn for_website_review(mut self, snapshot: &WebsiteSnapshot) -> Self {
         self.max_tokens = 512;
-        self.response_format = Some(website_response_format());
+        self.response_format = Some(website_response_format(snapshot));
         self
     }
 
@@ -620,6 +628,19 @@ pub(crate) mod tests {
             response_format: None,
         }
     }
+    fn snapshot() -> WebsiteSnapshot {
+        let mut snapshot: WebsiteSnapshot = serde_json::from_value(json!({
+            "schema_version": 1,
+            "scope": {"homepage": "https://example.com/", "script_origins": []},
+            "homepage": {"kind": "homepage", "url": "https://example.com/", "sha256": "d".repeat(64), "bytes": 5, "content_type": "text/html", "headers": {}, "text": "owned", "collected_at": 1, "connected_ip": null},
+            "resources": [], "scripts": [], "script_limit_reached": false,
+            "requests_made": 1, "captured_response_bytes": 5, "started_at": 1, "finished_at": 2
+        })).unwrap();
+        let mut other = snapshot.homepage.clone();
+        other.sha256 = "e".repeat(64);
+        snapshot.resources = vec![other.clone(), other];
+        snapshot
+    }
     #[test]
     fn a_serving_profile_must_match_the_paired_model_or_its_declared_parent() {
         let mut broker = broker();
@@ -635,7 +656,10 @@ pub(crate) mod tests {
         request.body.as_mut().unwrap()["max_tokens"] = json!(u64::MAX);
         assert_eq!(broker().chat(&request).unwrap()["max_tokens"], 192);
         assert_eq!(
-            broker().for_website_review().chat(&request).unwrap()["max_tokens"],
+            broker()
+                .for_website_review(&snapshot())
+                .chat(&request)
+                .unwrap()["max_tokens"],
             512
         );
     }
@@ -876,7 +900,8 @@ pub(crate) mod tests {
         let answer =
             br#"{"choices":[{"message":{"content":"not a report"},"finish_reason":"stop"}]}"#;
         let (origin, fixture) = server(vec![(200, "application/json", answer.to_vec())]);
-        let mut broker = broker().for_website_review();
+        let snapshot = snapshot();
+        let mut broker = broker().for_website_review(&snapshot);
         broker.origin = origin;
         let mut request = chat();
         let body = request.body.as_mut().unwrap();
@@ -908,15 +933,22 @@ pub(crate) mod tests {
         );
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["findings"]["maxItems"], 1);
+        let hashes = &schema["properties"]["findings"]["items"]["properties"]["citations"]["items"]
+            ["properties"]["resource_sha256"]["enum"];
+        assert_eq!(hashes, &json!(["d".repeat(64), "e".repeat(64)]));
+        let snapshot_hash = patchriot_protocol::website_reviews::snapshot_hash(&snapshot).unwrap();
+        assert!(!hashes.as_array().unwrap().contains(&json!(snapshot_hash)));
+        assert!(!schema.to_string().contains("owned"));
     }
 
     #[test]
     fn runtime_cannot_override_website_format_or_exceed_total_request_budget() {
-        let website = broker().for_website_review();
+        let snapshot = snapshot();
+        let website = broker().for_website_review(&snapshot);
         for format in [
             json!(null),
             json!({"type":"text"}),
-            website_response_format(),
+            website_response_format(&snapshot),
         ] {
             let mut request = chat();
             request.body.as_mut().unwrap()["response_format"] = format;
