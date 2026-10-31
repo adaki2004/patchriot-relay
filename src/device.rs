@@ -164,6 +164,25 @@ impl std::fmt::Display for RemoteError {
 }
 impl std::error::Error for RemoteError {}
 
+#[derive(Debug)]
+struct DispatcherConnectionError;
+impl std::fmt::Display for DispatcherConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dispatcher connection interrupted; check connectivity and TLS"
+        )
+    }
+}
+impl std::error::Error for DispatcherConnectionError {}
+
+fn retryable_dispatcher_error(error: &Error) -> bool {
+    error.is::<DispatcherConnectionError>()
+        || error
+            .downcast_ref::<RemoteError>()
+            .is_some_and(|e| e.status == 429 || e.status >= 500)
+}
+
 fn post<T: Serialize, R: DeserializeOwned>(
     client: &reqwest::blocking::Client,
     config: &Config,
@@ -192,7 +211,7 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         .post(url)
         .json(&request)
         .send()
-        .map_err(|_| "dispatcher request failed; check connectivity and TLS")?;
+        .map_err(|_| DispatcherConnectionError)?;
     if !response.status().is_success() {
         return Err(Box::new(RemoteError {
             status: response.status().as_u16(),
@@ -200,11 +219,14 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
     }
     // Treat even a configured server's output as bounded input; redirects are disabled.
     let mut bytes = Vec::new();
-    response.take(maximum + 1).read_to_end(&mut bytes)?;
+    response
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| DispatcherConnectionError)?;
     if bytes.len() as u64 > maximum {
         return Err("dispatcher response exceeded limit".into());
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    serde_json::from_slice(&bytes).map_err(|_| "dispatcher returned an invalid reply".into())
 }
 
 fn initialize(directory: &Path, options: &HashMap<&str, &str>) -> Result<(), Error> {
@@ -905,7 +927,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                         // Never print response bodies, private keys or signed requests.
                         eprintln!("{error}");
                         if once
-                            || agents
+                            || agents && !retryable_dispatcher_error(&error)
                             || error.is::<crate::work::CleanupUnconfirmed>()
                             || error
                                 .downcast_ref::<RemoteError>()
@@ -936,6 +958,79 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_errors_can_retry_but_invalid_replies_cannot_restart_agent_work() {
+        use std::net::TcpListener;
+        let directory = tempfile::tempdir().unwrap();
+        let options = HashMap::from([
+            ("--dispatcher", "http://127.0.0.1:1"),
+            ("--audience", "test"),
+            ("--label", "owned fixture"),
+            ("--compute-group", "owned"),
+        ]);
+        let state = directory.path().join("relay");
+        initialize(&state, &options).unwrap();
+        let mut config = read_config(&state).unwrap();
+        let key = read_key(&state).unwrap();
+        let client = client().unwrap();
+        for (status, body, declared_length, retryable) in [
+            (503, "{}", 2, true),
+            (429, "{}", 2, true),
+            (403, "{}", 2, false),
+            (200, "{\"partial\":", 50, true),
+            (200, "not json", 8, false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            config.dispatcher = format!("http://{}/", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buffer = [0; 4096];
+                let mut request = Vec::new();
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0 && request.len() + count <= 16 * 1024);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                write!(stream,"HTTP/1.1 {status} Test\r\nContent-Length: {declared_length}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}").unwrap();
+            });
+            let error = post::<_, WorkReply>(
+                &client,
+                &config,
+                &key,
+                "/work/poll",
+                WorkPoll {
+                    sequence: 1,
+                    website_reviews: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                retryable_dispatcher_error(&error),
+                retryable,
+                "status {status}"
+            );
+            server.join().unwrap();
+        }
+        assert!(!retryable_dispatcher_error(&"model profile changed".into()));
+    }
 
     #[test]
     fn structured_website_outbox_survives_restart_and_oversized_writes_are_atomic() {
