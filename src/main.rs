@@ -1,10 +1,14 @@
-//! Owned-fixture runner. No arbitrary commands, customer targets or model calls.
+//! Pairing, owned fixtures and an explicit sandboxed local-agent check.
+//! Customer targets are not accepted by this prototype.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("The fixture runner currently supports Linux and macOS only.");
 
+mod agent;
 mod device;
+mod docker;
 mod fixtures;
+mod inference;
 mod process;
 mod runner;
 mod sandbox;
@@ -28,10 +32,12 @@ patchriot-relay resume --state-dir PATH
 patchriot-relay demo
 patchriot-relay fixture <case> [--timeout-ms N] [--max-output-bytes N] [--cancel-after-ms N]
 patchriot-relay sandbox-check --socket PATH --image sha256:IMAGE_ID
+patchriot-relay agent-check --config PATH
 
 Cases: original, patched, clean, slow, noisy, split_output, malformed, nonzero, descendant, environment
-Defaults: 3000 ms, 8192 combined stdout/stderr bytes. Maximums: 60000 ms, 1048576 bytes.
-Exit: 0 = completed fixture / verified demo; 1 = failed or interrupted run; 2 = input or runner error.
+Fixture defaults: 3000 ms, 8192 combined stdout/stderr bytes. Maximums: 60000 ms, 1048576 bytes.
+Agent check: owned example only, 600 seconds overall, four local model calls maximum.
+Exit: 0 = completed fixture / passing check; 1 = failed or interrupted run; 2 = input or runner error.
 Runtime results are JSON. Completed means execution finished, not that the target is safe.
 ";
 
@@ -56,6 +62,9 @@ fn execute() -> Result<u8, Box<dyn std::error::Error>> {
     }
     if args[0] == "sandbox-check" {
         return sandbox::execute(&args);
+    }
+    if args[0] == "agent-check" {
+        return agent::execute(&args);
     }
     // The subprocess can run only these compiled-in fixtures, never a shell command.
     if args.len() == 2 && args[0] == "__fixture" {

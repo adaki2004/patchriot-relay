@@ -10,3 +10,29 @@ The public worker's contributor lifecycle informed pairing, capability checks an
 Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their own licenses and notices; the Patchriot license does not replace them. This includes the separately Apache-2.0-licensed patchriot-protocol crate, Ed25519 implementation, HTTP/TLS client and operating-system bindings. Preserve the selected dependency licenses when distributing binaries.
 
 Preserve the applicable copyright and complete license notices when third-party code is actually imported. External runtimes and model weights require their own license review.
+
+External agent runtime
+Hermes Agent — https://github.com/NousResearch/hermes-agent
+The optional agent/Dockerfile derives from a pinned upstream image. Its runtime remains separate from Patchriot's Rust relay and original Python pipe adapter. The upstream MIT license is preserved in the image at /opt/hermes/LICENSE:
+
+MIT License
+
+Copyright (c) 2025 Nous Research
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

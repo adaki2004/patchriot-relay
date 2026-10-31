@@ -6,7 +6,7 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
-**Working today:** pairing (owned fixtures or a declared Hermes agent), manual approval, presence, pause/resume, revocation, queued owned-fixture reviews and separate Linux sandbox diagnostics. **Next:** sandboxed agent execution through the queue. No customer code or model calls run through the current queue.
+**Working today:** pairing (owned fixtures or a declared Hermes agent), manual approval, presence, pause/resume, revocation, queued owned-fixture reviews, Linux sandbox diagnostics and an explicit local-agent check. **Next:** sandboxed agent execution through the queue. No customer code or model calls run through the current queue.
 
 ## Try the owned example
 
@@ -55,7 +55,7 @@ Results are saved locally before submission and retried after connection loss. C
 
 The current runner clears inherited environment, uses a temporary directory and limits each fixture to **3 seconds and 8 KiB of combined output**. It terminates its process group on timeout or cancellation.
 
-**The queue uses process supervision, not a sandbox.** It accepts only compiled-in examples. The separate diagnostic below tests a container boundary before we connect real agent tools.
+**The queue uses process supervision, not a sandbox.** It accepts only compiled-in examples. The separate checks below test container isolation and a real agent's tools before queue integration.
 
 Private customer work will require approved operators and tested isolation. Assigned operators and permitted model providers can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
 
@@ -78,12 +78,46 @@ This runs only owned probes. It does not establish model honesty or rule out ker
 
 </details>
 
+<details>
+<summary><strong>Run a local agent check (operators)</strong></summary>
+
+This runs Hermes against a tiny, owned access-control example and its **supplied patch**. It is separate from pairing and the review queue. An agent explaining this example has not demonstrated independent vulnerability discovery.
+
+Build the pinned runtime adapter and use its immutable image ID:
+
+```sh
+docker build --network=none -t patchriot-agent:local agent
+docker image inspect --format '{{.Id}}' patchriot-agent:local
+cargo run --locked -- agent-check --config .local/agent.json
+```
+
+The operator's configuration has five fields; replace the example image and model digest with inspected values:
+
+```json
+{
+  "docker_socket": "/var/run/docker.sock",
+  "image": "sha256:REPLACE_WITH_LOCAL_IMAGE_ID",
+  "model_url": "http://127.0.0.1:11434",
+  "model": "your-local-model:pilot",
+  "model_digest": "REPLACE_WITH_64_CHARACTER_MODEL_DIGEST"
+}
+```
+
+Use an Ollama model that supports tools and a 64,000-token context. Its **stored model profile** must set `num_ctx 64000`; the compatible API does not apply that setting from chat requests. Inspect `/api/tags` for the digest and `/api/show` for the parameters. The relay checks both before starting. Keep the model server private, reachable only from the relay; the model URL accepts explicit loopback/private IPv4 addresses. This verifies the server's declaration, not remotely attested weights.
+
+**Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
+
+Configure the model server's separate CPU/RAM limits as well; the limits above cover the agent and its tools. The result includes timing, tool events, the reported regression and confirmed container removal. Cancellation stops the request and removes the container. A hard-killed relay or failed Docker engine needs operator inspection of containers labelled `io.patchriot.agent-check=1`. **Agent-reported evidence is not independent verification.** The CPU pilot uses one operator; more devices on that host do not add independent reviewers.
+
+</details>
+
 ## Check the controls
 
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+python3 -m unittest discover -s agent -p 'test_*.py'
 cargo run --locked -- fixture slow --timeout-ms 100
 cargo run --locked -- fixture noisy --max-output-bytes 1024
 ```
