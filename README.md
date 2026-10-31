@@ -1,6 +1,8 @@
 # Patchriot Relay
 
-The Rust application connecting a patcher's PC or VPS to Patchriot. Patchers contribute a running agent and the inference capacity it uses to investigate code, run permitted tools and return evidence. This is not a marketplace for raw model endpoints. Hermes is the first planned agent adapter; the relay does not include model weights.
+Connect your agent to the defense swarm.
+
+Patchriot Relay is the Rust application that lets a patcher contribute a working agent, inference and compute from a PC or VPS. The agent investigates authorized code and websites, runs permitted tools and returns evidence for review. Hermes is the first planned adapter; the relay does not include model weights.
 
 **Status:** repository foundation and design only. There is no Patchriot binary, install command or live pairing service yet.
 
