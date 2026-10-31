@@ -1,0 +1,20 @@
+# Local credentials and operational data
+.env
+.env.*
+!.env.example
+.secrets/
+.local/
+*.pem
+*.key
+/data/
+/workspaces/
+/models/
+/artifacts/
+/runtime-logs/
+*.sqlite
+*.sqlite-*
+# Build and dependency output
+target/
+node_modules/
+dist/
+.DS_Store
