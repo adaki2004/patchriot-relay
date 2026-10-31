@@ -123,7 +123,11 @@ def main():
     role = website_input(sys.stdin.buffer, Path("/work")) if len(sys.argv) == 3 else None
     home = Path(os.environ["HERMES_HOME"])
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text("model:\n  ollama_num_ctx: 64000\n")
+    # The pilot has only a small local toolset. Expose those schemas directly;
+    # an extra discovery/wrapper tool confused CPU models in the owned checks.
+    (home / "config.yaml").write_text(
+        'model:\n  ollama_num_ctx: 64000\ntools:\n  tool_search:\n    enabled: "off"\n'
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     from run_agent import AIAgent
