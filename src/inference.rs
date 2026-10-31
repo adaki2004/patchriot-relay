@@ -117,7 +117,18 @@ impl Broker {
         self.model == declared || self.show["details"]["parent_model"].as_str() == Some(declared)
     }
 
-    pub async fn connect(url: &str, model: &str, digest: &str) -> Result<Self, &'static str> {
+    pub async fn connect(
+        url: &str,
+        model: &str,
+        digest: &str,
+        attempt_seconds: u64,
+    ) -> Result<Self, &'static str> {
+        if !(patchriot_protocol::DEFAULT_AGENT_ATTEMPT_SECONDS
+            ..=patchriot_protocol::MAX_AGENT_ATTEMPT_SECONDS)
+            .contains(&attempt_seconds)
+        {
+            return Err("model timeout must fit the configured agent attempt limit");
+        }
         let origin = origin(url)?;
         if !model_name(model)
             || digest.len() != 64
@@ -131,7 +142,9 @@ impl Broker {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(540))
+            .timeout(Duration::from_secs(
+                attempt_seconds - patchriot_protocol::AGENT_CLEANUP_SECONDS,
+            ))
             .build()
             .map_err(|_| "model client unavailable")?;
         let tags = bounded_json(
@@ -635,14 +648,14 @@ pub(crate) mod tests {
     async fn preflight_rejects_changed_model_or_wrong_serving_window() {
         let (origin, fixture) = server(metadata(64000).into_iter().take(1).collect());
         assert!(
-            Broker::connect(&origin, "owned-model:pilot", &"b".repeat(64))
+            Broker::connect(&origin, "owned-model:pilot", &"b".repeat(64), 600)
                 .await
                 .is_err()
         );
         assert_eq!(fixture.join().unwrap().len(), 1);
         let (origin, fixture) = server(metadata(4096).into_iter().take(2).collect());
         assert!(
-            Broker::connect(&origin, "owned-model:pilot", &"a".repeat(64))
+            Broker::connect(&origin, "owned-model:pilot", &"a".repeat(64), 600)
                 .await
                 .is_err()
         );
@@ -659,7 +672,7 @@ pub(crate) mod tests {
             replies[1].2 = serde_json::to_vec(&show).unwrap();
             let (origin, fixture) = server(replies);
             assert!(
-                Broker::connect(&origin, "owned-model:pilot", &"a".repeat(64))
+                Broker::connect(&origin, "owned-model:pilot", &"a".repeat(64), 600)
                     .await
                     .is_err()
             );
@@ -674,7 +687,7 @@ pub(crate) mod tests {
         let mut replies = metadata(64000);
         replies.push((200, "text/event-stream", expected.as_bytes().to_vec()));
         let (origin, fixture) = server(replies);
-        let broker = Broker::connect(&origin, "owned-model:pilot", &"a".repeat(64))
+        let broker = Broker::connect(&origin, "owned-model:pilot", &"a".repeat(64), 600)
             .await
             .unwrap();
         let frames = collect(broker, chat()).await;

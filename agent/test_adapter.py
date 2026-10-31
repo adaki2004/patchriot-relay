@@ -16,6 +16,13 @@ import inspect_site
 
 
 class BridgeTests(unittest.TestCase):
+    def test_execution_budget_is_explicit_bounded_and_not_model_controlled(self):
+        for value in ["600", "1200", "1800"]:
+            self.assertEqual(adapter.execution_budget(value), int(value))
+        for value in ["", "0", "599", "1801", " 600", "600.0", "-600", "٦٠٠"]:
+            with self.assertRaises(ValueError):
+                adapter.execution_budget(value)
+
     def exchange(self, frames, method="GET", path="/api/version", body=None, headers=None):
         wire = io.StringIO()
         incoming = io.TextIOWrapper(io.BytesIO(b"".join(json.dumps(f).encode() + b"\n" for f in frames)))

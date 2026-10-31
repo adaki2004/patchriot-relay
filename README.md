@@ -50,7 +50,7 @@ Without either work option, the connection reports presence only. Heartbeats con
 
 With **three approved devices** connected in the same mode, choose **Reviews → New example review**. Three sequential roles check the same supplied bug and fix. Shared machines under one operator get one active assignment. Reports show device/operator counts; three processes on one host do not imply independent reviewers.
 
-Results are saved locally before submission and retried after connection loss. Agent leases renew while healthy, with a fixed ten-minute ceiling per attempt and 35-minute review deadline. Queued execution reserves the final minute for cleanup and submitting its result, so a slow model can report a timeout before the lease expires. Preflight and input delivery consume the same execution budget. The relay uses a monotonic clock and stops when it cannot renew. Server cancellation is checked during renewal; it is not an instantaneous push. Local signals interrupt a running agent directly.
+Results are saved locally before submission and retried after connection loss. Agent leases renew while healthy, with a saved attempt deadline. Defaults are ten minutes per attempt and 35 minutes per review. Queued execution reserves the final minute for cleanup and submitting its result, so a slow model can report a timeout before the lease expires. Preflight and input delivery consume the same execution budget. The relay uses a monotonic clock and stops when it cannot renew. Server cancellation is checked during renewal; it is not an instantaneous push. Local signals interrupt a running agent directly.
 
 Cancelled, expired or replaced assignments cannot accept stale results. Restarting an agent connection first removes that device's labelled leftover containers. Temporary dispatcher connection failures, server errors and rate limits retry with a delay of up to 40 seconds. Active work still stops if its lease cannot renew. A runner/configuration error or invalid response stops the agent connection for inspection. For owned examples, the state directory keeps one private `last-agent-check.json` (at most 2 MiB) for diagnosis. Website snapshots and their tool transcripts are not written to that file. A bounded pending report is saved until acknowledged. Keep state directories out of Git and shared backups.
 
@@ -94,7 +94,7 @@ docker image inspect --format '{{.Id}}' patchriot-agent:local
 cargo run --locked -- agent-check --config .local/agent.json
 ```
 
-The operator's configuration has five fields; replace the example image and model digest with inspected values:
+The operator's configuration has five required fields and an optional time limit; replace the example image and model digest with inspected values:
 
 ```json
 {
@@ -102,7 +102,8 @@ The operator's configuration has five fields; replace the example image and mode
   "image": "sha256:REPLACE_WITH_LOCAL_IMAGE_ID",
   "model_url": "http://127.0.0.1:11434",
   "model": "your-local-model:pilot",
-  "model_digest": "REPLACE_WITH_64_CHARACTER_MODEL_DIGEST"
+  "model_digest": "REPLACE_WITH_64_CHARACTER_MODEL_DIGEST",
+  "max_attempt_seconds": 600
 }
 ```
 
@@ -110,7 +111,9 @@ Use an Ollama model that supports tools and a 64,000-token context. Its **stored
 
 After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept owned-example checks submitted through the website. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
 
-**Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
+For a slow CPU pilot, set `max_attempt_seconds` to at most `1800` and rebuild the version 3 adapter. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
+
+**Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall by default. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
 
 Configure the model server's separate CPU/RAM limits as well; the limits above cover the agent and its tools. Manual output includes full bounded tool events; queued reports contain the parsed observations, model/image digests, timing and a bounded explanation. The explanation alone cannot pass the check. Cancellation stops the request and removes the container. If cleanup cannot be confirmed, inspect containers labelled `io.patchriot.agent-check=1` before restarting. **Agent-reported evidence is not independent verification.** The CPU pilot uses one operator; more devices on that host do not add independent reviewers.
 
@@ -120,7 +123,7 @@ The pilot presents its terminal and process-management tools directly, without a
 
 ## Opt in to private website reviews
 
-First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review requires adapter version 2; older images cannot opt in.
+First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review requires adapter version 2 or 3. The current build is version 3; longer CPU budgets require this version.
 
 ```sh
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --website-reviews
@@ -130,7 +133,7 @@ An admin must allow **private reviews** for the device. The requester then selec
 
 The relay downloads evidence only for its active lease, checks its hash and sends bounded data through the container's stdin. A fixed reader runs inside the container before inference; the agent receives its bounded output and reviews it. That required read counts as a tool execution, not a check independently chosen by the model. Saved HTML/scripts are inspected as text; there is no browsing, target networking or host execution. Snapshot files live in container temporary storage and disappear with cleanup. Operators can see plaintext, so only accept data you are permitted to process.
 
-Each role gets at most four model calls, 512 output tokens per call and ten minutes. Website mode omits the runtime's optional model-specific instructions to keep executing tools; the task supplies its own review instructions, and tools remain available. Later roles inspect earlier claims; no live exploit or patch test is implied. The server checks quotations against the original snapshot. **A complete report is not a security certificate.** Invalid reports and unsupported quotations remain unresolved. Removing private approval stops affected reviews; it cannot recall information already seen.
+Each role gets at most four model calls, 512 output tokens per call and the earlier of its saved lease deadline and operator time limit. Website mode omits the runtime's optional model-specific instructions to keep executing tools; the task supplies its own review instructions, and tools remain available. Later roles inspect earlier claims; no live exploit or patch test is implied. The server checks quotations against the original snapshot. **A complete report is not a security certificate.** Invalid reports and unsupported quotations remain unresolved. Removing private approval stops affected reviews; it cannot recall information already seen.
 
 ## Check the controls
 

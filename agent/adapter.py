@@ -98,6 +98,13 @@ def event(kind, **data):
     send({"type": "event", "event": kind, "data": data})
 
 
+def execution_budget(value):
+    """Operator-selected limit; website text and models cannot change it."""
+    if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 1800:
+        raise ValueError("agent time limit must be 600..1800 seconds")
+    return int(value)
+
+
 class Bridge(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -148,6 +155,8 @@ def main():
     if len(sys.argv) not in (2, 3) or len(sys.argv) == 3 and sys.argv[2] != "--website":
         raise SystemExit("expected the operator-configured model name")
     model = sys.argv[1]
+    budget = execution_budget(os.environ.get("PATCHRIOT_AGENT_MAX_SECONDS", "600"))
+    os.environ["HERMES_API_TIMEOUT"] = str(budget - 60)
     role = website_input(sys.stdin.buffer, Path("/work")) if len(sys.argv) == 3 else None
     home = Path(os.environ["HERMES_HOME"])
     home.mkdir(parents=True, exist_ok=True)
@@ -182,7 +191,7 @@ def main():
         request_overrides={"reasoning_effort": "none"},
         quiet_mode=True, skip_context_files=True, skip_memory=True,
         skip_background_review=True, checkpoints_enabled=False,
-        run_budget_seconds=570, cwd="/work",
+        run_budget_seconds=budget - 30, cwd="/work",
         tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
         tool_complete_callback=complete,
     )

@@ -36,7 +36,7 @@ patchriot-relay agent-check --config PATH
 
 Cases: original, patched, clean, slow, noisy, split_output, malformed, nonzero, descendant, environment
 Fixture defaults: 3000 ms, 8192 combined stdout/stderr bytes. Maximums: 60000 ms, 1048576 bytes.
-Agent check: owned example only, 600 seconds overall, four local model calls maximum.
+Agent check: owned example only, 600 seconds by default (operator-configurable up to 1800), four local model calls maximum.
 Exit: 0 = completed fixture / passing check; 1 = failed or interrupted run; 2 = input or runner error.
 Runtime results are JSON. Completed means execution finished, not that the target is safe.
 ";

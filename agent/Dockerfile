@@ -4,5 +4,5 @@ COPY adapter.py access.py check.py inspect_site.py /patchriot/
 USER 65534:65534
 WORKDIR /work
 ENV HOME=/opt/data HERMES_HOME=/opt/data/hermes PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/hermes TERMINAL_ENV=local TERMINAL_CWD=/work HERMES_API_TIMEOUT=540
-LABEL io.patchriot.agent-adapter="2"
+LABEL io.patchriot.agent-adapter="3"
 ENTRYPOINT ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"]

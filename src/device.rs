@@ -638,7 +638,17 @@ fn locally_ready(directory: &Path, lease_id: Uuid) -> bool {
 /// The renewable lease controls permission to keep working; this earlier deadline
 /// leaves one minute for container cleanup and saving the result. Use the server's
 /// remaining duration anchored before the request, not this machine's wall clock.
-fn agent_execution_deadline(started: Instant, renewed: &WorkRenewed) -> Result<Instant, Error> {
+fn agent_execution_deadline(
+    started: Instant,
+    renewed: &WorkRenewed,
+    operator_limit: u64,
+) -> Result<Instant, Error> {
+    if !(patchriot_protocol::DEFAULT_AGENT_ATTEMPT_SECONDS
+        ..=patchriot_protocol::MAX_AGENT_ATTEMPT_SECONDS)
+        .contains(&operator_limit)
+    {
+        return Err("invalid operator attempt limit".into());
+    }
     let after_expiry = renewed
         .deadline_at
         .checked_sub(renewed.expires_at)
@@ -646,8 +656,9 @@ fn agent_execution_deadline(started: Instant, renewed: &WorkRenewed) -> Result<I
         .ok_or("invalid lease deadline")? as u64;
     let remaining = after_expiry
         .saturating_add(renewed.valid_for_seconds)
-        .min(600);
-    Ok(started + Duration::from_secs(remaining.saturating_sub(60)))
+        .min(operator_limit);
+    Ok(started
+        + Duration::from_secs(remaining.saturating_sub(patchriot_protocol::AGENT_CLEANUP_SECONDS)))
 }
 
 fn agent_work(
@@ -661,7 +672,8 @@ fn agent_work(
     // The server must confirm that it is still this device's active lease.
     let (started, renewed) = renew(directory, client, assignment.lease_id)?;
     let window = LeaseWindow::new(started, renewed.valid_for_seconds);
-    let execution_deadline = agent_execution_deadline(started, &renewed)?;
+    let execution_deadline =
+        agent_execution_deadline(started, &renewed, settings.max_attempt_seconds())?;
     let config = read_config(directory)?;
     let device_id = config.device_id.ok_or("missing device identity")?;
     let declared_model = config
@@ -1124,7 +1136,7 @@ mod tests {
             valid_for_seconds: 59,
             replayed: false,
         };
-        let deadline = agent_execution_deadline(start, &renewal).unwrap();
+        let deadline = agent_execution_deadline(start, &renewal, 600).unwrap();
         assert_eq!(deadline.duration_since(start), Duration::from_secs(539));
         // Transit, snapshot delivery and preflight consume the same budget.
         assert_eq!(
@@ -1133,21 +1145,53 @@ mod tests {
         );
         renewal.deadline_at = 1120;
         assert_eq!(
-            agent_execution_deadline(start, &renewal).unwrap(),
+            agent_execution_deadline(start, &renewal, 600).unwrap(),
             start + Duration::from_secs(59)
         );
         renewal.deadline_at = renewal.expires_at;
-        assert_eq!(agent_execution_deadline(start, &renewal).unwrap(), start);
+        assert_eq!(
+            agent_execution_deadline(start, &renewal, 600).unwrap(),
+            start
+        );
         renewal.deadline_at = i64::MAX;
         assert_eq!(
-            agent_execution_deadline(start, &renewal).unwrap(),
+            agent_execution_deadline(start, &renewal, 600).unwrap(),
             start + Duration::from_secs(540)
         );
         renewal.deadline_at = 0;
-        assert!(agent_execution_deadline(start, &renewal).is_err());
+        assert!(agent_execution_deadline(start, &renewal, 600).is_err());
         renewal.deadline_at = i64::MAX;
         renewal.expires_at = i64::MIN;
-        assert!(agent_execution_deadline(start, &renewal).is_err());
+        assert!(agent_execution_deadline(start, &renewal, 600).is_err());
+    }
+
+    #[test]
+    fn longer_cpu_runs_require_both_server_and_operator_allowance() {
+        let start = Instant::now();
+        let mut renewal = WorkRenewed {
+            lease_id: Uuid::nil(),
+            sequence: 1,
+            expires_at: 1060,
+            deadline_at: 2800,
+            valid_for_seconds: 59,
+            replayed: false,
+        };
+        assert_eq!(
+            agent_execution_deadline(start, &renewal, 600).unwrap(),
+            start + Duration::from_secs(540)
+        );
+        assert_eq!(
+            agent_execution_deadline(start, &renewal, 1800).unwrap(),
+            start + Duration::from_secs(1739)
+        );
+        renewal.deadline_at = 1600;
+        assert_eq!(
+            agent_execution_deadline(start, &renewal, 1800).unwrap(),
+            start + Duration::from_secs(539)
+        );
+        for invalid in [0, 599, 1801, u64::MAX] {
+            assert!(agent_execution_deadline(start, &renewal, invalid).is_err());
+        }
     }
 
     #[test]

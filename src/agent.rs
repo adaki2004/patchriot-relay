@@ -7,7 +7,9 @@ use crate::{
     process::Outcome,
 };
 use patchriot_protocol::{
-    AgentFixtureObservation, AgentOutcome, AgentResult, AgentResultKind, WorkResult,
+    AgentFixtureObservation, AgentOutcome, AgentResult, AgentResultKind,
+    DEFAULT_AGENT_ATTEMPT_SECONDS, MAX_AGENT_ATTEMPT_SECONDS, WorkResult,
+    default_agent_attempt_seconds,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -53,16 +55,31 @@ pub struct Settings {
     model_url: String,
     model: String,
     model_digest: String,
+    #[serde(default = "default_agent_attempt_seconds")]
+    max_attempt_seconds: u64,
 }
 
 impl Settings {
+    pub fn max_attempt_seconds(&self) -> u64 {
+        self.max_attempt_seconds
+    }
+
     pub fn require_website_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "2"
+            || !["2", "3"].contains(
+                &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
+                    .as_str()
+                    .unwrap_or(""),
+            )
+            || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
+                && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "3"
         {
-            return Err("website reviews require the pinned version 2 agent adapter image".into());
+            return Err(
+                "website reviews require adapter 2 or 3; longer CPU budgets require adapter 3"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -78,6 +95,11 @@ impl Settings {
             serde_json::from_slice(&bytes).map_err(|_| "invalid agent configuration")?;
         if !immutable_image(&settings.image) {
             return Err("agent image must be an immutable local sha256 image ID".into());
+        }
+        if !(DEFAULT_AGENT_ATTEMPT_SECONDS..=MAX_AGENT_ATTEMPT_SECONDS)
+            .contains(&settings.max_attempt_seconds)
+        {
+            return Err("max_attempt_seconds must be 600..1800".into());
         }
         crate::inference::origin(&settings.model_url)?;
         Ok(settings)
@@ -406,7 +428,7 @@ async fn supervise(
     Ok(report)
 }
 
-fn policy(container: &Value, image: &str, args: &[&str]) -> bool {
+fn policy(container: &Value, image: &str, args: &[&str], seconds: u64) -> bool {
     let h = &container["HostConfig"];
     let c = &container["Config"];
     container["Image"] == image
@@ -454,6 +476,10 @@ fn policy(container: &Value, image: &str, args: &[&str]) -> bool {
         && c["Cmd"] == json!(args)
         && c["Tty"] == false
         && c["OpenStdin"] == true
+        && c["Env"].as_array().is_some_and(|env| {
+            env.iter()
+                .any(|value| value == &format!("PATCHRIOT_AGENT_MAX_SECONDS={seconds}"))
+        })
 }
 
 pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
@@ -485,12 +511,19 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2"].contains(
+        || !["1", "2", "3"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
-        || website.is_some() && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "2"
+        || website.is_some()
+            && !["2", "3"].contains(
+                &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
+                    .as_str()
+                    .unwrap_or(""),
+            )
+        || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
+            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "3"
         || !no_entries(&image["Config"]["OnBuild"])
         || !no_entries(&image["Config"]["Healthcheck"])
     {
@@ -503,6 +536,7 @@ pub fn run(
         &settings.model_url,
         &settings.model,
         &settings.model_digest,
+        settings.max_attempt_seconds,
     ))?;
     let broker = if website.is_some() {
         broker.website_budget()
@@ -538,6 +572,11 @@ pub fn run(
         "--pull=never".into(),
         "--name".into(),
         owned.name.clone(),
+        "--env".into(),
+        format!(
+            "PATCHRIOT_AGENT_MAX_SECONDS={}",
+            settings.max_attempt_seconds
+        ),
     ];
     if let Some(assignment) = &assignment {
         command.extend([
@@ -600,6 +639,7 @@ pub fn run(
             &docker.inspect("container", &owned.name)?,
             &settings.image,
             &args,
+            settings.max_attempt_seconds,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -619,8 +659,8 @@ pub fn run(
                     a.execution_deadline
                         .saturating_duration_since(Instant::now())
                 })
-                .unwrap_or(Duration::from_secs(600))
-                .min(Duration::from_secs(600)),
+                .unwrap_or(Duration::from_secs(settings.max_attempt_seconds))
+                .min(Duration::from_secs(settings.max_attempt_seconds)),
             input,
         ))?;
         if report.outcome != "completed" {
@@ -768,6 +808,7 @@ mod tests {
             model_url: "http://127.0.0.1:11434".into(),
             model: "test-profile".into(),
             model_digest: "a".repeat(64),
+            max_attempt_seconds: DEFAULT_AGENT_ATTEMPT_SECONDS,
         }
     }
 
@@ -946,13 +987,13 @@ mod tests {
     fn container() -> Value {
         json!({
             "Image":"owned-image","State":{"Status":"created"},"Mounts":[],
-            "Config":{"User":"65534:65534","WorkingDir":"/work","Entrypoint":IMAGE_ENTRY,"Cmd":["owned-model"],"Tty":false,"OpenStdin":true},
+            "Config":{"Env":["PATCHRIOT_AGENT_MAX_SECONDS=600"],"User":"65534:65534","WorkingDir":"/work","Entrypoint":IMAGE_ENTRY,"Cmd":["owned-model"],"Tty":false,"OpenStdin":true},
             "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"Privileged":false,"Init":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],"Memory":2147483648u64,"MemorySwap":2147483648u64,"NanoCpus":2000000000u64,"PidsLimit":128,"CgroupnsMode":"private","PidMode":"","IpcMode":"private","UTSMode":"","UsernsMode":"","LogConfig":{"Type":"none"},"RestartPolicy":{"Name":"no"},"Tmpfs":TMPFS.into_iter().collect::<std::collections::BTreeMap<_,_>>()}
         })
     }
     #[test]
     fn docker_configuration_must_preserve_the_execution_boundary() {
-        assert!(policy(&container(), "owned-image", &["owned-model"]));
+        assert!(policy(&container(), "owned-image", &["owned-model"], 600));
         for (pointer, value) in [
             ("/HostConfig/NetworkMode", json!("host")),
             ("/HostConfig/ReadonlyRootfs", json!(false)),
@@ -963,19 +1004,51 @@ mod tests {
             ("/HostConfig/PidMode", json!("host")),
             ("/Config/Cmd", json!(["other-model"])),
             ("/Config/User", json!("root")),
+            ("/Config/Env", json!(["PATCHRIOT_AGENT_MAX_SECONDS=1800"])),
             ("/Mounts", json!([{"Source":"/var/run/docker.sock"}])),
         ] {
             let mut value_container = container();
             *value_container.pointer_mut(pointer).unwrap() = value;
             assert!(
-                !policy(&value_container, "owned-image", &["owned-model"]),
+                !policy(&value_container, "owned-image", &["owned-model"], 600),
                 "{pointer}"
             );
         }
         for key in ["Binds", "Devices", "CapAdd", "PortBindings"] {
             let mut value = container();
             value["HostConfig"][key] = json!(["unexpected"]);
-            assert!(!policy(&value, "owned-image", &["owned-model"]), "{key}");
+            assert!(
+                !policy(&value, "owned-image", &["owned-model"], 600),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_configuration_defaults_to_ten_minutes_and_rejects_unbounded_budgets() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut input = json!({"docker_socket":"/var/run/docker.sock", "image":format!("sha256:{}", "b".repeat(64)), "model_url":"http://127.0.0.1:11434", "model":"owned-model", "model_digest":"a".repeat(64)});
+        std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(
+            Settings::load(file.path()).unwrap().max_attempt_seconds(),
+            600
+        );
+        input["max_attempt_seconds"] = json!(1800);
+        std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(
+            Settings::load(file.path()).unwrap().max_attempt_seconds(),
+            1800
+        );
+        for value in [
+            json!(599),
+            json!(1801),
+            json!("1800"),
+            json!(-1),
+            json!(null),
+        ] {
+            input["max_attempt_seconds"] = value;
+            std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
+            assert!(Settings::load(file.path()).is_err());
         }
     }
 }
