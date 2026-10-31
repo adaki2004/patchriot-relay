@@ -5,6 +5,7 @@ import json
 import hashlib
 from pathlib import Path
 import tempfile
+import subprocess
 import sys
 import threading
 import unittest
@@ -113,6 +114,44 @@ class WebsiteTests(unittest.TestCase):
         self.assertTrue(report["resources"][0]["excerpt_truncated"])
         self.assertIn("must not execute target", report["resources"][0]["excerpt"])
         self.assertFalse(report["previous_reports"][0]["evidence_complete"])
+
+    def test_required_inspection_preserves_reader_output_and_discloses_its_origin(self):
+        raw = json.dumps(self.snapshot(), ensure_ascii=False).encode()
+        output = inspect_site.inspect(raw, []) + "\n"
+        wire = io.StringIO()
+        with patch.object(adapter, "wire_out", wire), patch.object(adapter.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+            self.assertEqual(adapter.inspect_website(), output)
+            # The command is fixed; neither website text nor model output can
+            # select a shell program or extra arguments for this required read.
+            self.assertEqual(run.call_args.args[0], [sys.executable, "/patchriot/inspect_site.py"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 5)
+            self.assertNotIn("shell", run.call_args.kwargs)
+        events = [json.loads(line) for line in wire.getvalue().splitlines()]
+        self.assertEqual([event["event"] for event in events], ["tool_start", "tool_complete"])
+        self.assertEqual(events[1]["data"]["origin"], "required_snapshot_inspection")
+        self.assertEqual(json.loads(events[1]["data"]["args"][3])["output"], output)
+
+    def test_failed_or_unreadable_required_inspection_cannot_report_success(self):
+        for response in [
+            subprocess.CompletedProcess([], 1, stdout='{"snapshot_sha256":"' + 'a' * 64 + '"}', stderr="failed"),
+            subprocess.CompletedProcess([], 0, stdout="not JSON", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="[]", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout='{"snapshot_sha256":"invented"}', stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=" " * 16001, stderr=""),
+            subprocess.TimeoutExpired("fixed reader", 5),
+        ]:
+            with self.subTest(response=type(response).__name__):
+                wire = io.StringIO()
+                with patch.object(adapter, "wire_out", wire), patch.object(adapter.subprocess, "run") as run:
+                    if isinstance(response, Exception):
+                        run.side_effect = response
+                    else:
+                        run.return_value = response
+                    with self.assertRaises((RuntimeError, ValueError, subprocess.TimeoutExpired)):
+                        adapter.inspect_website()
+                events = [json.loads(line) for line in wire.getvalue().splitlines()]
+                self.assertEqual([event["event"] for event in events], ["tool_start"])
 
 
 if __name__ == "__main__":
