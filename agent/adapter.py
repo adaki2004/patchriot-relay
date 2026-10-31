@@ -156,6 +156,12 @@ def main():
     (home / "config.yaml").write_text(
         'model:\n  ollama_num_ctx: 64000\ntools:\n  tool_search:\n    enabled: "off"\n'
     )
+    if role:
+        # The snapshot is already collected. Generic model-specific instructions
+        # to keep executing tools conflict with this bounded, offline review.
+        # Tools remain available; Rust still enforces permissions and budgets.
+        with (home / "config.yaml").open("a") as config:
+            config.write("agent:\n  tool_use_enforcement: false\n  execution_guidance: false\n")
     # Required collection is deterministic. A CPU model should spend its budget
     # reviewing evidence, rather than deciding whether to run a prescribed read.
     inspection = inspect_website() if role else None

@@ -130,7 +130,7 @@ An admin must allow **private reviews** for the device. The requester then selec
 
 The relay downloads evidence only for its active lease, checks its hash and sends bounded data through the container's stdin. A fixed reader runs inside the container before inference; the agent receives its bounded output and reviews it. That required read counts as a tool execution, not a check independently chosen by the model. Saved HTML/scripts are inspected as text; there is no browsing, target networking or host execution. Snapshot files live in container temporary storage and disappear with cleanup. Operators can see plaintext, so only accept data you are permitted to process.
 
-Each role gets at most four model calls, 512 output tokens per call and ten minutes. Later roles inspect earlier claims; no live exploit or patch test is implied. The server checks quotations against the original snapshot. **A complete report is not a security certificate.** Invalid reports and unsupported quotations remain unresolved. Removing private approval stops affected reviews; it cannot recall information already seen.
+Each role gets at most four model calls, 512 output tokens per call and ten minutes. Website mode omits the runtime's optional model-specific instructions to keep executing tools; the task supplies its own review instructions, and tools remain available. Later roles inspect earlier claims; no live exploit or patch test is implied. The server checks quotations against the original snapshot. **A complete report is not a security certificate.** Invalid reports and unsupported quotations remain unresolved. Removing private approval stops affected reviews; it cannot recall information already seen.
 
 ## Check the controls
 
