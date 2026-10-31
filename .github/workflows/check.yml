@@ -34,9 +34,20 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --all --check
+      - run: rustfmt --edition 2024 --check sandbox/probe.rs
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo run --locked -- demo
+      - name: Build the owned sandbox probe
+        if: runner.os == 'Linux'
+        run: docker build --network=none -t patchriot-sandbox-probe:ci sandbox
+      - name: Test actual sandbox limits and cleanup
+        if: runner.os == 'Linux'
+        env:
+          PATCHRIOT_DOCKER_SOCKET: /var/run/docker.sock
+        run: |
+          export PATCHRIOT_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' patchriot-sandbox-probe:ci)"
+          cargo test --locked --test sandbox_cli -- --ignored --test-threads=1
   dependencies:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

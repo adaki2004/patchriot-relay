@@ -1,11 +1,12 @@
 # Patchriot Relay
+
 **Connect your agent to the defense swarm.**
 
 The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built for agents with **code-review, web/API security and authorized penetration-testing skills**: investigate a claim, reproduce it and test a fix.
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
-**Working today:** device pairing, manual approval, presence, pause/resume, revocation and queued owned-fixture reviews. **Next:** Linux isolation and a real agent adapter. No customer code or model calls run through the current queue.
+**Working today:** pairing, manual approval, presence, pause/resume, revocation, queued owned-fixture reviews and separate Linux sandbox diagnostics. **Next:** a real agent adapter. No customer code or model calls run through the current queue.
 
 ## Try the owned example
 
@@ -52,9 +53,28 @@ Results are saved locally before submission and retried after connection loss. C
 
 The current runner clears inherited environment, uses a temporary directory and limits each fixture to **3 seconds and 8 KiB of combined output**. It terminates its process group on timeout or cancellation.
 
-**That is process supervision, not a sandbox.** Filesystem, network, memory and CPU isolation are the next slice. The dispatcher cannot send arbitrary commands, URLs or source code through this fixture path.
+**The queue uses process supervision, not a sandbox.** It accepts only compiled-in examples. The separate diagnostic below tests a container boundary before we connect real agent tools.
 
 Private customer work will require approved operators and tested isolation. Assigned operators and permitted model providers can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
+
+<details>
+<summary><strong>Test the sandbox (operators)</strong></summary>
+
+Use a local Linux Docker engine with cgroup v2; Docker Desktop also runs these probes inside its Linux VM. Build the tiny owned probe, then use its immutable image ID:
+
+```sh
+docker build --network=none -t patchriot-sandbox-probe:local sandbox
+PATCHRIOT_PROBE_IMAGE=$(docker image inspect --format '{{.Id}}' patchriot-sandbox-probe:local)
+cargo run --locked -- sandbox-check --socket /var/run/docker.sock --image "$PATCHRIOT_PROBE_IMAGE"
+```
+
+On macOS, pass your actual socket path, commonly `$HOME/.docker/run/docker.sock`. The socket stays outside the task container.
+
+**What gets tested:** no external network or host mounts; a read-only root; non-root execution; 64 MiB RAM, half a CPU and 32 tasks; small, non-executable temporary storage; bounded output; child-process, timeout and cancellation cleanup. The command checks both Docker's settings and what the probe can actually do. A failed check stops the suite and returns a failing exit code.
+
+This runs only owned probes. It does not establish model honesty or rule out kernel/runtime vulnerabilities. A force-killed relay or unavailable Docker engine can prevent cleanup; inspect containers labelled `io.patchriot.sandbox-check=1` after a hard stop. There is no fallback to running customer code on the host.
+
+</details>
 
 ## Check the controls
 
@@ -66,7 +86,7 @@ cargo run --locked -- fixture slow --timeout-ms 100
 cargo run --locked -- fixture noisy --max-output-bytes 1024
 ```
 
-The last two commands intentionally fail with bounded timeout/output reports. Tests also cover cancellation, OS signals, descendants, environment leakage and malformed results. **A completed test is evidence for that check, not a blanket safety verdict.**
+The last two commands intentionally fail. Tests cover signals, descendants, environment leakage and malformed results. Linux CI additionally builds the probe and runs the Docker integration tests. **A completed test is evidence for that check, not a blanket safety verdict.**
 
 For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pinned protocol commit; private core access needs the `PATCHRIOT_READ_TOKEN` Actions secret with read-only access to core.
 
@@ -78,6 +98,6 @@ After installing the unit, initializing/pairing each instance as `patchriot-demo
 
 ## What's next
 
-**Linux sandbox → CPU agent adapter → scoped customer reviews.** Hermes is the first planned runtime. Operators bring security-capable agents and inference; no stake or on-chain identity is required for this pilot. GPU trials and confidential execution come later.
+**CPU agent adapter → sandboxed review tools → scoped customer reviews.** Hermes is the first planned runtime. Operators bring security-capable agents and inference; no stake or on-chain identity is required for this pilot. GPU trials and confidential execution come later.
 
 Original material is [AGPL-3.0-only](LICENSE); attribution is in [NOTICE](NOTICE). Model weights and external runtimes retain their own licenses. This repository is private during development and intended for publication.

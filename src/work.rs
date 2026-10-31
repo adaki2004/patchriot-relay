@@ -46,10 +46,10 @@ pub fn execute(
             return Ok(None);
         }
         let report = runner::run(&executable, case, Limits::default(), cancelled, None)?;
-        if report.outcome == Outcome::CleanupUnconfirmed {
+        if report.process.outcome == Outcome::CleanupUnconfirmed {
             return Err(Box::new(CleanupUnconfirmed));
         }
-        let completed = report.outcome == Outcome::Completed;
+        let completed = report.process.outcome == Outcome::Completed;
         let checks = report
             .evidence
             .map(|evidence| {
@@ -68,7 +68,7 @@ pub fn execute(
             version,
             completed,
             checks,
-            elapsed_ms: report.duration_ms.try_into()?,
+            elapsed_ms: report.process.duration_ms.try_into()?,
         });
         if !completed {
             break;

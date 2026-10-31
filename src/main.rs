@@ -5,7 +5,9 @@ compile_error!("The fixture runner currently supports Linux and macOS only.");
 
 mod device;
 mod fixtures;
+mod process;
 mod runner;
+mod sandbox;
 mod work;
 
 use fixtures::Case;
@@ -24,6 +26,7 @@ patchriot-relay resume --state-dir PATH
 
 patchriot-relay demo
 patchriot-relay fixture <case> [--timeout-ms N] [--max-output-bytes N] [--cancel-after-ms N]
+patchriot-relay sandbox-check --socket PATH --image sha256:IMAGE_ID
 
 Cases: original, patched, clean, slow, noisy, split_output, malformed, nonzero, descendant, environment
 Defaults: 3000 ms, 8192 combined stdout/stderr bytes. Maximums: 60000 ms, 1048576 bytes.
@@ -49,6 +52,9 @@ fn execute() -> Result<u8, Box<dyn std::error::Error>> {
     }
     if ["init", "pair", "connect", "status", "pause", "resume"].contains(&args[0].as_str()) {
         return device::execute(&args);
+    }
+    if args[0] == "sandbox-check" {
+        return sandbox::execute(&args);
     }
     // The subprocess can run only these compiled-in fixtures, never a shell command.
     if args.len() == 2 && args[0] == "__fixture" {
@@ -101,14 +107,14 @@ fn execute() -> Result<u8, Box<dyn std::error::Error>> {
         let mut runs = Vec::new();
         for case in [Case::Original, Case::Patched, Case::Clean] {
             let report = runner::run(&executable, case, limits, &cancelled, None)?;
-            let completed = report.outcome == Outcome::Completed;
+            let completed = report.process.outcome == Outcome::Completed;
             runs.push(report);
             if !completed {
                 break;
             }
         }
         let verified = runs.len() == 3
-            && runs.iter().all(|r| r.outcome == Outcome::Completed)
+            && runs.iter().all(|r| r.process.outcome == Outcome::Completed)
             && runs
                 .iter()
                 .zip([Case::Original, Case::Patched, Case::Clean])
@@ -129,7 +135,7 @@ fn execute() -> Result<u8, Box<dyn std::error::Error>> {
         code = u8::from(!verified);
     } else {
         let report = runner::run(&executable, case, limits, &cancelled, cancel_after)?;
-        code = u8::from(report.outcome != Outcome::Completed);
+        code = u8::from(report.process.outcome != Outcome::Completed);
         serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
     }
     println!();
