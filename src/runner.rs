@@ -68,7 +68,7 @@ pub struct Report {
     case: Case,
     pub outcome: Outcome,
     limits: Limits,
-    duration_ms: u128,
+    pub duration_ms: u128,
     process_started: bool,
     exit_code: Option<i32>,
     termination_signal: Option<i32>,

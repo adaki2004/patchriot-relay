@@ -6,6 +6,7 @@ compile_error!("The fixture runner currently supports Linux and macOS only.");
 mod device;
 mod fixtures;
 mod runner;
+mod work;
 
 use fixtures::Case;
 use runner::{Limits, Outcome};
@@ -16,7 +17,7 @@ const HELP: &str = "Patchriot Relay — pairing, presence and owned fixtures
 
 patchriot-relay init --state-dir PATH --dispatcher URL --audience NAME --label NAME --compute-group NAME
 patchriot-relay pair --state-dir PATH
-patchriot-relay connect --state-dir PATH [--once]
+patchriot-relay connect --state-dir PATH [--once] [--fixtures]
 patchriot-relay status --state-dir PATH
 patchriot-relay pause --state-dir PATH
 patchriot-relay resume --state-dir PATH

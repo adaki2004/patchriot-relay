@@ -4,7 +4,7 @@ Connect your agent to the defense swarm.
 
 Patchriot Relay is the Rust application that lets a patcher contribute a working agent, inference and compute from a PC or VPS. The agent investigates authorized code and websites, runs permitted tools and returns evidence for review. Hermes is the first planned adapter; the relay does not include model weights.
 
-**Status:** the local fixture runner and device onboarding are implemented. The relay can pair, connect outward to a dispatcher, report presence, pause and resume. It does not yet run an AI agent or accept customer code. Hermes, work dispatch and the production sandbox remain planned.
+**Status:** the local fixture runner, device onboarding and queued owned-fixture assignments are implemented. The relay can pair, connect outward, report presence, pause/resume and retry a saved result after a lost response. It does not yet run an AI agent or accept customer code. Hermes and the production sandbox remain planned.
 
 **DON'T TRUST! VERIFY!** Read this README yourself or ask your own agent to inspect the implementation, permissions, dependencies and release provenance before running it.
 
@@ -54,7 +54,7 @@ cargo run --locked -- pair --state-dir .local/relay-one
 cargo run --locked -- connect --state-dir .local/relay-one
 ```
 
-`init` creates a private state directory and an Ed25519 key readable only by its owner. It refuses to overwrite an existing identity. `pair` prints a five-minute code to claim from the matching account. The dashboard for that step is being built; the dispatcher currently exposes authenticated core routes for claiming and approving. `connect` waits for a claim, then sends signed heartbeats every ten seconds. It reports `awaiting_approval` until an admin approves the device. `--once` performs one connection step and exits, which is useful for diagnostics.
+`init` creates a private state directory and an Ed25519 key readable only by its owner. It refuses to overwrite an existing identity. `pair` prints a five-minute code to enter under **Pair a relay** in the core website. `connect` waits for a claim, then sends signed heartbeats every ten seconds. It reports `awaiting_approval` until an admin approves the device through **Fleet & approvals**. `--once` performs one connection step and exits, which is useful for diagnostics.
 
 ```sh
 cargo run --locked -- status --state-dir .local/relay-one
@@ -66,6 +66,20 @@ Pause/resume takes effect on the next heartbeat. The private key stays local; on
 
 Keep state directories out of Git and backups shared with other people. Use different private directories for different devices. A shared machine should use the same declared `compute-group` across its relay instances; this declaration is not hardware attestation.
 
+## Accept a fixture review
+
+Add `--fixtures` to explicitly accept the built-in example from the dispatcher:
+
+```sh
+cargo run --locked -- connect --state-dir .local/relay-one --fixtures
+```
+
+Without that option, `connect` only reports presence. In the website, **Reviews → New fixture review** queues the owned access-control example. Three distinct approved devices take the investigator, reproducer and challenger roles; devices sharing a compute group run one at a time. Each role runs the original, patched and clean examples. These are known fixtures, not AI-generated findings, patches or independent audits. No model, shell command, source URL or resource-limit override can arrive through this path.
+
+Poll counters and pending results are saved privately and atomically. If a result reply is lost, the relay resends the saved result; it does not fabricate a replacement. The dispatcher deduplicates it. Cancelled, expired or replaced leases reject late results; a rejected stale outbox entry is discarded. Revocation stops further requests. Pause is checked before each fixture, and OS signals interrupt the current process. Each fixture has the same local deadline/output bounds as the standalone demo; unconfirmed process cleanup stops the connection loop.
+
+The 60-second assignment lease is not extended by retries. Interrupted work can be reassigned up to three attempts, within the review's 15-minute lifetime. A report includes the actual device/operator/compute-group identities and labels its evidence as device-reported. `--once --fixtures` completes at most one assigned role and emits newline-delimited JSON events. Core's `scripts/smoke-reviews.py` exercises three real relays and deliberately loses a result reply to check recovery.
+
 ## Planned lifecycle
 
 1. Generate a device key locally. Prove possession in a short-lived, one-use pairing request, then approve it from the signed-in account with fresh authentication.
@@ -75,11 +89,11 @@ Keep state directories out of Git and backups shared with other people. Use diff
 5. Run a disposable agent session. Return bounded artifacts through job-scoped credentials; retain a durable completion record until acknowledged.
 6. Pause to stop accepting new work. Cancellation terminates the process tree and reports whether termination was confirmed. Revocation blocks new work and invalidates future artifact access; it cannot erase plaintext already received by an operator.
 
-The commands above implement pairing and presence. Work execution, doctor diagnostics and local unpairing remain planned; owners can revoke a device through the authenticated service. Model probes with a cost require an explicit bounded run.
+The commands above implement pairing, presence and the fixed owned-fixture queue. Arbitrary agent execution, doctor diagnostics and local unpairing remain planned; owners can revoke a device through the authenticated service. Model probes with a cost require an explicit bounded run.
 
 ## Easy pairing, separate approval
 
-Sign in with Google, choose **Become a patcher**, then follow the relay's pairing link or enter its short-lived code in the dashboard. The browser shows the device being connected; the account confirms that exact device. Collect the operator profile during this flow rather than requiring a separate application first.
+The local prototype uses one-use account invitations. Enter the short-lived device code in the dashboard and complete the operator profile there. Google sign-in and stronger patcher/admin authentication are planned before private beta; an invitation is not a verified Google identity.
 
 Ask for a display name, a contact address confirmed through sign-in, whether this is their own machine or a VPS, and confirmation that they control it and accept the private-work handling rules. A GitHub or professional profile is optional context for manual approval. Do not request SSH passwords, cloud credentials, model-provider keys or identity documents in this form.
 
