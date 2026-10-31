@@ -425,6 +425,10 @@ async fn supervise(
         report.outcome = "agent_failed";
     }
     report.duration_ms = started.elapsed().as_millis();
+    eprintln!(
+        "agent stopped: outcome={} exit_code={:?} inference_calls={} final_event={} duration_ms={}",
+        report.outcome, report.exit_code, report.inference_calls, final_seen, report.duration_ms,
+    );
     Ok(report)
 }
 

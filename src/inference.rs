@@ -10,6 +10,56 @@ pub const MAX_REQUEST: usize = 65_536;
 pub const MAX_RESPONSE: usize = 262_144;
 pub const MAX_TOKENS: u64 = 192;
 
+/// Operational counters only. Never interpolate model text, errors or IDs into
+/// logs: even a provider's finish reason is untrusted, possibly private text.
+#[derive(Debug)]
+struct ResponseStats {
+    finish: &'static str,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+impl ResponseStats {
+    fn read(bytes: &[u8], streaming: bool) -> Self {
+        let mut stats = Self {
+            finish: "not_reported",
+            prompt_tokens: None,
+            completion_tokens: None,
+        };
+        if streaming {
+            // Parse after the bounded stream finishes so HTTP chunks and UTF-8
+            // boundaries cannot split a data line. No response is written to disk.
+            for line in bytes.split(|&b| b == b'\n') {
+                if let Some(data) = line.strip_prefix(b"data:")
+                    && let Ok(value) = serde_json::from_slice(data)
+                {
+                    stats.observe(&value);
+                }
+            }
+        } else if let Ok(value) = serde_json::from_slice(bytes) {
+            stats.observe(&value);
+        }
+        stats
+    }
+
+    fn observe(&mut self, value: &Value) {
+        if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
+            self.finish = match reason {
+                "stop" => "stop",
+                "length" => "length",
+                "tool_calls" => "tool_calls",
+                "content_filter" => "content_filter",
+                "function_call" => "function_call",
+                _ => "other",
+            };
+        }
+        if value["usage"].is_object() {
+            self.prompt_tokens = value["usage"]["prompt_tokens"].as_u64();
+            self.completion_tokens = value["usage"]["completion_tokens"].as_u64();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -372,6 +422,7 @@ impl Broker {
                 .await;
             return;
         };
+        let mut received = Vec::new();
         let result = async {
             let mut response = self
                 .client
@@ -410,7 +461,6 @@ impl Broker {
                 })
                 .await
                 .map_err(|_| "agent_disconnected")?;
-            let mut bytes = 0;
             while let Some(chunk) = response.chunk().await.map_err(|error| {
                 if error.is_timeout() {
                     "model_timeout"
@@ -418,10 +468,10 @@ impl Broker {
                     "model_stream_interrupted"
                 }
             })? {
-                bytes += chunk.len();
-                if bytes > MAX_RESPONSE {
+                if received.len() + chunk.len() > MAX_RESPONSE {
                     return Err("model_output_limit");
                 }
+                received.extend_from_slice(&chunk);
                 for piece in chunk.chunks(4096) {
                     output
                         .send(Frame::Chunk {
@@ -439,6 +489,15 @@ impl Broker {
             Ok::<_, &'static str>(())
         }
         .await;
+        let stats = ResponseStats::read(&received, body["stream"] == true);
+        eprintln!(
+            "model response: transport={} finish={} prompt_tokens={:?} completion_tokens={:?} bytes={}",
+            result.err().unwrap_or("complete"),
+            stats.finish,
+            stats.prompt_tokens,
+            stats.completion_tokens,
+            received.len(),
+        );
         if let Err(reason) = result {
             let _ = output.send(Frame::Failed { id, reason }).await;
         }
@@ -453,6 +512,42 @@ pub(crate) mod tests {
         net::TcpListener,
         thread,
     };
+
+    #[test]
+    fn completion_diagnostics_read_stream_usage_without_exposing_private_text() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"private answer\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4000,\"completion_tokens\":512}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let stats = ResponseStats::read(body.as_bytes(), true);
+        assert_eq!(stats.finish, "length");
+        assert_eq!(stats.prompt_tokens, Some(4000));
+        assert_eq!(stats.completion_tokens, Some(512));
+        assert!(!format!("{stats:?}").contains("private"));
+        let hostile = json!({"choices":[{"finish_reason":"private\nforged log entry", "message":{"content":"private"}}], "usage":{"prompt_tokens":-1,"completion_tokens":"private"},"error":"private"});
+        let stats = ResponseStats::read(&serde_json::to_vec(&hostile).unwrap(), false);
+        assert_eq!(stats.finish, "other");
+        assert_eq!(stats.prompt_tokens, None);
+        assert_eq!(stats.completion_tokens, None);
+        assert!(!format!("{stats:?}").contains("private"));
+    }
+
+    #[test]
+    fn missing_or_interrupted_metadata_does_not_invent_a_finish_reason() {
+        for bytes in [b"".as_slice(), b"data: {\"choices\":[", b"data: [DONE]\n"] {
+            let stats = ResponseStats::read(bytes, true);
+            assert_eq!(stats.finish, "not_reported");
+            assert_eq!(stats.completion_tokens, None);
+        }
+        let stats = ResponseStats::read(
+            br#"{"choices":[{"finish_reason":"tool_calls"}],"usage":{"completion_tokens":40}}"#,
+            false,
+        );
+        assert_eq!(stats.finish, "tool_calls");
+        assert_eq!(stats.completion_tokens, Some(40));
+    }
 
     pub(crate) fn broker() -> Broker {
         Broker {
