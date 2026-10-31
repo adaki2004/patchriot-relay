@@ -208,6 +208,14 @@ mod tests {
                 .evidence_complete(&task.evidence.snapshot)
         );
         run.events[0]["data"]["args"][2]["command"] = json!("python /patchriot/inspect_site.py");
+        // Structured output can still confuse the overall snapshot hash with a
+        // resource hash. Valid JSON must not turn that into accepted evidence.
+        let mut fake = assessment.clone();
+        fake["findings"][0]["citations"][0]["resource_sha256"] = json!(task.snapshot_sha256);
+        run.events[1]["data"]["final_response"] = json!(fake.to_string());
+        let result = evidence(&run, &settings, None, &task, true, true);
+        assert!(result.assessment.is_some());
+        assert!(!result.evidence_complete(&task.evidence.snapshot));
         let mut fake = assessment;
         fake["findings"][0]["citations"][0]["quote"] = json!("invented");
         run.events[1]["data"]["final_response"] = json!(fake.to_string());

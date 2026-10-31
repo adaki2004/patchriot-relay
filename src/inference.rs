@@ -99,6 +99,51 @@ pub struct Broker {
     tags: Value,
     version: Value,
     max_tokens: u64,
+    response_format: Option<Value>,
+}
+
+/// Generation guidance, not evidence validation. A model can produce this shape
+/// with invented claims or quotations; the normal result checks still apply.
+fn website_response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "website_assessment",
+            "strict": true,
+            "schema": {
+                "type": "object", "additionalProperties": false,
+                "required": ["summary", "findings", "limitations"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "findings": {
+                        "type": "array", "maxItems": 1,
+                        "items": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["title", "support", "explanation", "suggested_action", "citations"],
+                            "properties": {
+                                "title": {"type": "string"},
+                                "support": {"type": "string", "enum": ["observed_in_snapshot", "needs_live_test", "not_supported"]},
+                                "explanation": {"type": "string"},
+                                "suggested_action": {"type": "string"},
+                                "citations": {
+                                    "type": "array", "minItems": 1, "maxItems": 3,
+                                    "items": {
+                                        "type": "object", "additionalProperties": false,
+                                        "required": ["resource_sha256", "quote"],
+                                        "properties": {
+                                            "resource_sha256": {"type": "string"},
+                                            "quote": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "limitations": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "string"}}
+                }
+            }
+        }
+    })
 }
 
 pub fn origin(value: &str) -> Result<String, &'static str> {
@@ -151,10 +196,11 @@ async fn bounded_json(mut response: reqwest::Response) -> Result<Value, &'static
 }
 
 impl Broker {
-    /// A small structured website report needs more space than the two-sentence
-    /// example. Neither the server nor the model may choose this ceiling.
-    pub fn website_budget(mut self) -> Self {
+    /// Website reports use a fixed format and need more space than the
+    /// two-sentence example. The runtime cannot change the schema or ceiling.
+    pub fn for_website_review(mut self) -> Self {
         self.max_tokens = 512;
+        self.response_format = Some(website_response_format());
         self
     }
 
@@ -261,6 +307,7 @@ impl Broker {
             tags: json!({"models":[tag]}),
             version: json!({"version":version["version"]}),
             max_tokens: MAX_TOKENS,
+            response_format: None,
         })
     }
 
@@ -378,7 +425,19 @@ impl Broker {
         // relay owns the ceiling: forward a bounded request without raising it.
         body.insert("max_tokens".into(), json!(tokens.min(self.max_tokens)));
         body.insert("reasoning_effort".into(), json!("none"));
-        Ok(Value::Object(body))
+        if let Some(format) = &self.response_format {
+            body.insert("response_format".into(), format.clone());
+        }
+        let body = Value::Object(body);
+        // Adding the relay-owned schema must not exceed the transport budget.
+        if serde_json::to_vec(&body)
+            .map_err(|_| "invalid chat object")?
+            .len()
+            > MAX_REQUEST
+        {
+            return Err("prepared model request exceeds limit");
+        }
+        Ok(body)
     }
 
     pub async fn respond(&self, request: Request, output: mpsc::Sender<Frame>) {
@@ -558,6 +617,7 @@ pub(crate) mod tests {
             tags: json!({}),
             version: json!({}),
             max_tokens: MAX_TOKENS,
+            response_format: None,
         }
     }
     #[test]
@@ -575,7 +635,7 @@ pub(crate) mod tests {
         request.body.as_mut().unwrap()["max_tokens"] = json!(u64::MAX);
         assert_eq!(broker().chat(&request).unwrap()["max_tokens"], 192);
         assert_eq!(
-            broker().website_budget().chat(&request).unwrap()["max_tokens"],
+            broker().for_website_review().chat(&request).unwrap()["max_tokens"],
             512
         );
     }
@@ -623,6 +683,7 @@ pub(crate) mod tests {
                 json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://private"}}]}]),
             ),
             ("store", json!(true)),
+            ("response_format", json!({"type":"text"})),
             ("tools", json!([{"type":"web_search"}])),
             ("tool_choice", json!({"type":"web_search"})),
             (
@@ -805,6 +866,70 @@ pub(crate) mod tests {
         assert_eq!(requests[3]["body"]["max_tokens"], 128);
         assert_eq!(requests[3]["body"]["reasoning_effort"], "none");
         assert!(requests[3]["body"].get("options").is_none());
+        assert!(requests[3]["body"].get("response_format").is_none());
+    }
+
+    #[tokio::test]
+    async fn website_format_reaches_provider_without_changing_tools_or_trusting_its_reply() {
+        // A provider may ignore the schema. Its answer must arrive unchanged so
+        // result validation can reject it, rather than silently repairing it.
+        let answer =
+            br#"{"choices":[{"message":{"content":"not a report"},"finish_reason":"stop"}]}"#;
+        let (origin, fixture) = server(vec![(200, "application/json", answer.to_vec())]);
+        let mut broker = broker().for_website_review();
+        broker.origin = origin;
+        let mut request = chat();
+        let body = request.body.as_mut().unwrap();
+        body["max_tokens"] = json!(u64::MAX);
+        body["stream"] = json!(false);
+        let tools = json!([{"type":"function", "function":{"name":"terminal", "parameters":{"type":"object"}}}]);
+        body["tools"] = tools.clone();
+        body["tool_choice"] = json!("auto");
+        let frames = collect(broker, request).await;
+        assert!(matches!(frames.last(), Some(Frame::End { .. })));
+        let received: Vec<_> = frames
+            .iter()
+            .flat_map(|frame| match frame {
+                Frame::Chunk { hex, .. } => hex::decode(hex).unwrap(),
+                _ => vec![],
+            })
+            .collect();
+        assert_eq!(received, answer);
+        let requests = fixture.join().unwrap();
+        let body = &requests[0]["body"];
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        let schema = &body["response_format"]["json_schema"]["schema"];
+        assert_eq!(
+            schema["required"],
+            json!(["summary", "findings", "limitations"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["findings"]["maxItems"], 1);
+    }
+
+    #[test]
+    fn runtime_cannot_override_website_format_or_exceed_total_request_budget() {
+        let website = broker().for_website_review();
+        for format in [
+            json!(null),
+            json!({"type":"text"}),
+            website_response_format(),
+        ] {
+            let mut request = chat();
+            request.body.as_mut().unwrap()["response_format"] = format;
+            assert!(website.chat(&request).is_err());
+        }
+        let mut request = chat();
+        request.body.as_mut().unwrap()["messages"][0]["content"] =
+            json!("x".repeat(MAX_REQUEST - 256));
+        assert!(broker().chat(&request).is_ok());
+        assert_eq!(
+            website.chat(&request).unwrap_err(),
+            "prepared model request exceeds limit"
+        );
     }
 
     #[tokio::test]
