@@ -5,6 +5,8 @@ Original material in this repository is licensed under AGPL-3.0-only. See LICENS
 
 Design acknowledgement
 IdentityMD worker — https://github.com/Identity-md/worker
-The public worker's contributor lifecycle informed pairing, capability checks and result delivery. This foundation contains original documentation only; no upstream implementation is included or represented as licensed for redistribution here.
+The public worker's contributor lifecycle informed pairing, capability checks and result delivery. Patchriot's fixture runner is original implementation; no upstream worker code is included or represented as licensed for redistribution here.
+
+Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their own licenses and notices; the Patchriot license does not replace them. The runner's direct dependencies are ctrlc, rustix, serde, serde_json and tempfile. Preserve the selected dependency licenses when distributing binaries.
 
 Preserve the applicable copyright and complete license notices when third-party code is actually imported. External runtimes and model weights require their own license review.

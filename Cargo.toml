@@ -1,0 +1,21 @@
+[package]
+name = "patchriot-relay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "AGPL-3.0-only"
+description = "Local execution controls for Patchriot agents"
+publish = false
+
+[dependencies]
+ctrlc = { version = "3.5.2", features = ["termination"] }
+rustix = { version = "1.1.6", features = ["fs", "process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
