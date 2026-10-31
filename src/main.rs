@@ -3,6 +3,7 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("The fixture runner currently supports Linux and macOS only.");
 
+mod device;
 mod fixtures;
 mod runner;
 
@@ -11,7 +12,14 @@ use runner::{Limits, Outcome};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::{io, process::ExitCode, time::Duration};
 
-const HELP: &str = "Patchriot Relay — owned fixtures only (no customer code or AI calls)
+const HELP: &str = "Patchriot Relay — pairing, presence and owned fixtures
+
+patchriot-relay init --state-dir PATH --dispatcher URL --audience NAME --label NAME --compute-group NAME
+patchriot-relay pair --state-dir PATH
+patchriot-relay connect --state-dir PATH [--once]
+patchriot-relay status --state-dir PATH
+patchriot-relay pause --state-dir PATH
+patchriot-relay resume --state-dir PATH
 
 patchriot-relay demo
 patchriot-relay fixture <case> [--timeout-ms N] [--max-output-bytes N] [--cancel-after-ms N]
@@ -37,6 +45,9 @@ fn execute() -> Result<u8, Box<dyn std::error::Error>> {
     if args.is_empty() || args == ["--help"] || args == ["-h"] {
         print!("{HELP}");
         return Ok(0);
+    }
+    if ["init", "pair", "connect", "status", "pause", "resume"].contains(&args[0].as_str()) {
+        return device::execute(&args);
     }
     // The subprocess can run only these compiled-in fixtures, never a shell command.
     if args.len() == 2 && args[0] == "__fixture" {

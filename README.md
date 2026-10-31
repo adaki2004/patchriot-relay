@@ -4,13 +4,13 @@ Connect your agent to the defense swarm.
 
 Patchriot Relay is the Rust application that lets a patcher contribute a working agent, inference and compute from a PC or VPS. The agent investigates authorized code and websites, runs permitted tools and returns evidence for review. Hermes is the first planned adapter; the relay does not include model weights.
 
-**Status:** the local Rust fixture runner is implemented. It exercises process supervision on owned examples; it does not run an AI agent or accept customer code. Pairing, Hermes, the dispatcher connection and the production sandbox are planned.
+**Status:** the local fixture runner and device onboarding are implemented. The relay can pair, connect outward to a dispatcher, report presence, pause and resume. It does not yet run an AI agent or accept customer code. Hermes, work dispatch and the production sandbox remain planned.
 
 **DON'T TRUST! VERIFY!** Read this README yourself or ask your own agent to inspect the implementation, permissions, dependencies and release provenance before running it.
 
 ## Run the first slice
 
-Install Rust through your usual trusted installation method. The repository pins Rust 1.94.1; Cargo uses `rust-toolchain.toml` and the committed dependency lockfile. Linux and macOS are supported by this fixture runner.
+Install Rust through your usual trusted installation method. Place `patchriot-core` beside this repository; its separately licensed protocol crate is the shared dependency. The repository pins Rust 1.94.1; Cargo uses `rust-toolchain.toml` and the committed dependency lockfile. Linux and macOS are supported.
 
 ```sh
 cargo run --locked -- demo
@@ -42,6 +42,30 @@ cargo test --locked --all-targets
 
 The tests cover the specific regression and clean control, deadlines, cancellation before/during execution, OS signals, combined output limits, exact-limit behavior, malformed output, failed processes, pipe-holding descendants and parent-environment canaries. GitHub Actions is configured to run these checks on Linux/macOS and audit the dependency lockfile; hosted results require the repository to be pushed.
 
+CI checks out the protocol dependency at a pinned core commit. If core is private, configure `PATCHRIOT_READ_TOKEN` with read-only access to that repository. Once core is public, the default GitHub token is sufficient. No credential value belongs in source or a release.
+
+## Pair and connect
+
+With a local dispatcher configured for audience `patchriot-local-v1`:
+
+```sh
+cargo run --locked -- init --state-dir .local/relay-one --dispatcher http://127.0.0.1:7411 --audience patchriot-local-v1 --label "My relay" --compute-group "my-machine"
+cargo run --locked -- pair --state-dir .local/relay-one
+cargo run --locked -- connect --state-dir .local/relay-one
+```
+
+`init` creates a private state directory and an Ed25519 key readable only by its owner. It refuses to overwrite an existing identity. `pair` prints a five-minute code to claim from the matching account. The dashboard for that step is being built; the dispatcher currently exposes authenticated core routes for claiming and approving. `connect` waits for a claim, then sends signed heartbeats every ten seconds. It reports `awaiting_approval` until an admin approves the device. `--once` performs one connection step and exits, which is useful for diagnostics.
+
+```sh
+cargo run --locked -- status --state-dir .local/relay-one
+cargo run --locked -- pause --state-dir .local/relay-one
+cargo run --locked -- resume --state-dir .local/relay-one
+```
+
+Pause/resume takes effect on the next heartbeat. The private key stays local; only signatures and declared device details leave the machine. A process lock prevents two connection loops from using the same directory. A revoked device stops connecting; rejoining requires a new identity and approval. HTTPS is required for remote endpoints; HTTP is accepted only for explicit loopback addresses. Redirects and environment proxy settings are disabled for these credential-bearing requests. The current runtime is explicitly `owned_fixture`; no model is represented as connected by these commands.
+
+Keep state directories out of Git and backups shared with other people. Use different private directories for different devices. A shared machine should use the same declared `compute-group` across its relay instances; this declaration is not hardware attestation.
+
 ## Planned lifecycle
 
 1. Generate a device key locally. Prove possession in a short-lived, one-use pairing request, then approve it from the signed-in account with fresh authentication.
@@ -51,7 +75,7 @@ The tests cover the specific regression and clean control, deadlines, cancellati
 5. Run a disposable agent session. Return bounded artifacts through job-scoped credentials; retain a durable completion record until acknowledged.
 6. Pause to stop accepting new work. Cancellation terminates the process tree and reports whether termination was confirmed. Revocation blocks new work and invalidates future artifact access; it cannot erase plaintext already received by an operator.
 
-Pairing, run, status, doctor, pause and unpair are intended CLI operations, not commands available today. Diagnostics must explain failed checks. Model probes with a cost require an explicit bounded run.
+The commands above implement pairing and presence. Work execution, doctor diagnostics and local unpairing remain planned; owners can revoke a device through the authenticated service. Model probes with a cost require an explicit bounded run.
 
 ## Easy pairing, separate approval
 

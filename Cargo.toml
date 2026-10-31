@@ -1,6 +1,6 @@
 [package]
 name = "patchriot-relay"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.94"
 license = "AGPL-3.0-only"
@@ -9,10 +9,17 @@ publish = false
 
 [dependencies]
 ctrlc = { version = "3.5.2", features = ["termination"] }
+getrandom = "0.4"
+hex = "0.4.3"
+patchriot-protocol = { path = "../patchriot-core/crates/protocol" }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rustix = { version = "1.1.6", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.23"
+url = "2.5"
+uuid = { version = "1.22", features = ["serde"] }
+zeroize = "1.9"
 
 [lints.rust]
 unsafe_code = "forbid"

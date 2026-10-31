@@ -7,6 +7,6 @@ Design acknowledgement
 IdentityMD worker — https://github.com/Identity-md/worker
 The public worker's contributor lifecycle informed pairing, capability checks and result delivery. Patchriot's fixture runner is original implementation; no upstream worker code is included or represented as licensed for redistribution here.
 
-Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their own licenses and notices; the Patchriot license does not replace them. The runner's direct dependencies are ctrlc, rustix, serde, serde_json and tempfile. Preserve the selected dependency licenses when distributing binaries.
+Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their own licenses and notices; the Patchriot license does not replace them. This includes the separately Apache-2.0-licensed patchriot-protocol crate, Ed25519 implementation, HTTP/TLS client and operating-system bindings. Preserve the selected dependency licenses when distributing binaries.
 
 Preserve the applicable copyright and complete license notices when third-party code is actually imported. External runtimes and model weights require their own license review.
