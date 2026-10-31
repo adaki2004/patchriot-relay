@@ -1,4 +1,4 @@
-//! Persistent device identity, presence and optional owned-fixture assignments.
+//! Persistent device identity, presence and optional owned-example assignments.
 //! No remote shell is exposed. Private keys stay in the operator's state directory.
 
 use patchriot_protocol::*;
@@ -10,10 +10,10 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -37,6 +37,8 @@ struct Config {
     active_assignment: Option<WorkAssignment>,
     #[serde(default)]
     pending_result: Option<CompleteWork>,
+    #[serde(default)]
+    renewal_sequence: u64,
 }
 
 fn private_open(path: &Path, create: bool) -> Result<File, Error> {
@@ -86,6 +88,21 @@ fn write_config(directory: &Path, config: &Config) -> Result<(), Error> {
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary.persist(directory.join("relay.json"))?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn write_agent_report(directory: &Path, report: &serde_json::Value) -> Result<(), Error> {
+    let bytes = serde_json::to_vec(report)?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err("local agent report exceeded its limit".into());
+    }
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(&bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(directory.join("last-agent-check.json"))?;
     File::open(directory)?.sync_all()?;
     Ok(())
 }
@@ -256,6 +273,7 @@ fn initialize(directory: &Path, options: &HashMap<&str, &str>) -> Result<(), Err
             work_sequence: 0,
             active_assignment: None,
             pending_result: None,
+            renewal_sequence: 0,
         },
     )?;
     println!(
@@ -317,6 +335,9 @@ fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<S
     // Reserve the sequence durably before sending. A lost response or restart
     // skips a number instead of accidentally reusing it for different content.
     write_config(directory, &config)?;
+    // Do not hold the local state lock during a potentially slow network call;
+    // pause/status must remain available while the dispatcher is unreachable.
+    drop(_lock);
     let reply: HeartbeatReply = post(
         client,
         &config,
@@ -366,11 +387,11 @@ fn send_result(directory: &Path, client: &reqwest::blocking::Client) -> Result<(
     match reply {
         Ok(accepted) => {
             if !accepted.accepted {
-                return Err("dispatcher did not accept the saved fixture result".into());
+                return Err("dispatcher did not accept the saved result".into());
             }
             println!(
                 "{}",
-                serde_json::json!({"event":"fixture_result_accepted","lease_id":result.lease_id,"fixture_matches":accepted.fixture_matches,"replayed":accepted.replayed})
+                serde_json::json!({"event":if result.result.mode().is_fixture() { "fixture_result_accepted" } else { "agent_result_accepted" },"mode":result.result.mode(),"lease_id":result.lease_id,"fixture_matches":accepted.fixture_matches,"replayed":accepted.replayed})
             );
             clear_assignment(directory)?;
         }
@@ -382,7 +403,7 @@ fn send_result(directory: &Path, client: &reqwest::blocking::Client) -> Result<(
             // A cancelled, superseded or expired lease cannot be resurrected by
             // an outbox retry. Discard only this saved result, never reinterpret it.
             clear_assignment(directory)?;
-            eprintln!("saved fixture result no longer has an active lease");
+            eprintln!("saved result no longer has an active lease");
         }
         Err(error) => return Err(error), // Keep the outbox for a network retry.
     }
@@ -393,6 +414,7 @@ fn work_tick(
     directory: &Path,
     client: &reqwest::blocking::Client,
     stop: &Arc<AtomicBool>,
+    agent: Option<&crate::agent::Settings>,
 ) -> Result<(), Error> {
     send_result(directory, client)?;
     let (config, key) = {
@@ -423,11 +445,17 @@ fn work_tick(
         clear_assignment(directory)?;
         return Ok(());
     };
+    if (assignment.mode == ReviewMode::OwnedAgent) != agent.is_some() {
+        return Err("assignment mode does not match the opted-in local runtime".into());
+    }
     {
         let _lock = state_lock(directory)?;
         let mut latest = read_config(directory)?;
         latest.active_assignment = Some(assignment.clone());
         write_config(directory, &latest)?;
+    }
+    if let Some(settings) = agent {
+        return agent_work(directory, client, stop, settings, &assignment);
     }
     let ready = || {
         let Ok(_lock) = state_lock(directory) else {
@@ -453,11 +481,233 @@ fn work_tick(
     Ok(())
 }
 
+fn renew(
+    directory: &Path,
+    client: &reqwest::blocking::Client,
+    lease_id: Uuid,
+) -> Result<(Instant, WorkRenewed), Error> {
+    let (config, key) = {
+        let _lock = state_lock(directory)?;
+        let mut config = read_config(directory)?;
+        if config.paused || config.active_assignment.as_ref().map(|a| a.lease_id) != Some(lease_id)
+        {
+            return Err("assignment is no longer locally active".into());
+        }
+        config.renewal_sequence = config
+            .renewal_sequence
+            .checked_add(1)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or("renewal sequence exhausted")?;
+        write_config(directory, &config)?;
+        (config, read_key(directory)?)
+    };
+    let id = config.device_id.ok_or("missing device identity")?;
+    let started = Instant::now();
+    let reply: WorkRenewed = post(
+        client,
+        &config,
+        &key,
+        &format!("/v1/devices/{id}/work/renew"),
+        RenewWork {
+            lease_id,
+            sequence: config.renewal_sequence,
+        },
+    )?;
+    if reply.lease_id != lease_id
+        || reply.sequence != config.renewal_sequence
+        || reply.valid_for_seconds > 60
+        || reply.expires_at > reply.deadline_at
+    {
+        return Err("invalid lease renewal reply".into());
+    }
+    {
+        let _lock = state_lock(directory)?;
+        let mut latest = read_config(directory)?;
+        if let Some(active) = &mut latest.active_assignment
+            && active.lease_id == lease_id
+        {
+            active.expires_at = reply.expires_at;
+            write_config(directory, &latest)?;
+        }
+    }
+    Ok((started, reply))
+}
+
+/// All work uses this monotonic deadline. A response delayed in transit cannot
+/// grant another minute, and expiry latches even if a late renewal arrives.
+struct LeaseWindow(Mutex<(Instant, bool)>);
+impl LeaseWindow {
+    fn new(started: Instant, valid_seconds: u64) -> Self {
+        Self(Mutex::new((
+            started + Duration::from_secs(valid_seconds.saturating_sub(5)),
+            false,
+        )))
+    }
+    fn stopped_at(&self, now: Instant) -> bool {
+        let Ok(mut state) = self.0.lock() else {
+            return true;
+        };
+        state.1 |= now >= state.0;
+        state.1
+    }
+    fn stop(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.1 = true;
+        }
+    }
+    fn extend_at(&self, started: Instant, valid_seconds: u64, now: Instant) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        let until = started + Duration::from_secs(valid_seconds.saturating_sub(5));
+        state.1 |= now >= state.0 || now >= until;
+        if !state.1 {
+            state.0 = until;
+        }
+    }
+}
+
+fn locally_ready(directory: &Path, lease_id: Uuid) -> bool {
+    let Ok(_lock) = state_lock(directory) else {
+        return false;
+    };
+    read_config(directory).is_ok_and(|c| {
+        !c.paused && c.active_assignment.as_ref().map(|a| a.lease_id) == Some(lease_id)
+    })
+}
+
+fn agent_work(
+    directory: &Path,
+    client: &reqwest::blocking::Client,
+    stop: &Arc<AtomicBool>,
+    settings: &crate::agent::Settings,
+    assignment: &WorkAssignment,
+) -> Result<(), Error> {
+    // Renew before spawning even when a cached poll reply contains an assignment.
+    // The server must confirm that it is still this device's active lease.
+    let (started, renewed) = renew(directory, client, assignment.lease_id)?;
+    let window = LeaseWindow::new(started, renewed.valid_for_seconds);
+    let config = read_config(directory)?;
+    let device_id = config.device_id.ok_or("missing device identity")?;
+    let declared_model = config
+        .introduction
+        .declared_model
+        .as_deref()
+        .ok_or("missing model declaration")?;
+    let done = AtomicBool::new(false);
+    struct StopMonitor<'a>(&'a AtomicBool);
+    impl Drop for StopMonitor<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({"event":"agent_started","review_id":assignment.review_id,"role":assignment.role,"lease_id":assignment.lease_id})
+    );
+    std::thread::scope(|scope| {
+        let monitor = scope.spawn(|| {
+            struct StopWindow<'a>(&'a LeaseWindow);
+            impl Drop for StopWindow<'_> {
+                fn drop(&mut self) {
+                    self.0.stop();
+                }
+            }
+            let _stop_window = StopWindow(&window);
+            let mut heartbeat_at = Instant::now() + Duration::from_secs(10);
+            let mut renew_at = Instant::now() + Duration::from_secs(20);
+            while !done.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed)
+                    || window.stopped_at(Instant::now())
+                    || !locally_ready(directory, assignment.lease_id)
+                {
+                    window.stop();
+                    break;
+                }
+                if Instant::now() >= heartbeat_at {
+                    match tick(directory, client) {
+                        Ok(Some(state)) if ["online", "busy"].contains(&state.as_str()) => {}
+                        Err(error) if !terminal_remote_error(&error) => {
+                            eprintln!("heartbeat retry pending")
+                        }
+                        _ => {
+                            window.stop();
+                            break;
+                        }
+                    }
+                    heartbeat_at = Instant::now() + Duration::from_secs(10);
+                }
+                if Instant::now() >= renew_at {
+                    match renew(directory, client, assignment.lease_id) {
+                        Ok((started, reply)) => {
+                            window.extend_at(started, reply.valid_for_seconds, Instant::now())
+                        }
+                        Err(error) if !terminal_remote_error(&error) => {
+                            eprintln!("lease renewal retry pending")
+                        }
+                        _ => {
+                            window.stop();
+                            break;
+                        }
+                    }
+                    renew_at = Instant::now() + Duration::from_secs(10);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let stop_monitor = StopMonitor(&done);
+        let result = (|| {
+            let check = crate::agent::run(
+                settings,
+                Some(crate::agent::Assignment {
+                    device_id,
+                    lease_id: assignment.lease_id,
+                    declared_model,
+                }),
+                &|| stop.load(Ordering::Relaxed) || window.stopped_at(Instant::now()),
+            )?;
+            // Keep one bounded private trace for operator diagnosis. It is never
+            // printed or sent to the website; only typed observations are sent.
+            write_agent_report(directory, &check.report)?;
+            if stop.load(Ordering::Relaxed)
+                || window.stopped_at(Instant::now())
+                || !locally_ready(directory, assignment.lease_id)
+            {
+                clear_assignment(directory)?;
+                eprintln!("agent stopped; lease ended or work was cancelled");
+                return Ok(());
+            }
+            {
+                let _lock = state_lock(directory)?;
+                let mut latest = read_config(directory)?;
+                latest.pending_result = Some(CompleteWork {
+                    lease_id: assignment.lease_id,
+                    result: WorkResult::Agent(check.result),
+                });
+                write_config(directory, &latest)?;
+            }
+            send_result(directory, client)
+        })();
+        drop(stop_monitor);
+        if monitor.join().is_err() {
+            return Err("lease monitor stopped unexpectedly".into());
+        }
+        result
+    })
+}
+
+fn terminal_remote_error(error: &Error) -> bool {
+    error
+        .downcast_ref::<RemoteError>()
+        .is_some_and(|e| [400, 401, 403, 404, 409, 422].contains(&e.status))
+}
+
 pub fn execute(args: &[String]) -> Result<u8, Error> {
     let action = args[0].as_str();
     let mut options = HashMap::new();
     let mut once = false;
     let mut fixtures = false;
+    let mut agents = false;
     let mut args = args[1..].iter();
     while let Some(name) = args.next() {
         if name == "--once" && action == "connect" && !once {
@@ -468,7 +718,12 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             fixtures = true;
             continue;
         }
+        if name == "--agents" && action == "connect" && !agents {
+            agents = true;
+            continue;
+        }
         let allowed = name == "--state-dir"
+            || action == "connect" && name == "--agent-config"
             || action == "init"
                 && [
                     "--dispatcher",
@@ -517,11 +772,24 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             );
         }
         "connect" => {
+            if fixtures && agents || agents != options.contains_key("--agent-config") {
+                return Err(
+                    "choose --fixtures or --agents --agent-config PATH; each is explicit opt-in"
+                        .into(),
+                );
+            }
             if fixtures
                 && read_config(&directory)?.introduction.runtime != RuntimeKind::OwnedFixture
             {
-                return Err("--fixtures is only for owned_fixture devices; Hermes pairing currently reports presence only".into());
+                return Err("--fixtures is only for owned_fixture devices; without --agents a Hermes relay reports presence only".into());
             }
+            if agents && read_config(&directory)?.introduction.runtime != RuntimeKind::Hermes {
+                return Err("--agents requires a paired Hermes runtime declaration".into());
+            }
+            let settings = options
+                .get("--agent-config")
+                .map(|path| crate::agent::Settings::load(Path::new(path)))
+                .transpose()?;
             let daemon_lock = private_open(&directory.join("daemon.lock"), true)?;
             daemon_lock
                 .try_lock()
@@ -531,14 +799,24 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))?;
             let client = client()?;
             let mut failures = 0;
+            let mut recovered = false;
             loop {
                 let result = tick(&directory, &client).and_then(|state| {
-                    if fixtures
+                    if (fixtures || agents)
                         && state
                             .as_deref()
                             .is_some_and(|s| ["online", "busy"].contains(&s))
                     {
-                        work_tick(&directory, &client, &stop)?;
+                        if let Some(settings) = &settings
+                            && !recovered
+                        {
+                            let id = read_config(&directory)?
+                                .device_id
+                                .ok_or("missing device identity")?;
+                            crate::agent::recover(settings, id)?;
+                            recovered = true;
+                        }
+                        work_tick(&directory, &client, &stop, settings.as_ref())?;
                     }
                     Ok(())
                 });
@@ -548,6 +826,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                         // Never print response bodies, private keys or signed requests.
                         eprintln!("{error}");
                         if once
+                            || agents
                             || error.is::<crate::work::CleanupUnconfirmed>()
                             || error
                                 .downcast_ref::<RemoteError>()
@@ -578,6 +857,67 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_time_excludes_transit_and_late_replies_cannot_revive_expired_work() {
+        let start = Instant::now();
+        let lease = LeaseWindow::new(start, 60);
+        assert!(!lease.stopped_at(start + Duration::from_secs(54)));
+        lease.extend_at(
+            start + Duration::from_secs(40),
+            60,
+            start + Duration::from_secs(45),
+        );
+        assert!(!lease.stopped_at(start + Duration::from_secs(94)));
+        assert!(lease.stopped_at(start + Duration::from_secs(95)));
+        lease.extend_at(
+            start + Duration::from_secs(94),
+            60,
+            start + Duration::from_secs(96),
+        );
+        assert!(lease.stopped_at(start + Duration::from_secs(96)));
+
+        let delayed = LeaseWindow::new(start, 10);
+        assert!(delayed.stopped_at(start + Duration::from_secs(8)));
+        let late = LeaseWindow::new(start, 60);
+        late.extend_at(
+            start + Duration::from_secs(50),
+            60,
+            start + Duration::from_secs(56),
+        );
+        assert!(late.stopped_at(start + Duration::from_secs(56)));
+        let cancelled = LeaseWindow::new(start, 60);
+        cancelled.stop();
+        cancelled.extend_at(start, 60, start);
+        assert!(cancelled.stopped_at(start));
+        assert!(LeaseWindow::new(start, 4).stopped_at(start));
+    }
+
+    #[test]
+    fn local_agent_trace_is_private_bounded_and_keeps_only_the_last_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("last-agent-check.json");
+        write_agent_report(directory.path(), &serde_json::json!({"run":1})).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let before = fs::read(&path).unwrap();
+        assert!(
+            write_agent_report(
+                directory.path(),
+                &serde_json::json!({"output":"x".repeat(2 * 1024 * 1024)})
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        write_agent_report(directory.path(), &serde_json::json!({"run":2})).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap()["run"],
+            2
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn endpoints_require_tls_except_explicit_loopback() {

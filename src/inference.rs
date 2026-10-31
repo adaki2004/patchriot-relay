@@ -100,6 +100,12 @@ async fn bounded_json(mut response: reqwest::Response) -> Result<Value, &'static
 }
 
 impl Broker {
+    /// A serving profile may retain the original model name as its parent.
+    /// This catches accidental configuration swaps, not a dishonest model server.
+    pub fn matches_declaration(&self, declared: &str) -> bool {
+        self.model == declared || self.show["details"]["parent_model"].as_str() == Some(declared)
+    }
+
     pub async fn connect(url: &str, model: &str, digest: &str) -> Result<Self, &'static str> {
         let origin = origin(url)?;
         if !model_name(model)
@@ -430,6 +436,15 @@ pub(crate) mod tests {
             tags: json!({}),
             version: json!({}),
         }
+    }
+    #[test]
+    fn a_serving_profile_must_match_the_paired_model_or_its_declared_parent() {
+        let mut broker = broker();
+        assert!(broker.matches_declaration("owned-model:pilot"));
+        assert!(!broker.matches_declaration("another-model"));
+        broker.show = json!({"details":{"parent_model":"owned-base:small"}});
+        assert!(broker.matches_declaration("owned-base:small"));
+        assert!(!broker.matches_declaration("owned-base:large"));
     }
     fn chat() -> Request {
         Request {

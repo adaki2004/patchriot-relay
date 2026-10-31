@@ -6,7 +6,7 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
-**Working today:** pairing (owned fixtures or a declared Hermes agent), manual approval, presence, pause/resume, revocation, queued owned-fixture reviews, Linux sandbox diagnostics and an explicit local-agent check. **Next:** sandboxed agent execution through the queue. No customer code or model calls run through the current queue.
+**Working today:** pairing, manual approval, presence, pause/resume, revocation and queued checks of an owned example. Choose fast fixture tests or an isolated Hermes agent using your local model. Customer targets are not accepted.
 
 ## Try the owned example
 
@@ -34,28 +34,31 @@ cargo run --locked -- connect --state-dir .local/relay-one
 
 The Ed25519 key stays in your private state directory. The relay connects outward; it needs no public inbound port. Use HTTPS or an authenticated tunnel outside loopback. Three devices on one machine should declare the same compute group.
 
-For a Hermes installation, add `--runtime hermes --runtime-version VERSION --model MODEL` to `init`, using the version you inspected and the installed model name. Each agent needs its own state directory. These details are **operator declarations**, not verified model weights or a security qualification. A Hermes connection currently reports presence; `--fixtures` is reserved for the built-in example.
+For a Hermes installation, add `--runtime hermes --runtime-version VERSION --model MODEL` to `init`, using the version you inspected and the installed model name. Each agent needs its own state directory. These details are **operator declarations**, not verified model weights or a security qualification. A connection reports presence until you explicitly opt in to work.
 
 ## Control your contribution
 
 | Command after `cargo run --locked --` | Effect |
 | --- | --- |
 | `status --state-dir .local/relay-one` | Show local pairing and pause state |
-| `pause --state-dir .local/relay-one` | Stop accepting work on the next connection cycle |
+| `pause --state-dir .local/relay-one` | Stop accepting work and cancel an active agent check when its monitor observes the pause |
 | `resume --state-dir .local/relay-one` | Resume contribution |
 | `connect --state-dir .local/relay-one --fixtures` | Explicitly accept the fixed owned example |
+| `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` | Run isolated local-agent checks; setup below |
 
-Without `--fixtures`, the connection reports presence only. Heartbeats run every ten seconds; stale devices become offline after 30 seconds. Owners can revoke a device in the website. Revoked keys cannot reconnect.
+Without either work option, the connection reports presence only. Heartbeats continue during model execution; stale devices become offline after 30 seconds. Owners can revoke a device in the website. Revoked keys cannot reconnect.
 
-With **three approved devices** connected using `--fixtures`, choose **Reviews → New fixture review**. Investigator, reproducer and challenger roles run sequentially. Shared machines get one active assignment. Reports show actual device/operator counts; they do not imply three independent operators.
+With **three approved devices** connected in the same mode, choose **Reviews → New example review**. Three sequential roles check the same supplied bug and fix. Shared machines under one operator get one active assignment. Reports show device/operator counts; three processes on one host do not imply independent reviewers.
 
-Results are saved locally before submission and retried after connection loss. Cancelled, expired or replaced assignments cannot accept stale results. Keep state directories out of Git and shared backups.
+Results are saved locally before submission and retried after connection loss. Agent leases renew while healthy, with a fixed ten-minute ceiling per attempt and 35-minute review deadline. The relay uses a monotonic clock, reserves time for shutdown and stops when it cannot renew. Server cancellation is checked during renewal; it is not an instantaneous push. Local signals interrupt a running agent directly.
+
+Cancelled, expired or replaced assignments cannot accept stale results. Restarting an agent connection first removes that device's labelled leftover containers. A runner/configuration error stops the agent connection for inspection. The state directory keeps one private `last-agent-check.json` (at most 2 MiB), overwritten on each completed or interrupted check, to diagnose tool failures. Keep state directories out of Git and shared backups.
 
 ## Execution boundary
 
 The current runner clears inherited environment, uses a temporary directory and limits each fixture to **3 seconds and 8 KiB of combined output**. It terminates its process group on timeout or cancellation.
 
-**The queue uses process supervision, not a sandbox.** It accepts only compiled-in examples. The separate checks below test container isolation and a real agent's tools before queue integration.
+**Fixture mode** uses process supervision and accepts only compiled-in examples. **Agent mode** uses the container boundary below; it never falls back to host execution. The server supplies only the known scenario and lease. The operator controls the pinned image and local model endpoint.
 
 Private customer work will require approved operators and tested isolation. Assigned operators and permitted model providers can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
 
@@ -81,7 +84,7 @@ This runs only owned probes. It does not establish model honesty or rule out ker
 <details>
 <summary><strong>Run a local agent check (operators)</strong></summary>
 
-This runs Hermes against a tiny, owned access-control example and its **supplied patch**. It is separate from pairing and the review queue. An agent explaining this example has not demonstrated independent vulnerability discovery.
+This runs Hermes against a tiny, owned access-control example and its **supplied patch**. Try it manually before opting in to queued work. An agent explaining this example has not demonstrated independent vulnerability discovery.
 
 Build the pinned runtime adapter and use its immutable image ID:
 
@@ -105,9 +108,11 @@ The operator's configuration has five fields; replace the example image and mode
 
 Use an Ollama model that supports tools and a 64,000-token context. Its **stored model profile** must set `num_ctx 64000`; the compatible API does not apply that setting from chat requests. Inspect `/api/tags` for the digest and `/api/show` for the parameters. The relay checks both before starting. Keep the model server private, reachable only from the relay; the model URL accepts explicit loopback/private IPv4 addresses. This verifies the server's declaration, not remotely attested weights.
 
+After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept website requests. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
+
 **Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
 
-Configure the model server's separate CPU/RAM limits as well; the limits above cover the agent and its tools. The result includes timing, tool events, the reported regression and confirmed container removal. Cancellation stops the request and removes the container. A hard-killed relay or failed Docker engine needs operator inspection of containers labelled `io.patchriot.agent-check=1`. **Agent-reported evidence is not independent verification.** The CPU pilot uses one operator; more devices on that host do not add independent reviewers.
+Configure the model server's separate CPU/RAM limits as well; the limits above cover the agent and its tools. Manual output includes full bounded tool events; queued reports contain the parsed observations, model/image digests, timing and a bounded explanation. The explanation alone cannot pass the check. Cancellation stops the request and removes the container. If cleanup cannot be confirmed, inspect containers labelled `io.patchriot.agent-check=1` before restarting. **Agent-reported evidence is not independent verification.** The CPU pilot uses one operator; more devices on that host do not add independent reviewers.
 
 </details>
 

@@ -173,3 +173,29 @@ fn incomplete_or_misleading_runtime_declarations_do_not_create_an_identity() {
         assert!(!path.exists());
     }
 }
+
+#[test]
+fn agent_work_requires_explicit_opt_in_and_cannot_run_on_a_fixture_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("fixture");
+    assert!(
+        initialize(&path, "https://dispatcher.invalid")
+            .status
+            .success()
+    );
+    for args in [
+        vec!["--agents"],
+        vec!["--agent-config", "/not/read"],
+        vec!["--agents", "--fixtures", "--agent-config", "/not/read"],
+        vec!["--agents", "--agent-config", "/not/read"],
+    ] {
+        assert!(!invoke(&path, "connect", &args).status.success());
+        let state: Value =
+            serde_json::from_slice(&fs::read(path.join("relay.json")).unwrap()).unwrap();
+        assert_eq!(
+            state["sequence"], 0,
+            "must reject before a network heartbeat or work poll"
+        );
+        assert_eq!(state["work_sequence"], 0);
+    }
+}

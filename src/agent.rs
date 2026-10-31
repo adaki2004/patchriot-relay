@@ -1,11 +1,12 @@
 //! Explicit owned-example check through a pinned, network-isolated agent image.
-//! This is not yet an admission path for customer code or queued model work.
+//! The server selects an owned scenario; only the operator configures execution.
 
 use crate::{
     docker::{Container, Docker, immutable_image, no_entries},
     inference::{Broker, Frame, MAX_REQUEST, Request},
     process::Outcome,
 };
+use patchriot_protocol::{AgentFixtureObservation, AgentOutcome, AgentResult, AgentResultKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -42,12 +43,88 @@ const TMPFS: [(&str, &str); 3] = [
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Settings {
+pub struct Settings {
     docker_socket: PathBuf,
     image: String,
     model_url: String,
     model: String,
     model_digest: String,
+}
+
+impl Settings {
+    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(8193)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 8192 {
+            return Err("agent configuration exceeds 8 KiB".into());
+        }
+        let settings: Self =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid agent configuration")?;
+        if !immutable_image(&settings.image) {
+            return Err("agent image must be an immutable local sha256 image ID".into());
+        }
+        crate::inference::origin(&settings.model_url)?;
+        Ok(settings)
+    }
+}
+
+pub struct Assignment<'a> {
+    pub device_id: uuid::Uuid,
+    pub lease_id: uuid::Uuid,
+    pub declared_model: &'a str,
+}
+
+pub struct Check {
+    pub result: AgentResult,
+    pub report: Value,
+}
+
+/// Remove only this device's labelled leftovers before polling after a restart.
+/// The daemon lock prevents another process for the same identity running work.
+pub fn recover(
+    settings: &Settings,
+    device_id: uuid::Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let docker = Docker::new(&settings.docker_socket)?;
+    let label = format!("label=io.patchriot.device={device_id}");
+    let result = docker.control(&[
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        "label=io.patchriot.agent-check=1",
+        "--filter",
+        &label,
+        "--format",
+        "{{.Names}}",
+    ])?;
+    if result.outcome != Outcome::Completed {
+        return Err("could not inspect this device's previous agent containers".into());
+    }
+    let names = std::str::from_utf8(&result.stdout)?;
+    let names: Vec<_> = names.lines().collect();
+    if names.len() > 16
+        || names.iter().any(|name| {
+            !name
+                .strip_prefix("patchriot-agent-")
+                .is_some_and(|tail| tail.len() == 32 && tail.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+    {
+        return Err("unexpected agent container list; inspect the local runtime".into());
+    }
+    for name in names {
+        let mut previous = Container {
+            docker: &docker,
+            name: name.into(),
+            cleaned: false,
+        };
+        if !previous.cleanup() {
+            return Err("previous agent container cleanup could not be confirmed".into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -57,7 +134,7 @@ enum Wire {
     Event { event: String, data: Value },
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct AgentRun {
     outcome: &'static str,
     failure_reason: Option<&'static str>,
@@ -83,9 +160,15 @@ impl Drop for RequestTask {
 async fn supervise(
     command: std::process::Command,
     broker: Broker,
-    cancelled: &AtomicBool,
+    cancelled: &impl Fn() -> bool,
     timeout: Duration,
 ) -> io::Result<AgentRun> {
+    if cancelled() {
+        return Ok(AgentRun {
+            outcome: "cancelled",
+            ..AgentRun::default()
+        });
+    }
     let started = Instant::now();
     let mut child = tokio::process::Command::from(command)
         .stdin(Stdio::piped())
@@ -138,7 +221,7 @@ async fn supervise(
                 break;
             }
             _ = tick.tick() => {
-                if cancelled.load(Ordering::Relaxed) {
+                if cancelled() {
                     report.outcome = "cancelled";
                     break;
                 }
@@ -178,8 +261,7 @@ async fn supervise(
                             last_id = request.id;
                             active = Some(request.id);
                             if request.path == "/v1/chat/completions" {
-                                report.inference_calls += 1;
-                                if report.inference_calls > 4 {
+                                if report.inference_calls >= 4 {
                                     report.outcome = "inference_limit";
                                     break 'running;
                                 }
@@ -188,6 +270,7 @@ async fn supervise(
                                     report.outcome = "invalid_model_request";
                                     break 'running;
                                 }
+                                report.inference_calls += 1;
                                 eprintln!("agent requested model call {}", report.inference_calls);
                             }
                             if let Some(previous) = task.0.take() {
@@ -319,17 +402,23 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
     if args.len() != 3 || args[1] != "--config" {
         return Err("usage: patchriot-relay agent-check --config PATH".into());
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(&args[2])?
-        .take(8193)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 8192 {
-        return Err("agent configuration exceeds 8 KiB".into());
-    }
-    let settings: Settings =
-        serde_json::from_slice(&bytes).map_err(|_| "invalid agent configuration")?;
-    if !immutable_image(&settings.image) {
-        return Err("agent image must be an immutable local sha256 image ID".into());
+    let settings = Settings::load(Path::new(&args[2]))?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
+    let check = run(&settings, None, &|| cancelled.load(Ordering::Relaxed))?;
+    serde_json::to_writer_pretty(io::stdout().lock(), &check.report)?;
+    println!();
+    Ok(u8::from(!check.result.matches_fixture()))
+}
+
+pub fn run(
+    settings: &Settings,
+    assignment: Option<Assignment<'_>>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Check, Box<dyn std::error::Error>> {
+    if cancelled() {
+        return Err("agent check cancelled before startup".into());
     }
     let docker = Docker::new(Path::new(&settings.docker_socket))?;
     let image = docker.inspect("image", &settings.image)?;
@@ -351,9 +440,17 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
         &settings.model,
         &settings.model_digest,
     ))?;
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let signal = cancelled.clone();
-    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
+    if let Some(assignment) = &assignment
+        && !broker.matches_declaration(assignment.declared_model)
+    {
+        return Err(
+            "configured model does not match this device's declaration or its serving profile"
+                .into(),
+        );
+    }
+    if cancelled() {
+        return Err("agent check cancelled during preflight".into());
+    }
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).map_err(|_| "random source unavailable")?;
     let mut owned = Container {
@@ -368,6 +465,14 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
         "--name".into(),
         owned.name.clone(),
     ];
+    if let Some(assignment) = &assignment {
+        command.extend([
+            "--label".into(),
+            format!("io.patchriot.device={}", assignment.device_id),
+            "--label".into(),
+            format!("io.patchriot.lease={}", assignment.lease_id),
+        ]);
+    }
     command.extend(
         [
             "--label",
@@ -433,7 +538,7 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
                 &owned.name,
             ]),
             broker,
-            &cancelled,
+            cancelled,
             Duration::from_secs(600),
         ))?;
         if report.outcome != "completed" {
@@ -457,17 +562,166 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
         return Err("agent cleanup could not be confirmed; inspect containers labelled io.patchriot.agent-check=1".into());
     }
     let (report, stopped, oom, passed) = result?;
-    serde_json::to_writer_pretty(
-        io::stdout().lock(),
-        &json!({"schema_version":1,"mode":"owned_agent_check","evidence_source":"agent_reported_owned_example_not_independent_verification","container":owned.name,"model":settings.model,"model_digest":settings.model_digest,"image":settings.image,"policy_verified":true,"network":"none; bounded model requests over pipes","container_stopped":stopped,"oom_killed":oom,"cleanup_confirmed":cleanup,"passed":passed && cleanup,"run":report}),
-    )?;
-    println!();
-    Ok(u8::from(!(passed && cleanup)))
+    let evidence = evidence(
+        &report,
+        settings,
+        assignment.as_ref().map(|a| a.declared_model),
+        passed,
+        cleanup,
+    );
+    if !evidence.valid() {
+        return Err("agent evidence exceeded the report limits".into());
+    }
+    Ok(Check {
+        report: json!({"schema_version":1,"mode":"owned_agent_check","evidence_source":"agent_reported_owned_example_not_independent_verification","container":owned.name,"model":settings.model,"model_digest":settings.model_digest,"image":settings.image,"policy_verified":true,"network":"none; bounded model requests over pipes","container_stopped":stopped,"oom_killed":oom,"cleanup_confirmed":cleanup,"passed":evidence.matches_fixture(),"run":report}),
+        result: evidence,
+    })
+}
+
+fn evidence(
+    report: &AgentRun,
+    settings: &Settings,
+    declared: Option<&str>,
+    passed: bool,
+    cleanup: bool,
+) -> AgentResult {
+    let mut observation: Option<AgentFixtureObservation> = None;
+    let mut terminal_calls = 0;
+    let mut inconsistent = false;
+    for event in &report.events {
+        if event["event"] != "tool_complete" || event["data"]["args"][1] != "terminal" {
+            continue;
+        }
+        terminal_calls += 1;
+        let args = &event["data"]["args"];
+        let observed = (|| {
+            if args[2]["command"] != "cat /patchriot/access.py && python /patchriot/check.py" {
+                return None;
+            }
+            let tool: Value = serde_json::from_str(args[3].as_str()?).ok()?;
+            if tool["exit_code"] != 0 || !tool["error"].is_null() {
+                return None;
+            }
+            serde_json::from_str::<AgentFixtureObservation>(
+                tool["output"].as_str()?.lines().last()?,
+            )
+            .ok()
+        })();
+        if observed.is_none()
+            || observation
+                .as_ref()
+                .is_some_and(|old| Some(old) != observed.as_ref())
+        {
+            inconsistent = true;
+        }
+        observation = observed;
+    }
+    if inconsistent {
+        observation = None;
+    }
+    let response = report
+        .events
+        .iter()
+        .find(|e| e["event"] == "result")
+        .and_then(|e| e["data"]["final_response"].as_str())
+        .unwrap_or("");
+    let mut summary = String::new();
+    for c in response
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+    {
+        if summary.len() + c.len_utf8() > 4_000 {
+            break;
+        }
+        summary.push(c);
+    }
+    AgentResult {
+        kind: AgentResultKind::OwnedAgentV1,
+        outcome: match report.outcome {
+            "completed" if passed => AgentOutcome::Passed,
+            "timed_out" => AgentOutcome::TimedOut,
+            "cancelled" => AgentOutcome::Cancelled,
+            _ => AgentOutcome::Failed,
+        },
+        declared_model: declared.unwrap_or(&settings.model).into(),
+        model: settings.model.clone(),
+        model_digest: settings.model_digest.clone(),
+        image_digest: settings.image.clone(),
+        duration_ms: report.duration_ms.try_into().unwrap_or(u64::MAX),
+        inference_calls: report.inference_calls.try_into().unwrap_or(u16::MAX),
+        terminal_calls,
+        cleanup_confirmed: cleanup,
+        observation,
+        summary,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settings() -> Settings {
+        Settings {
+            docker_socket: "/var/run/docker.sock".into(),
+            image: format!("sha256:{}", "b".repeat(64)),
+            model_url: "http://127.0.0.1:11434".into(),
+            model: "test-profile".into(),
+            model_digest: "a".repeat(64),
+        }
+    }
+
+    fn tool_event(blocked_after: bool) -> Value {
+        let observations = json!({"original":{"owner_reads":true,"blocks_other_user":false},"patched":{"owner_reads":true,"blocks_other_user":blocked_after}});
+        let tool = json!({"output":observations.to_string(),"exit_code":0,"error":null});
+        json!({"event":"tool_complete","data":{"args":["call-1","terminal",{"command":"cat /patchriot/access.py && python /patchriot/check.py"},tool.to_string()]}})
+    }
+
+    #[test]
+    fn published_agent_evidence_comes_from_the_exact_tool_not_the_final_answer() {
+        let mut report = AgentRun {
+            outcome: "completed",
+            inference_calls: 2,
+            duration_ms: 500_000,
+            events: vec![
+                json!({"event":"result","data":{"completed":true,"observed_fixture_regression":true,"final_response":"Definitely fixed."}}),
+            ],
+            ..AgentRun::default()
+        };
+        assert!(!evidence(&report, &settings(), None, true, true).matches_fixture());
+        report.events.insert(0, tool_event(true));
+        let result = evidence(&report, &settings(), Some("test-parent"), true, true);
+        assert!(result.matches_fixture());
+        assert_eq!(result.declared_model, "test-parent");
+        assert_eq!(result.model, "test-profile");
+        assert!(!evidence(&report, &settings(), None, true, false).matches_fixture());
+        report.events.insert(1, tool_event(false));
+        assert!(!evidence(&report, &settings(), None, true, true).matches_fixture());
+        report.events.remove(1);
+        report.events[0]["data"]["args"][2]["command"] = json!("echo invented-results");
+        assert!(!evidence(&report, &settings(), None, true, true).matches_fixture());
+    }
+
+    #[test]
+    fn agent_summary_is_bounded_utf8_and_terminal_control_sequences_are_removed() {
+        let report = AgentRun {
+            events: vec![
+                json!({"event":"result","data":{"final_response": format!("\u{1b}{}\n", "é".repeat(3000))}}),
+            ],
+            ..AgentRun::default()
+        };
+        let result = evidence(&report, &settings(), None, false, true);
+        assert_eq!(result.summary.len(), 4_000);
+        assert!(!result.summary.contains('\u{1b}'));
+        assert!(result.valid());
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_start_never_executes_the_attach_command() {
+        let report = run("exit 99", &AtomicBool::new(true), Duration::from_secs(2)).await;
+        assert_eq!(report.outcome, "cancelled");
+        assert_eq!(report.exit_code, None);
+        assert_eq!(report.requests, 0);
+    }
 
     fn command(script: &str) -> std::process::Command {
         let mut command = std::process::Command::new("/bin/sh");
@@ -478,7 +732,7 @@ mod tests {
         supervise(
             command(script),
             crate::inference::tests::broker(),
-            cancelled,
+            &|| cancelled.load(Ordering::Relaxed),
             timeout,
         )
         .await
