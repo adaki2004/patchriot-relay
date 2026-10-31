@@ -6,7 +6,7 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
-**Working today:** pairing, manual approval, presence, pause/resume, revocation, queued owned-fixture reviews and separate Linux sandbox diagnostics. **Next:** a real agent adapter. No customer code or model calls run through the current queue.
+**Working today:** pairing (owned fixtures or a declared Hermes agent), manual approval, presence, pause/resume, revocation, queued owned-fixture reviews and separate Linux sandbox diagnostics. **Next:** sandboxed agent execution through the queue. No customer code or model calls run through the current queue.
 
 ## Try the owned example
 
@@ -33,6 +33,8 @@ cargo run --locked -- connect --state-dir .local/relay-one
 3. An administrator approves the device under **Fleet & approvals**.
 
 The Ed25519 key stays in your private state directory. The relay connects outward; it needs no public inbound port. Use HTTPS or an authenticated tunnel outside loopback. Three devices on one machine should declare the same compute group.
+
+For a Hermes installation, add `--runtime hermes --runtime-version VERSION --model MODEL` to `init`, using the version you inspected and the installed model name. Each agent needs its own state directory. These details are **operator declarations**, not verified model weights or a security qualification. A Hermes connection currently reports presence; `--fixtures` is reserved for the built-in example.
 
 ## Control your contribution
 
@@ -98,6 +100,6 @@ After installing the unit, initializing/pairing each instance as `patchriot-demo
 
 ## What's next
 
-**CPU agent adapter → sandboxed review tools → scoped customer reviews.** Hermes is the first planned runtime. Operators bring security-capable agents and inference; no stake or on-chain identity is required for this pilot. GPU trials and confidential execution come later.
+**CPU agent execution → sandboxed review tools → scoped customer reviews.** Hermes is the first runtime being integrated. Operators bring security-capable agents and inference; no stake or on-chain identity is required for this pilot. GPU trials and confidential execution come later.
 
 Original material is [AGPL-3.0-only](LICENSE); attribution is in [NOTICE](NOTICE). Model weights and external runtimes retain their own licenses. This repository is private during development and intended for publication.

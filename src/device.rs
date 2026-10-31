@@ -187,12 +187,39 @@ fn initialize(directory: &Path, options: &HashMap<&str, &str>) -> Result<(), Err
     }
     let introduction = DeviceIntroduction {
         label: required("--label")?.into(),
-        runtime: RuntimeKind::OwnedFixture,
-        runtime_version: env!("CARGO_PKG_VERSION").into(),
-        declared_model: None,
+        runtime: match options.get("--runtime").copied().unwrap_or("owned_fixture") {
+            "owned_fixture" => RuntimeKind::OwnedFixture,
+            "hermes" => RuntimeKind::Hermes,
+            _ => return Err("supported runtimes: owned_fixture or hermes".into()),
+        },
+        runtime_version: options
+            .get("--runtime-version")
+            .copied()
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .into(),
+        declared_model: options.get("--model").map(|value| (*value).to_owned()),
         compute_group: required("--compute-group")?.into(),
         slots: 1,
     };
+    match introduction.runtime {
+        RuntimeKind::Hermes
+            if !options.contains_key("--runtime-version")
+                || introduction
+                    .declared_model
+                    .as_ref()
+                    .is_none_or(|m| m.trim().is_empty()) =>
+        {
+            return Err("Hermes pairing requires --runtime-version and --model; these are operator declarations".into());
+        }
+        RuntimeKind::OwnedFixture
+            if options.contains_key("--runtime-version") || options.contains_key("--model") =>
+        {
+            return Err(
+                "owned fixtures use the built-in runtime version and do not declare a model".into(),
+            );
+        }
+        _ => {}
+    }
     introduction.validate()?;
     fs::DirBuilder::new()
         .recursive(true)
@@ -443,8 +470,16 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
         }
         let allowed = name == "--state-dir"
             || action == "init"
-                && ["--dispatcher", "--audience", "--label", "--compute-group"]
-                    .contains(&name.as_str());
+                && [
+                    "--dispatcher",
+                    "--audience",
+                    "--label",
+                    "--compute-group",
+                    "--runtime",
+                    "--runtime-version",
+                    "--model",
+                ]
+                .contains(&name.as_str());
         if !allowed {
             return Err("unknown option; see --help".into());
         }
@@ -478,10 +513,15 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             }
             println!(
                 "{}",
-                serde_json::json!({"device_id":config.device_id,"pairing_id":config.pairing_id,"label":config.introduction.label,"paused":config.paused,"sequence":config.sequence})
+                serde_json::json!({"device_id":config.device_id,"pairing_id":config.pairing_id,"label":config.introduction.label,"runtime":config.introduction.runtime,"runtime_version":config.introduction.runtime_version,"declared_model":config.introduction.declared_model,"paused":config.paused,"sequence":config.sequence})
             );
         }
         "connect" => {
+            if fixtures
+                && read_config(&directory)?.introduction.runtime != RuntimeKind::OwnedFixture
+            {
+                return Err("--fixtures is only for owned_fixture devices; Hermes pairing currently reports presence only".into());
+            }
             let daemon_lock = private_open(&directory.join("daemon.lock"), true)?;
             daemon_lock
                 .try_lock()

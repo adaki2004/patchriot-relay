@@ -18,6 +18,7 @@ use std::{io, process::ExitCode, time::Duration};
 const HELP: &str = "Patchriot Relay — pairing, presence and owned fixtures
 
 patchriot-relay init --state-dir PATH --dispatcher URL --audience NAME --label NAME --compute-group NAME
+  [--runtime hermes --runtime-version VERSION --model MODEL]
 patchriot-relay pair --state-dir PATH
 patchriot-relay connect --state-dir PATH [--once] [--fixtures]
 patchriot-relay status --state-dir PATH

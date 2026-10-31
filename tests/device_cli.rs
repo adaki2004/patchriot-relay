@@ -96,3 +96,80 @@ fn public_http_and_world_readable_state_are_rejected() {
     fs::set_permissions(path.join("relay.json"), fs::Permissions::from_mode(0o644)).unwrap();
     assert!(!invoke(&path, "status", &[]).status.success());
 }
+
+#[test]
+fn hermes_pairing_preserves_the_declaration_and_cannot_run_the_fixture_queue() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("hermes");
+    let output = invoke(
+        &path,
+        "init",
+        &[
+            "--dispatcher",
+            "https://dispatcher.invalid",
+            "--audience",
+            "pilot",
+            "--label",
+            "CPU agent",
+            "--compute-group",
+            "one-machine",
+            "--runtime",
+            "hermes",
+            "--runtime-version",
+            "0.22.2",
+            "--model",
+            "publisher/model:small",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = invoke(&path, "status", &[]);
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["runtime"], "hermes");
+    assert_eq!(value["runtime_version"], "0.22.2");
+    assert_eq!(value["declared_model"], "publisher/model:small");
+    let denied = invoke(&path, "connect", &["--once", "--fixtures"]);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("presence only"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(path.join("relay.json")).unwrap()).unwrap()["sequence"],
+        0
+    );
+}
+
+#[test]
+fn incomplete_or_misleading_runtime_declarations_do_not_create_an_identity() {
+    for extra in [
+        vec!["--runtime", "hermes"],
+        vec![
+            "--runtime",
+            "hermes",
+            "--runtime-version",
+            "1",
+            "--model",
+            " ",
+        ],
+        vec!["--runtime", "unknown"],
+        vec!["--model", "publisher/model"],
+        vec!["--runtime-version", "pretend-version"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rejected");
+        let mut args = vec![
+            "--dispatcher",
+            "https://dispatcher.invalid",
+            "--audience",
+            "pilot",
+            "--label",
+            "CPU agent",
+            "--compute-group",
+            "one-machine",
+        ];
+        args.extend(extra);
+        assert!(!invoke(&path, "init", &args).status.success());
+        assert!(!path.exists());
+    }
+}
