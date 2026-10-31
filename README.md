@@ -80,6 +80,14 @@ Poll counters and pending results are saved privately and atomically. If a resul
 
 The 60-second assignment lease is not extended by retries. Interrupted work can be reassigned up to three attempts, within the review's 15-minute lifetime. A report includes the actual device/operator/compute-group identities and labels its evidence as device-reported. `--once --fixtures` completes at most one assigned role and emits newline-delimited JSON events. Core's `scripts/smoke-reviews.py` exercises three real relays and deliberately loses a result reply to check recovery.
 
+## Small Linux demo host
+
+The example unit [deploy/patchriot-relay-demo@.service](deploy/patchriot-relay-demo@.service) runs the fixed fixture demo as a dedicated, unprivileged `patchriot-demo` user. Install a reviewed Linux binary at `/opt/patchriot-demo/patchriot-relay`, create a private state directory such as `/var/lib/patchriot-demo/one`, then initialize and pair as that user. The unit assumes an authenticated dispatcher tunnel on loopback; it permits only loopback networking. Do not expose an unencrypted dispatcher publicly to make the example connect.
+
+After installing the unit and approving the device, `systemctl start patchriot-relay-demo@one` starts it. Inspect `systemctl status patchriot-relay-demo@one` and `journalctl -u patchriot-relay-demo@one`; stop it with `systemctl stop patchriot-relay-demo@one`. Extra instances need distinct private state directories and device keys. Use one compute-group name for the shared host. The unit opts into `--fixtures`; remove that option for presence only.
+
+Each service is limited to 64 MiB, 10% of one CPU and 32 tasks. The filesystem is read-only apart from its state and private temporary directory. These service restrictions do not constitute the future sandbox for untrusted agent tools or customer code. If the tunnel or source machine stops, presence becomes offline; this arrangement is a development demo, not a production dispatcher deployment.
+
 ## Planned lifecycle
 
 1. Generate a device key locally. Prove possession in a short-lived, one-use pairing request, then approve it from the signed-in account with fresh authentication.
