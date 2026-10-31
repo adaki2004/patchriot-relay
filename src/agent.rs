@@ -88,6 +88,9 @@ pub struct Assignment<'a> {
     pub device_id: uuid::Uuid,
     pub lease_id: uuid::Uuid,
     pub declared_model: &'a str,
+    /// Stop execution early enough to clean up and submit a timeout report while
+    /// the lease is still valid. Preflight time counts against this deadline.
+    pub execution_deadline: Instant,
 }
 
 pub struct Check {
@@ -186,7 +189,14 @@ async fn supervise(
             ..AgentRun::default()
         });
     }
+    if timeout.is_zero() {
+        return Ok(AgentRun {
+            outcome: "timed_out",
+            ..AgentRun::default()
+        });
+    }
     let started = Instant::now();
+    let deadline_at = tokio::time::Instant::from_std(started + timeout);
     let mut child = tokio::process::Command::from(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -201,13 +211,22 @@ async fn supervise(
         // The adapter consumes one bounded frame before starting its model bridge.
         // This carries data, never a shell command or a host-mounted file.
         if !matches!(
-            tokio::time::timeout(Duration::from_secs(5), stdin.write_all(&input)).await,
+            tokio::time::timeout_at(
+                deadline_at.min(tokio::time::Instant::now() + Duration::from_secs(5)),
+                stdin.write_all(&input),
+            )
+            .await,
             Ok(Ok(()))
         ) {
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             return Ok(AgentRun {
-                outcome: "agent_input_stalled",
+                outcome: if tokio::time::Instant::now() >= deadline_at {
+                    "timed_out"
+                } else {
+                    "agent_input_stalled"
+                },
+                duration_ms: started.elapsed().as_millis(),
                 ..AgentRun::default()
             });
         }
@@ -241,7 +260,7 @@ async fn supervise(
         exit_code: None,
         events: Vec::new(),
     };
-    let deadline = tokio::time::sleep(timeout);
+    let deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(deadline);
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     eprintln!("running isolated agent check");
@@ -594,7 +613,14 @@ pub fn run(
             ]),
             broker,
             cancelled,
-            Duration::from_secs(600),
+            assignment
+                .as_ref()
+                .map(|a| {
+                    a.execution_deadline
+                        .saturating_duration_since(Instant::now())
+                })
+                .unwrap_or(Duration::from_secs(600))
+                .min(Duration::from_secs(600)),
             input,
         ))?;
         if report.outcome != "completed" {
@@ -795,6 +821,35 @@ mod tests {
         let report = run("exit 99", &AtomicBool::new(true), Duration::from_secs(2)).await;
         assert_eq!(report.outcome, "cancelled");
         assert_eq!(report.exit_code, None);
+        assert_eq!(report.requests, 0);
+    }
+
+    #[tokio::test]
+    async fn spent_execution_budget_does_not_start_work_and_input_time_counts() {
+        let report = supervise(
+            std::process::Command::new("/nonexistent-patchriot-budget-probe"),
+            crate::inference::tests::broker(),
+            &|| false,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "timed_out");
+        assert_eq!(report.exit_code, None);
+        let started = Instant::now();
+        let report = supervise(
+            command("exec sleep 10"),
+            crate::inference::tests::broker(),
+            &|| false,
+            Duration::from_millis(40),
+            Some(vec![b'x'; 1024 * 1024]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "timed_out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(report.duration_ms >= 30);
         assert_eq!(report.requests, 0);
     }
 

@@ -635,6 +635,21 @@ fn locally_ready(directory: &Path, lease_id: Uuid) -> bool {
     })
 }
 
+/// The renewable lease controls permission to keep working; this earlier deadline
+/// leaves one minute for container cleanup and saving the result. Use the server's
+/// remaining duration anchored before the request, not this machine's wall clock.
+fn agent_execution_deadline(started: Instant, renewed: &WorkRenewed) -> Result<Instant, Error> {
+    let after_expiry = renewed
+        .deadline_at
+        .checked_sub(renewed.expires_at)
+        .filter(|difference| *difference >= 0)
+        .ok_or("invalid lease deadline")? as u64;
+    let remaining = after_expiry
+        .saturating_add(renewed.valid_for_seconds)
+        .min(600);
+    Ok(started + Duration::from_secs(remaining.saturating_sub(60)))
+}
+
 fn agent_work(
     directory: &Path,
     client: &reqwest::blocking::Client,
@@ -646,6 +661,7 @@ fn agent_work(
     // The server must confirm that it is still this device's active lease.
     let (started, renewed) = renew(directory, client, assignment.lease_id)?;
     let window = LeaseWindow::new(started, renewed.valid_for_seconds);
+    let execution_deadline = agent_execution_deadline(started, &renewed)?;
     let config = read_config(directory)?;
     let device_id = config.device_id.ok_or("missing device identity")?;
     let declared_model = config
@@ -741,6 +757,7 @@ fn agent_work(
                     device_id,
                     lease_id: assignment.lease_id,
                     declared_model,
+                    execution_deadline,
                 }),
                 website.as_ref(),
                 &|| stop.load(Ordering::Relaxed) || window.stopped_at(Instant::now()),
@@ -1094,6 +1111,43 @@ mod tests {
         cancelled.extend_at(start, 60, start);
         assert!(cancelled.stopped_at(start));
         assert!(LeaseWindow::new(start, 4).stopped_at(start));
+    }
+
+    #[test]
+    fn agent_deadline_reserves_cleanup_and_reporting_without_extending_short_leases() {
+        let start = Instant::now();
+        let mut renewal = WorkRenewed {
+            lease_id: Uuid::nil(),
+            sequence: 1,
+            expires_at: 1060,
+            deadline_at: 1600,
+            valid_for_seconds: 59,
+            replayed: false,
+        };
+        let deadline = agent_execution_deadline(start, &renewal).unwrap();
+        assert_eq!(deadline.duration_since(start), Duration::from_secs(539));
+        // Transit, snapshot delivery and preflight consume the same budget.
+        assert_eq!(
+            deadline.saturating_duration_since(start + Duration::from_secs(40)),
+            Duration::from_secs(499)
+        );
+        renewal.deadline_at = 1120;
+        assert_eq!(
+            agent_execution_deadline(start, &renewal).unwrap(),
+            start + Duration::from_secs(59)
+        );
+        renewal.deadline_at = renewal.expires_at;
+        assert_eq!(agent_execution_deadline(start, &renewal).unwrap(), start);
+        renewal.deadline_at = i64::MAX;
+        assert_eq!(
+            agent_execution_deadline(start, &renewal).unwrap(),
+            start + Duration::from_secs(540)
+        );
+        renewal.deadline_at = 0;
+        assert!(agent_execution_deadline(start, &renewal).is_err());
+        renewal.deadline_at = i64::MAX;
+        renewal.expires_at = i64::MIN;
+        assert!(agent_execution_deadline(start, &renewal).is_err());
     }
 
     #[test]
