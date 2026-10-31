@@ -76,6 +76,6 @@ pub fn execute(
     }
     Ok(Some(CompleteWork {
         lease_id: assignment.lease_id,
-        result: FixtureResult { runs },
+        result: patchriot_protocol::WorkResult::Fixture(FixtureResult { runs }),
     }))
 }
