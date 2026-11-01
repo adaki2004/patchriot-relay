@@ -6,7 +6,7 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
-**Working today:** pairing, approval, presence, local controls and queued checks of an owned example. An additional opt-in accepts private website snapshots for offline review. Hermes uses your local model inside an isolated container; active target testing is not enabled.
+**Working today:** pairing, approval, presence, local controls and queued checks of an owned example. Separate opt-ins accept private website snapshots or source files for offline review. Hermes uses your local model inside an isolated container; active target testing is not enabled.
 
 **Hosted beta: coming soon.** Patchriot runs the website and dispatcher. Contributors run this relay on their own PC or VPS; customers need only the website. Request access first; the approved account provides connection details under **Pair an agent**. Local setup below is for developers running their own copy.
 
@@ -87,7 +87,7 @@ With **three approved devices** connected in the same mode, choose **Reviews →
 
 Results are saved locally before submission and retried after connection loss. Agent leases renew while healthy, with a saved attempt deadline. Defaults are ten minutes per attempt and 35 minutes per review. Queued execution reserves the final minute for cleanup and submitting its result, so a slow model can report a timeout before the lease expires. Preflight and input delivery consume the same execution budget. The relay uses a monotonic clock and stops when it cannot renew. Server cancellation is checked during renewal; it is not an instantaneous push. Local signals interrupt a running agent directly.
 
-Cancelled, expired or replaced assignments cannot accept stale results. Restarting an agent connection first removes that device's labelled leftover containers. Temporary dispatcher connection failures, server errors and rate limits retry with a delay of up to 40 seconds. Active work still stops if its lease cannot renew. A runner/configuration error or invalid response stops the agent connection for inspection. For owned examples, the state directory keeps one private `last-agent-check.json` (at most 2 MiB) for diagnosis. Website snapshots and their tool transcripts are not written to that file. A bounded pending report is saved until acknowledged. Keep state directories out of Git and shared backups.
+Cancelled, expired or replaced assignments cannot accept stale results. Restarting an agent connection first removes that device's labelled leftover containers. Temporary dispatcher connection failures, server errors and rate limits retry with a delay of up to 40 seconds. Active work still stops if its lease cannot renew. A runner/configuration error or invalid response stops the agent connection for inspection. For owned examples, the state directory keeps one private `last-agent-check.json` (at most 2 MiB) for diagnosis. Website snapshots, source bundles and their tool transcripts are not written to that file. A bounded pending report is saved until acknowledged. Keep state directories out of Git and shared backups.
 
 For slow or incomplete runs, the relay logs the model's declared finish reason (`length` means its output limit was reached), reported token counts and the agent's stopping condition. Missing metadata stays `not_reported`. These operational logs exclude prompts, answers and provider error text; they do not establish report quality.
 
@@ -157,7 +157,7 @@ Use an Ollama model that supports tools and a 64,000-token context. Its **stored
 
 After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept owned-example checks submitted through the website. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
 
-For a slow CPU pilot, set `max_attempt_seconds` to at most `1800` and rebuild the version 3 adapter. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
+For a slow CPU pilot, set `max_attempt_seconds` to at most `1800` and rebuild adapter version 3 or 4. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
 
 **Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall by default. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
 
@@ -169,7 +169,7 @@ The pilot presents its terminal and process-management tools directly, without a
 
 ## Opt in to private website reviews
 
-First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review requires adapter version 2 or 3. The current build is version 3; longer CPU budgets require this version.
+First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review accepts adapter versions 2, 3 and 4. The current build is version 4; longer CPU budgets require version 3 or 4.
 
 ```sh
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --website-reviews
@@ -204,6 +204,20 @@ cargo run --locked -- fixture noisy --max-output-bytes 1024
 The last two commands intentionally fail. Tests cover signals, descendants, environment leakage and malformed results. Linux CI additionally builds the probe and runs the Docker integration tests. **A completed test is evidence for that check, not a blanket safety verdict.**
 
 For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pinned protocol commit; private core access needs a `READ_TOKEN` Actions secret with read-only access to core. An existing `PATCHRIOT_READ_TOKEN` secret also works and takes precedence. Keep token values out of source.
+
+## Opt in to private source reviews
+
+Build the current **adapter 4** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
+
+```sh
+cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --source-reviews
+```
+
+You may also pass `--website-reviews` to accept both kinds. An admin must approve private work, and each requester confirms your device before sharing. Restarting without `--source-reviews` withdraws that opt-in.
+
+The dispatcher sends at most 12 text files, 16 KiB each and 48 KiB total. They arrive through stdin as one JSON bundle in temporary container storage. A fixed reader supplies bounded excerpts; filenames are never used as paths. **The model has no tools in this mode.** It cannot install dependencies, execute uploaded code, build or run tests. Longer text can be shortened; reports disclose the missing coverage. Required reads are counted separately from model judgment in the execution evidence.
+
+The three roles inspect and challenge claims against the same saved text. The role named “reproducer” checks quotations and explains what would still need a real test; it does not execute a reproduction. Reports can retain short quotations after the original files expire. Review your local retention and backup settings because operators can see plaintext.
 
 ## Keep a relay running
 

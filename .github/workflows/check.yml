@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: adaki2004/patchriot-core
-          ref: 7f995a2ed3689d5f405da616b6a142d330737b50
+          ref: 383b1ffc78ab86a688229301e13b94a1f51ddf2b
           path: patchriot-core
           token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
           persist-credentials: false
@@ -69,7 +69,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: adaki2004/patchriot-core
-          ref: 7f995a2ed3689d5f405da616b6a142d330737b50
+          ref: 383b1ffc78ab86a688229301e13b94a1f51ddf2b
           path: patchriot-core
           token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
           persist-credentials: false

@@ -29,6 +29,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub mod source;
 pub mod website;
 
 const IMAGE_ENTRY: [&str; 2] = ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"];
@@ -68,18 +69,31 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3"].contains(
+            || !["2", "3", "4"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "3"
+                && !["3", "4"].contains(
+                    &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
+                        .as_str()
+                        .unwrap_or(""),
+                )
         {
             return Err(
-                "website reviews require adapter 2 or 3; longer CPU budgets require adapter 3"
+                "website reviews require adapter 2, 3 or 4; longer CPU budgets require adapter 3 or 4"
                     .into(),
             );
+        }
+        Ok(())
+    }
+    pub fn require_source_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
+        if image["Id"] != self.image
+            || image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "4"
+        {
+            return Err("source reviews require the inspected adapter 4 image".into());
         }
         Ok(())
     }
@@ -494,7 +508,9 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
-    let check = run(&settings, None, None, &|| cancelled.load(Ordering::Relaxed))?;
+    let check = run(&settings, None, None, None, &|| {
+        cancelled.load(Ordering::Relaxed)
+    })?;
     serde_json::to_writer_pretty(io::stdout().lock(), &check.report)?;
     println!();
     Ok(u8::from(!check.result.matches_fixture()))
@@ -504,8 +520,12 @@ pub fn run(
     settings: &Settings,
     assignment: Option<Assignment<'_>>,
     website: Option<&website::Task>,
+    source: Option<&source::Task>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Check, Box<dyn std::error::Error>> {
+    if website.is_some() && source.is_some() {
+        return Err("assignment has conflicting material".into());
+    }
     if cancelled() {
         return Err("agent check cancelled before startup".into());
     }
@@ -515,19 +535,24 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3"].contains(
+        || !["1", "2", "3", "4"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3"].contains(
+            && !["2", "3", "4"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
+        || source.is_some() && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "4"
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "3"
+            && !["3", "4"].contains(
+                &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
+                    .as_str()
+                    .unwrap_or(""),
+            )
         || !no_entries(&image["Config"]["OnBuild"])
         || !no_entries(&image["Config"]["Healthcheck"])
     {
@@ -544,13 +569,22 @@ pub fn run(
     ))?;
     let broker = if let Some(task) = website {
         broker.for_website_review(&task.evidence.snapshot)
+    } else if let Some(task) = source {
+        broker.for_source_review(&task.evidence.bundle)
     } else {
         broker
     };
-    let input = website.map(website::Task::input).transpose()?;
+    let input = if let Some(task) = source {
+        Some(task.input()?)
+    } else {
+        website.map(website::Task::input).transpose()?
+    };
     let mut args = vec![settings.model.as_str()];
     if website.is_some() {
         args.push("--website");
+    }
+    if source.is_some() {
+        args.push("--source");
     }
     if let Some(assignment) = &assignment
         && !broker.matches_declaration(assignment.declared_model)
@@ -678,7 +712,9 @@ pub fn run(
             && state["State"]["OOMKilled"] == false
             && report.events.iter().any(|e| {
                 e["event"] == "result"
-                    && (website.is_some() || e["data"]["observed_fixture_regression"] == true)
+                    && (website.is_some()
+                        || source.is_some()
+                        || e["data"]["observed_fixture_regression"] == true)
                     && e["data"]["completed"] == true
             });
         Ok((report, stopped, state["State"]["OOMKilled"].clone(), passed))
@@ -702,6 +738,23 @@ pub fn run(
         }
         return Ok(Check {
             result: WorkResult::Website(result),
+            report: None,
+        });
+    }
+    if let Some(task) = source {
+        let result = source::evidence(
+            &report,
+            settings,
+            assignment.as_ref().map(|a| a.declared_model),
+            task,
+            passed,
+            cleanup,
+        );
+        if !result.valid() {
+            return Err("source evidence exceeded the report limits".into());
+        }
+        return Ok(Check {
+            result: WorkResult::Source(result),
             report: None,
         });
     }

@@ -481,6 +481,7 @@ fn work_tick(
     stop: &Arc<AtomicBool>,
     agent: Option<&crate::agent::Settings>,
     website_reviews: bool,
+    source_reviews: bool,
 ) -> Result<(), Error> {
     send_result(directory, client)?;
     let (config, key) = {
@@ -506,6 +507,7 @@ fn work_tick(
         WorkPoll {
             sequence: config.work_sequence,
             website_reviews,
+            source_reviews,
         },
     )?;
     let Some(assignment) = reply.assignment else {
@@ -517,17 +519,27 @@ fn work_tick(
             agent.is_none()
                 && assignment.scenario == FixtureScenario::AccessControlV1
                 && assignment.website.is_none()
+                && assignment.source.is_none()
         }
         ReviewMode::OwnedAgent => {
             agent.is_some()
                 && assignment.scenario == FixtureScenario::AccessControlV1
                 && assignment.website.is_none()
+                && assignment.source.is_none()
         }
         ReviewMode::WebsiteAgent => {
             agent.is_some()
                 && website_reviews
                 && assignment.scenario == FixtureScenario::WebsiteSnapshotV1
                 && assignment.website.is_some()
+                && assignment.source.is_none()
+        }
+        ReviewMode::SourceAgent => {
+            agent.is_some()
+                && source_reviews
+                && assignment.scenario == FixtureScenario::SourceBundleV1
+                && assignment.source.is_some()
+                && assignment.website.is_none()
         }
     };
     if !allowed {
@@ -789,6 +801,25 @@ fn agent_work(
             } else {
                 None
             };
+            let source = if let Some(source) = &assignment.source {
+                let saved = post_with_limit(
+                    client,
+                    &config,
+                    &read_key(directory)?,
+                    &format!("/v1/devices/{device_id}/work/source-evidence"),
+                    patchriot_protocol::website_reviews::ReadWorkEvidence {
+                        lease_id: assignment.lease_id,
+                    },
+                    512 * 1024,
+                )?;
+                Some(crate::agent::source::Task {
+                    role: assignment.role,
+                    snapshot_sha256: source.snapshot_sha256.clone(),
+                    evidence: saved,
+                })
+            } else {
+                None
+            };
             let check = crate::agent::run(
                 settings,
                 Some(crate::agent::Assignment {
@@ -798,6 +829,7 @@ fn agent_work(
                     execution_deadline,
                 }),
                 website.as_ref(),
+                source.as_ref(),
                 &|| stop.load(Ordering::Relaxed) || window.stopped_at(Instant::now()),
             )?;
             // Keep one bounded private trace for operator diagnosis. It is never
@@ -845,6 +877,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
     let mut fixtures = false;
     let mut agents = false;
     let mut website_reviews = false;
+    let mut source_reviews = false;
     let mut args = args[1..].iter();
     while let Some(name) = args.next() {
         if name == "--once" && action == "connect" && !once {
@@ -861,6 +894,10 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
         }
         if name == "--website-reviews" && action == "connect" && !website_reviews {
             website_reviews = true;
+            continue;
+        }
+        if name == "--source-reviews" && action == "connect" && !source_reviews {
+            source_reviews = true;
             continue;
         }
         let allowed = name == "--state-dir"
@@ -912,7 +949,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
         "connect" => {
             if fixtures && agents
                 || agents != options.contains_key("--agent-config")
-                || website_reviews && !agents
+                || (website_reviews || source_reviews) && !agents
             {
                 return Err(
                     "choose --fixtures or --agents --agent-config PATH; each is explicit opt-in"
@@ -936,6 +973,12 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                     .as_ref()
                     .ok_or("website reviews require an agent configuration")?
                     .require_website_adapter()?;
+            }
+            if source_reviews {
+                settings
+                    .as_ref()
+                    .ok_or("source reviews require an agent configuration")?
+                    .require_source_adapter()?;
             }
             let daemon_lock = private_open(&directory.join("daemon.lock"), true)?;
             daemon_lock
@@ -969,6 +1012,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                             &stop,
                             settings.as_ref(),
                             website_reviews,
+                            source_reviews,
                         )?;
                     }
                     Ok(())
@@ -1071,6 +1115,7 @@ mod tests {
                 WorkPoll {
                     sequence: 1,
                     website_reviews: false,
+                    source_reviews: false,
                 },
             )
             .unwrap_err();

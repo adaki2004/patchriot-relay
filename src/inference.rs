@@ -101,6 +101,7 @@ pub struct Broker {
     version: Value,
     max_tokens: u64,
     response_format: Option<Value>,
+    source_only: bool,
 }
 
 /// Generation guidance, not evidence validation. A model can produce this shape
@@ -113,6 +114,9 @@ fn website_response_format(snapshot: &WebsiteSnapshot) -> Value {
         .chain(&snapshot.resources)
         .map(|resource| resource.sha256.as_str())
         .collect();
+    static_response_format(resource_hashes)
+}
+fn static_response_format(resource_hashes: BTreeSet<&str>) -> Value {
     json!({
         "type": "json_schema",
         "json_schema": {
@@ -209,6 +213,15 @@ impl Broker {
     pub fn for_website_review(mut self, snapshot: &WebsiteSnapshot) -> Self {
         self.max_tokens = 512;
         self.response_format = Some(website_response_format(snapshot));
+        self
+    }
+
+    pub fn for_source_review(mut self, bundle: &patchriot_protocol::sources::SourceBundle) -> Self {
+        self.max_tokens = 512;
+        self.source_only = true;
+        self.response_format = Some(static_response_format(
+            bundle.files.iter().map(|f| f.sha256.as_str()).collect(),
+        ));
         self
     }
 
@@ -316,6 +329,7 @@ impl Broker {
             version: json!({"version":version["version"]}),
             max_tokens: MAX_TOKENS,
             response_format: None,
+            source_only: false,
         })
     }
 
@@ -395,6 +409,15 @@ impl Broker {
             })
         {
             return Err("unsupported messages");
+        }
+        if self.source_only
+            && (body.get("tools").is_some_and(|v| v != &json!([]))
+                || body.get("tool_choice").is_some_and(|v| v != "none")
+                || messages
+                    .iter()
+                    .any(|m| m["role"] == "tool" || m.get("tool_calls").is_some()))
+        {
+            return Err("source reviews cannot request model tools");
         }
         if body.get("tools").is_some_and(|v| {
             !v.as_array()
@@ -626,7 +649,31 @@ pub(crate) mod tests {
             version: json!({}),
             max_tokens: MAX_TOKENS,
             response_format: None,
+            source_only: false,
         }
+    }
+
+    #[test]
+    fn source_reviews_reject_model_tools_and_bind_file_hashes() {
+        let bundle = super::super::agent::source::tests::task().evidence.bundle;
+        let broker = broker().for_source_review(&bundle);
+        let mut request = chat();
+        let result = broker.chat(&request).unwrap();
+        assert!(
+            result["response_format"]
+                .to_string()
+                .contains(&bundle.files[0].sha256)
+        );
+        request.body.as_mut().unwrap()["tools"] =
+            json!([{"type":"function", "function":{"name":"terminal"}}]);
+        assert_eq!(
+            broker.chat(&request).unwrap_err(),
+            "source reviews cannot request model tools"
+        );
+        request.body.as_mut().unwrap()["tools"] = json!([]);
+        assert!(broker.chat(&request).is_ok());
+        request.body.as_mut().unwrap()["tool_choice"] = json!("required");
+        assert!(broker.chat(&request).is_err());
     }
     fn snapshot() -> WebsiteSnapshot {
         let mut snapshot: WebsiteSnapshot = serde_json::from_value(json!({

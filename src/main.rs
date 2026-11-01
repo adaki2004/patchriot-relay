@@ -24,7 +24,7 @@ patchriot-relay init --state-dir PATH --dispatcher URL --audience NAME --label N
   [--runtime hermes --runtime-version VERSION --model MODEL]
 patchriot-relay pair --state-dir PATH
 patchriot-relay connect --state-dir PATH [--once] [--fixtures]
-patchriot-relay connect --state-dir PATH --agents --agent-config PATH [--once] [--website-reviews]
+patchriot-relay connect --state-dir PATH --agents --agent-config PATH [--once] [--website-reviews] [--source-reviews]
 patchriot-relay status --state-dir PATH
 patchriot-relay pause --state-dir PATH
 patchriot-relay resume --state-dir PATH
