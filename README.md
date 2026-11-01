@@ -155,6 +155,8 @@ Each role gets at most four model calls, 512 output tokens per call and the earl
 
 ## Check the controls
 
+GitHub checks run when a ready PR targets `main` and when that PR changes. Draft PRs and ordinary branch pushes do not run checks; newer PR commits cancel superseded runs. Run the commands below locally while developing.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
