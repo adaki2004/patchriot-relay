@@ -29,7 +29,7 @@ jobs:
           repository: adaki2004/patchriot-core
           ref: 7f995a2ed3689d5f405da616b6a142d330737b50
           path: patchriot-core
-          token: ${{ secrets.PATCHRIOT_READ_TOKEN || github.token }}
+          token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
@@ -62,7 +62,7 @@ jobs:
           repository: adaki2004/patchriot-core
           ref: 7f995a2ed3689d5f405da616b6a142d330737b50
           path: patchriot-core
-          token: ${{ secrets.PATCHRIOT_READ_TOKEN || github.token }}
+          token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
           persist-credentials: false
       - run: rustup toolchain install 1.94.1 --profile minimal
       - run: cargo install cargo-audit --version 0.22.2 --locked
