@@ -368,13 +368,24 @@ fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<S
             &key,
             PAIRING_STATUS_PATH,
             PairingStatusInput { pairing_id },
-        )?;
+        )
+        .map_err(|error| -> Error {
+            if error
+                .downcast_ref::<RemoteError>()
+                .is_some_and(|reply| reply.status == 404)
+            {
+                // Starting another pairing removes expired, unclaimed records.
+                "pairing not found (HTTP 404); check the dispatcher address, then run pair again with the same --state-dir".into()
+            } else {
+                error
+            }
+        })?;
         config.device_id = reply.device_id;
         write_config(directory, &config)?;
         if config.device_id.is_none() {
             println!("{}", serde_json::to_string(&reply)?);
             if reply.state == "expired" {
-                return Err("pairing expired; run pair again".into());
+                return Err("pairing expired; run pair again with the same --state-dir to keep the device key".into());
             }
             return Ok(None);
         }
