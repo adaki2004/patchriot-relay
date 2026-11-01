@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -43,6 +43,22 @@ struct Config {
     renewal_sequence: u64,
 }
 
+fn require_state_owner(metadata: &fs::Metadata) -> Result<(), Error> {
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err("state belongs to another Unix user; run the relay as the account that owns its state directory and files".into());
+    }
+    Ok(())
+}
+
+fn check_state_directory(directory: &Path) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err("state directory must be private (chmod 700), not a symlink".into());
+    }
+    // An accidental sudo invocation must not replace another user's state files.
+    require_state_owner(&metadata)
+}
+
 fn private_open(path: &Path, create: bool) -> Result<File, Error> {
     let file = OpenOptions::new()
         .read(true)
@@ -58,6 +74,7 @@ fn private_open(path: &Path, create: bool) -> Result<File, Error> {
             "state files must be regular files readable only by their owner (chmod 600)".into(),
         );
     }
+    require_state_owner(&metadata)?;
     Ok(file)
 }
 
@@ -281,10 +298,7 @@ fn initialize(directory: &Path, options: &HashMap<&str, &str>) -> Result<(), Err
         .recursive(true)
         .mode(0o700)
         .create(directory)?;
-    let metadata = fs::symlink_metadata(directory)?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err("state directory must be private (chmod 700), not a symlink".into());
-    }
+    check_state_directory(directory)?;
     let _lock = state_lock(directory)?;
     if directory.join("relay.json").exists() || directory.join("device.key").exists() {
         return Err("state already exists; choose a different directory".into());
@@ -868,10 +882,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
         return Ok(0);
     }
     // Other operations never create a missing state directory or follow a symlink.
-    let metadata = fs::symlink_metadata(&directory)?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err("state directory must be private (chmod 700), not a symlink".into());
-    }
+    check_state_directory(&directory)?;
     match action {
         "pair" => pair(&directory)?,
         "status" | "pause" | "resume" => {
