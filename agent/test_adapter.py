@@ -139,6 +139,72 @@ class WebsiteTests(unittest.TestCase):
         self.assertEqual(events[1]["data"]["origin"], "required_snapshot_inspection")
         self.assertEqual(json.loads(events[1]["data"]["args"][3])["output"], output)
 
+    def test_combined_preview_fits_even_with_large_headers_prior_reports_and_escaped_text(self):
+        for text in ["const harmless = 1;\n" * 600, 'é🙂\\"\t\n' * 2000]:
+            with self.subTest(text=text[:20]):
+                snapshot = self.snapshot()
+                resource = snapshot["homepage"]
+                resource["text"] = text
+                resource["sha256"] = hashlib.sha256(text.encode()).hexdigest()
+                resource["headers"] = {"content-security-policy": "default-src 'self'; " + "https://assets.example/ " * 100}
+                snapshot["resources"] = [dict(resource, kind="external_script", url=f"https://example.com/{i}") for i in range(5)]
+                previous = [{"role": role, "evidence_complete": False, "assessment": {"summary": text}}
+                            for role in ["investigator", "reproducer"]]
+                raw = json.dumps(snapshot, ensure_ascii=False).encode()
+                output = inspect_site.inspect(raw, previous) + "\n"
+                self.assertLessEqual(len(output.encode()), inspect_site.MAX_OUTPUT)
+                report = json.loads(output)
+                self.assertEqual(report["snapshot_sha256"], hashlib.sha256(raw).hexdigest())
+                self.assertEqual(report["omitted_resources"], 0)
+                self.assertEqual(len(report["resources"]), 6)
+                for original, sample in zip([resource, *snapshot["resources"]], report["resources"]):
+                    self.assertEqual(sample["sha256"], original["sha256"])
+                    for original_text, key, flag in [
+                        (original["text"], "excerpt", "excerpt_truncated"),
+                        (json.dumps(original["headers"], ensure_ascii=False), "headers_excerpt", "headers_truncated"),
+                        (original["url"], "url", "url_truncated"),
+                    ]:
+                        self.assertTrue(original_text.startswith(sample[key]))
+                        self.assertEqual(sample[flag], sample[key] != original_text)
+                    self.assertTrue(sample["excerpt_truncated"])
+                    self.assertTrue(sample["headers_truncated"])
+                for original, sample in zip(previous, report["previous_reports"]):
+                    assessment = json.dumps(original["assessment"], ensure_ascii=False)
+                    self.assertTrue(assessment.startswith(sample["assessment_excerpt"]))
+                    self.assertTrue(sample["assessment_truncated"])
+                    self.assertFalse(sample["evidence_complete"])
+                # The output must also survive the adapter's nested event frame.
+                wire = io.StringIO()
+                with patch.object(adapter, "wire_out", wire), patch.object(adapter.subprocess, "run") as run:
+                    run.return_value = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+                    self.assertEqual(adapter.inspect_website(), output)
+                for line in wire.getvalue().splitlines():
+                    self.assertLessEqual(len(line.encode()), adapter.MAX_REQUEST)
+                    json.loads(line)
+
+    def test_small_preview_is_complete_and_boundary_includes_printed_newline(self):
+        snapshot = self.snapshot()
+        previous = [{"role": "investigator", "evidence_complete": False, "assessment": {"findings": []}}]
+        raw = json.dumps(snapshot, ensure_ascii=False).encode()
+        output = inspect_site.inspect(raw, previous)
+        report = json.loads(output)
+        resource = report["resources"][0]
+        self.assertEqual(resource["excerpt"], snapshot["homepage"]["text"])
+        for flag in ["excerpt_truncated", "headers_truncated", "url_truncated"]:
+            self.assertFalse(resource[flag])
+        self.assertFalse(report["previous_reports"][0]["assessment_truncated"])
+        # At this boundary, the original JSON fits but print() would exceed it.
+        with patch.object(inspect_site, "MAX_OUTPUT", len(output.encode())):
+            shorter = inspect_site.inspect(raw, previous)
+            self.assertLessEqual(len(shorter.encode()) + 1, inspect_site.MAX_OUTPUT)
+            self.assertNotEqual(json.loads(shorter), report)
+
+    def test_oversized_metadata_is_rejected_instead_of_changing_citation_hashes(self):
+        snapshot = self.snapshot()
+        snapshot["homepage"]["sha256"] = "x" * inspect_site.MAX_OUTPUT
+        with self.assertRaisesRegex(ValueError, "inspection metadata exceeds limit"):
+            inspect_site.inspect(json.dumps(snapshot).encode(), [])
+
     def test_failed_or_unreadable_required_inspection_cannot_report_success(self):
         for response in [
             subprocess.CompletedProcess([], 1, stdout='{"snapshot_sha256":"' + 'a' * 64 + '"}', stderr="failed"),
