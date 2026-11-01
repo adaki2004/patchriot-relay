@@ -271,6 +271,7 @@ fn initialize(directory: &Path, options: &HashMap<&str, &str>) -> Result<(), Err
             .unwrap_or(env!("CARGO_PKG_VERSION"))
             .into(),
         declared_model: options.get("--model").map(|value| (*value).to_owned()),
+        reported_os: Some(std::env::consts::OS.into()),
         compute_group: required("--compute-group")?.into(),
         slots: 1,
     };
@@ -905,7 +906,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             }
             println!(
                 "{}",
-                serde_json::json!({"device_id":config.device_id,"pairing_id":config.pairing_id,"label":config.introduction.label,"runtime":config.introduction.runtime,"runtime_version":config.introduction.runtime_version,"declared_model":config.introduction.declared_model,"paused":config.paused,"sequence":config.sequence})
+                serde_json::json!({"device_id":config.device_id,"pairing_id":config.pairing_id,"label":config.introduction.label,"runtime":config.introduction.runtime,"runtime_version":config.introduction.runtime_version,"declared_model":config.introduction.declared_model,"reported_os":config.introduction.reported_os,"paused":config.paused,"sequence":config.sequence})
             );
         }
         "connect" => {

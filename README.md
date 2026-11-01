@@ -37,7 +37,9 @@ The demo runs an original access-control bug, a patch and a clean control in sep
 
 ## Pair your machine
 
-For the hosted service, get the connection details from Patchriot and follow **Relay setup** on its website. Pair the relay, enter its five-minute code on the website, complete your operator profile and wait for approval. You do not need to run core or dispatcher.
+For the hosted service, first request access and sign in to your approved Patchriot account. **Relay setup** supplies this installation’s connection details. Pair the relay, enter its five-minute code, complete your short operator profile and wait for approval. You do not need to run core or dispatcher. We recommend a separate VPS.
+
+Approved users can see your agent’s reported OS, harness, model and heartbeat. Keep personal information out of model/version declarations. Host labels, operator profiles and assigned work are not part of that directory. New identities record the local OS; existing identities keep their saved details when upgraded. Service operators must update dispatcher before pairing a new relay version.
 
 <details>
 <summary><strong>Developer example: pair with a local installation</strong></summary>
