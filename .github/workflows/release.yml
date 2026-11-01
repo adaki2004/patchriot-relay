@@ -1,0 +1,129 @@
+name: Release relay
+
+# PRs run Check. Updating main builds the installable relay once.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      tag: ${{ steps.package.outputs.tag }}
+    defaults:
+      run:
+        working-directory: patchriot-relay
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: patchriot-relay
+          persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: adaki2004/patchriot-core
+          ref: 7f995a2ed3689d5f405da616b6a142d330737b50
+          path: patchriot-core
+          token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          cargo install cargo-bundle-licenses --version 5.0.0 --locked
+      - name: Build Linux x86-64 relay
+        run: |
+          mkdir -p target/release-linux
+          docker run --rm --platform linux/amd64 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$GITHUB_WORKSPACE/patchriot-relay/target/release-linux:/build" \
+            -e CARGO_TARGET_DIR=/build -e CARGO_PROFILE_RELEASE_STRIP=symbols \
+            -e RUSTUP_TOOLCHAIN=1.94.1 -w /src/patchriot-relay \
+            rust@sha256:7c094ad1afb45a61e28dd007a2add9d8ac171fd3a268e5f8f74b8aebe6c723ae \
+            sh -c 'cargo build --locked --release && mkdir -p /build/release/rust-notices && cp /usr/local/rustup/toolchains/1.94.1-x86_64-unknown-linux-musl/share/doc/rust/COPYRIGHT-library.html /build/release/rust-notices/ && cp -R /usr/local/rustup/toolchains/1.94.1-x86_64-unknown-linux-musl/share/doc/rust/licenses /build/release/rust-notices/'
+      - name: Package and check the download
+        id: package
+        run: |
+          cargo bundle-licenses --format json --output "$RUNNER_TEMP/licenses.json"
+          python3 scripts/package-release.py target/release-linux/release/patchriot-relay "$RUNNER_TEMP/licenses.json" dist
+          cd dist
+          sha256sum --check SHA256SUMS
+          mkdir unpacked
+          tar -xzf patchriot-relay-linux-x86_64.tar.gz -C unpacked
+          unpacked/patchriot-relay/patchriot-relay demo
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relay-release
+          path: |
+            patchriot-relay/dist/*.tar.gz
+            patchriot-relay/dist/SHA256SUMS
+            patchriot-relay/dist/release.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: relay-release
+          path: dist
+      - name: Publish the complete release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { createHash } = require('node:crypto');
+            const repo = context.repo;
+            const manifest = JSON.parse(fs.readFileSync('dist/release.json', 'utf8'));
+            if (manifest.commit !== context.sha || manifest.tag !== process.env.RELEASE_TAG) {
+              throw new Error('Release manifest does not match this main commit');
+            }
+            const files = ['patchriot-relay-linux-x86_64.tar.gz', 'patchriot-relay-source.tar.gz'];
+            for (const name of files) {
+              const digest = createHash('sha256').update(fs.readFileSync(`dist/${name}`)).digest('hex');
+              if (digest !== manifest.sha256[name]) throw new Error(`Checksum mismatch: ${name}`);
+            }
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({ ...repo, tag: manifest.tag })).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release = (await github.rest.repos.createRelease({
+                ...repo, tag_name: manifest.tag, target_commitish: context.sha,
+                name: `Patchriot Relay ${manifest.tag}`, draft: true, prerelease: true,
+                body: 'Linux x86-64 prototype. Download the relay archive and SHA256SUMS; verify before running. The archive includes agent setup files and dependency notices. Matching relay and protocol source is attached. Existing agents are not updated automatically. Model weights and the external agent runtime are installed separately.'
+              })).data;
+            }
+            if (release.target_commitish !== context.sha) throw new Error('Release targets another commit');
+            const tagged = await github.rest.repos.getCommit({ ...repo, ref: manifest.tag }).catch(error => {
+              // A draft created by this run can have no tag until publication.
+              if (error.status === 404 && release.draft && release.target_commitish === context.sha) return null;
+              throw error;
+            });
+            if (tagged && tagged.data.sha !== context.sha) throw new Error('Tag points to another commit');
+            if (!release.draft) {
+              core.info('This commit already has a published release; leaving its assets unchanged.');
+              return;
+            }
+            for (const name of [...files, 'SHA256SUMS', 'release.json']) {
+              const previous = release.assets.find(asset => asset.name === name);
+              if (previous) await github.rest.repos.deleteReleaseAsset({ ...repo, asset_id: previous.id });
+              await github.rest.repos.uploadReleaseAsset({
+                ...repo, release_id: release.id, name, data: fs.readFileSync(`dist/${name}`)
+              });
+            }
+            await github.rest.repos.updateRelease({ ...repo, release_id: release.id, draft: false });

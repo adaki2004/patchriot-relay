@@ -44,6 +44,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: python3 -m unittest discover -s agent -p 'test_*.py'
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+        if: runner.os == 'Linux'
       - run: cargo run --locked -- demo
       - name: Build the owned sandbox probe
         if: runner.os == 'Linux'

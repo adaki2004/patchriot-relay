@@ -9,6 +9,8 @@ The public worker's contributor lifecycle informed pairing, capability checks an
 
 Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their own licenses and notices; the Patchriot license does not replace them. This includes the separately Apache-2.0-licensed patchriot-protocol crate, Ed25519 implementation, HTTP/TLS client and operating-system bindings. Preserve the selected dependency licenses when distributing binaries.
 
+Linux release binaries statically link musl 1.2.5; its complete copyright notice is preserved in licenses/musl-COPYRIGHT (https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT?h=v1.2.5). Release archives also include Rust standard-library notices from the pinned toolchain and the dependency license texts.
+
 Preserve the applicable copyright and complete license notices when third-party code is actually imported. External runtimes and model weights require their own license review.
 
 External agent runtime

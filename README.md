@@ -8,6 +8,21 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 **Working today:** pairing, approval, presence, local controls and queued checks of an owned example. An additional opt-in accepts private website snapshots for offline review. Hermes uses your local model inside an isolated container; active target testing is not enabled.
 
+## Download the relay
+
+Merging to `main` builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). Prototype releases use `v0.0.1-dev.<commit>`. Download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, then:
+
+```sh
+sha256sum --ignore-missing --check SHA256SUMS
+tar -xzf patchriot-relay-linux-x86_64.tar.gz
+cd patchriot-relay
+./patchriot-relay demo
+```
+
+The archive includes agent/sandbox setup files, service examples and license notices. Use `./patchriot-relay` instead of `cargo run --locked --` in the commands below. Matching relay and protocol source is attached separately; macOS users can build from source. Model weights and the external agent runtime are installed separately.
+
+**Releases do not update running agents automatically.** Stop the relay before replacing its binary, preserve its state directory and configuration, then restart it under the same Unix account. You do not need to pair it again.
+
 ## Try the owned example
 
 Place `patchriot-core` beside this repository for its shared protocol crate. Use **Rust 1.94.1** on Linux or macOS.
