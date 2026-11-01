@@ -8,6 +8,23 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 **Working today:** pairing, approval, presence, local controls and queued checks of an owned example. An additional opt-in accepts private website snapshots for offline review. Hermes uses your local model inside an isolated container; active target testing is not enabled.
 
+**Hosted beta: coming soon.** Patchriot runs the website and dispatcher. Contributors run this relay on their own PC or VPS; customers need only the website. The current deployment is a private pilot, and its connection details come from the operator. Local setup below is for developers running their own copy.
+
+## Download the relay
+
+After a merge to `main`, the release workflow builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). The first hosted release is pending. Prototype releases use `v0.0.1-dev.<commit>`. Once available, download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, then:
+
+```sh
+sha256sum --ignore-missing --check SHA256SUMS
+tar -xzf patchriot-relay-linux-x86_64.tar.gz
+cd patchriot-relay
+./patchriot-relay demo
+```
+
+The archive includes agent/sandbox setup files, service examples and license notices. Use `./patchriot-relay` instead of `cargo run --locked --` in the commands below. Matching relay and protocol source is attached separately; macOS users can build from source. Model weights and the external agent runtime are installed separately.
+
+**Releases do not update running agents automatically.** Stop the relay before replacing its binary, preserve its state directory and configuration, then restart it under the same Unix account. You do not need to pair it again.
+
 ## Try the owned example
 
 Place `patchriot-core` beside this repository for its shared protocol crate. Use **Rust 1.94.1** on Linux or macOS.
@@ -20,7 +37,12 @@ The demo runs an original access-control bug, a patch and a clean control in sep
 
 ## Pair your machine
 
-Start the local core website and dispatcher using their READMEs, then:
+For the hosted service, get the connection details from Patchriot and follow **Relay setup** on its website. Pair the relay, enter its five-minute code on the website, complete your operator profile and wait for approval. You do not need to run core or dispatcher.
+
+<details>
+<summary><strong>Developer example: pair with a local installation</strong></summary>
+
+Start your own core website and dispatcher using their READMEs. These addresses point to services on your computer:
 
 ```sh
 cargo run --locked -- init --state-dir .local/relay-one --dispatcher http://127.0.0.1:7411 --audience patchriot-local-v1 --label "My relay" --compute-group "my-machine"
@@ -31,6 +53,8 @@ cargo run --locked -- connect --state-dir .local/relay-one
 1. Sign in to the website and enter the five-minute code under **Pair a relay**.
 2. Complete the short operator profile and data-handling consent.
 3. An administrator approves the device under **Fleet & approvals**.
+
+</details>
 
 If the code expires, run `pair` again with the same `--state-dir` and use the new code. Keep the existing state: it contains your device key. A code claimed by another account requires that account or a separate device identity; refreshing the website cannot transfer it.
 
@@ -54,6 +78,8 @@ Without either work option, the connection reports presence only. Heartbeats con
 
 With **three approved devices** connected in the same mode, choose **Reviews → New example review**. Three sequential roles check the same supplied bug and fix. Shared machines under one operator get one active assignment. Reports show device/operator counts; three processes on one host do not imply independent reviewers.
 
+**Earnings:** this pilot does not promise or calculate operator payments. Report counts show activity only. A paid contribution offer must state its reward and payout terms before you accept it.
+
 <details>
 <summary><strong>Retries, deadlines and connection failures</strong></summary>
 
@@ -65,11 +91,18 @@ For slow or incomplete runs, the relay logs the model's declared finish reason (
 
 </details>
 
-## Execution boundary
+## What the safety limits mean
 
-The current runner clears inherited environment, uses a temporary directory and limits each fixture to **3 seconds and 8 KiB of combined output**. It terminates its process group on timeout or cancellation.
+There are two different runners:
 
-**Fixture mode** uses process supervision and accepts only compiled-in examples. **Agent mode** uses the container boundary below; it never falls back to host execution. The server supplies a known scenario, lease and—only with explicit opt-in—a saved website snapshot. The operator controls the pinned image and local model endpoint.
+| Runner | What it can do | What its limits mean |
+| --- | --- | --- |
+| **Known example (`--fixtures`)** | Run only the test programs built into the relay | Default limits are 3 seconds and 8,192 bytes of printed text per test, counting normal output and errors together. This stops stuck or noisy tests. |
+| **Agent (`--agents`)** | Review the supplied example or an explicitly shared website snapshot in a container | Separate limits control runtime, memory, model calls and output. The container cannot browse the internet or access host files and keys. |
+
+**8 KiB means test output, not prompt size or model context.** The example runner removes inherited environment variables, uses a temporary working directory and stops its process group on timeout or cancellation. That alone is not a sandbox for arbitrary code; it accepts only the built-in tests.
+
+Agent mode requires the container setup below and stops if it cannot use it. A webpage can still try to mislead the model. Permissions and isolation restrict what the agent can do even when its answer is wrong; output limits do not prevent prompt injection.
 
 Private work requires separate operator approval and requester consent. Assigned operators can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
 
@@ -154,6 +187,8 @@ Each role gets at most four model calls, 512 output tokens per call and the earl
 </details>
 
 ## Check the controls
+
+GitHub checks run when a ready PR targets `main` and when that PR changes. Draft PRs and ordinary branch pushes do not run checks; newer PR commits cancel superseded runs. Run the commands below locally while developing.
 
 ```sh
 cargo fmt --all --check

@@ -1,8 +1,13 @@
 name: Check
 
 on:
-  push:
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -13,6 +18,7 @@ defaults:
 
 jobs:
   rust:
+    if: ${{ !github.event.pull_request.draft }}
     strategy:
       fail-fast: false
       matrix:
@@ -38,6 +44,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: python3 -m unittest discover -s agent -p 'test_*.py'
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+        if: runner.os == 'Linux'
       - run: cargo run --locked -- demo
       - name: Build the owned sandbox probe
         if: runner.os == 'Linux'
@@ -50,6 +58,7 @@ jobs:
           export PATCHRIOT_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' patchriot-sandbox-probe:ci)"
           cargo test --locked --test sandbox_cli -- --ignored --test-threads=1
   dependencies:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
