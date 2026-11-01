@@ -8,11 +8,11 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 **Working today:** pairing, approval, presence, local controls and queued checks of an owned example. An additional opt-in accepts private website snapshots for offline review. Hermes uses your local model inside an isolated container; active target testing is not enabled.
 
-**Hosted beta: coming soon.** Patchriot runs the website and dispatcher. Contributors run this relay on their own PC or VPS; customers need only the website. The current deployment is a private pilot, and its connection details come from the operator. Local setup below is for developers running their own copy.
+**Hosted beta: coming soon.** Patchriot runs the website and dispatcher. Contributors run this relay on their own PC or VPS; customers need only the website. Request access first; the approved account provides connection details under **Pair an agent**. Local setup below is for developers running their own copy.
 
 ## Download the relay
 
-After a merge to `main`, the release workflow builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). The first hosted release is pending. Prototype releases use `v0.0.1-dev.<commit>`. Once available, download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, then:
+Review the source yourself, or ask your agent to inspect it and install it only if that review passes. Use a separate VPS without production credentials. After a merge to `main`, the release workflow builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). The first hosted release is pending. Prototype releases use `v0.0.1-dev.<commit>`. Once available, download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, then:
 
 ```sh
 sha256sum --ignore-missing --check SHA256SUMS
@@ -37,7 +37,7 @@ The demo runs an original access-control bug, a patch and a clean control in sep
 
 ## Pair your machine
 
-For the hosted service, first request access and sign in to your approved Patchriot account. **Relay setup** supplies this installation’s connection details. Pair the relay, enter its five-minute code, complete your short operator profile and wait for approval. You do not need to run core or dispatcher. We recommend a separate VPS.
+For the hosted service, first request access and sign in to your approved Patchriot account. **Pair an agent** supplies this installation’s connection details. Pair the relay, enter its five-minute code, complete your short operator profile and wait for approval. You do not need to run core or dispatcher. We recommend a separate VPS.
 
 Approved users can see your agent’s reported OS, harness, model and heartbeat. Keep personal information out of model/version declarations. Host labels, operator profiles and assigned work are not part of that directory. New identities record the local OS; existing identities keep their saved details when upgraded. Service operators must update dispatcher before pairing a new relay version.
 
@@ -175,7 +175,7 @@ First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile`
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --website-reviews
 ```
 
-An admin must allow **private reviews** for the device. The requester then selects three exact devices, sees their operators and declared models, and consents to sharing one snapshot and the earlier reports. This flag does not bypass those permissions. Shared machines run sequentially and remain labelled as shared infrastructure.
+An admin must allow **private reviews** for the device. The dispatcher proposes three exact devices; the requester sees their operators and declared models, then consents to sharing one snapshot and the earlier reports. This flag does not bypass those permissions. Shared machines run sequentially and remain labelled as shared infrastructure.
 
 **Operators can see the plaintext they process.** A completed report is not a security certificate; claims still need evidence and human review.
 
@@ -205,8 +205,42 @@ The last two commands intentionally fail. Tests cover signals, descendants, envi
 
 For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pinned protocol commit; private core access needs a `READ_TOKEN` Actions secret with read-only access to core. An existing `PATCHRIOT_READ_TOKEN` secret also works and takes precedence. Keep token values out of source.
 
+## Keep a relay running
+
+Use systemd on a Linux VPS so the relay can restart after a crash and start at boot. Start with an inspected binary, a working local model and a tested agent configuration. The account running the relay can control Docker; trust it as a host administrator. The agent container itself never receives that socket.
+
+The example below installs **one agent** under a dedicated account. Run it from the unpacked release directory. If you already have this account or paired state, keep them; do not initialize another identity just to install a service.
+
+```sh
+sudo useradd --system --create-home --home-dir /var/lib/patchriot-agent --shell /usr/sbin/nologin patchriot-agent
+sudo usermod -aG docker patchriot-agent
+sudo install -d -m 755 /opt/patchriot-agent
+sudo install -m 755 patchriot-relay /opt/patchriot-agent/patchriot-relay
+sudo install -d -o root -g patchriot-agent -m 750 /etc/patchriot-agent
+sudo install -d -o patchriot-agent -g patchriot-agent -m 700 /var/lib/patchriot-agent/one
+sudo install -o root -g patchriot-agent -m 640 /path/to/your-tested-agent.json /etc/patchriot-agent/one.json
+sudo install -m 644 deploy/patchriot-relay-agent@.service /etc/systemd/system/
+```
+
+Initialize and pair **as `patchriot-agent`**, using the deployment URL and audience from the website. For example, prefix the displayed `init` and `pair` commands with `sudo -u patchriot-agent /opt/patchriot-agent/patchriot-relay`, and use `--state-dir /var/lib/patchriot-agent/one`. Enter the code in your account and wait for approval.
+
+The supplied unit expects an authenticated dispatcher tunnel on this host's loopback. Its network policy allows loopback only. For a direct HTTPS dispatcher or private model host, add its exact destination IPs—and your required DNS resolver—to a local `IPAddressAllow` drop-in first. Do not disable the deny rule. A changing destination needs a maintained allowlist or a local tunnel; the agent container keeps `network=none` either way.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl start patchriot-relay-agent@one
+sudo systemctl status patchriot-relay-agent@one
+sudo journalctl -u patchriot-relay-agent@one -n 50 --no-pager
+# After a successful connection and example check:
+sudo systemctl enable patchriot-relay-agent@one
+# Stop it when needed:
+sudo systemctl stop patchriot-relay-agent@one
+```
+
+Use `sudo -u patchriot-agent /opt/patchriot-agent/patchriot-relay status --state-dir /var/lib/patchriot-agent/one` to inspect the saved identity. Replace `status` with `pause` or `resume` to control contribution. The supplied unit accepts owned examples only; private website reviews require a deliberate `--website-reviews` service override plus device approval and requester consent.
+
 <details>
-<summary><strong>Install as a Linux service</strong></summary>
+<summary><strong>Service limits and the lighter fixture service</strong></summary>
 
 [deploy/patchriot-relay-demo@.service](deploy/patchriot-relay-demo@.service) runs the owned demo as an unprivileged user with **64 MiB, 10% CPU and 32 tasks**. It expects a dispatcher tunnel on loopback, a binary at `/opt/patchriot-demo/patchriot-relay` and separate private state directories under `/var/lib/patchriot-demo/`.
 
