@@ -6,7 +6,7 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
-**Working today:** pairing, approval, presence, local controls and queued checks of an owned example. Separate opt-ins accept private website snapshots or source files for offline review. Hermes uses your local model inside an isolated container; active target testing is not enabled.
+**Working today:** pairing, approval, presence, local controls and queued checks of an owned example. Separate opt-ins accept private website snapshots or source files for offline review. Hermes runs in an isolated container. A separate approved live-testing pilot uses a hosted model and scoped HTTP requests through the relay.
 
 **Hosted beta: coming soon.** Patchriot runs the website and dispatcher. Contributors run this relay on their own PC or VPS; customers need only the website. Request access first; the approved account provides connection details under **Pair an agent**. Local setup below is for developers running their own copy.
 
@@ -36,6 +36,19 @@ cargo run --locked -- demo
 The demo runs an original access-control bug, a patch and a clean control in separate processes. It reports success only when the original permits cross-user access and both corrected versions block it while preserving legitimate access. This is a known regression example, not an AI-discovered finding.
 
 ## Pair your machine
+
+### Private Tailscale connection
+
+If **Pair an agent** shows an HTTPS `device.tailnet.ts.net` address, first ask the administrator to admit your machine to that Tailscale network. Network admission and Patchriot device approval are separate. Then run this read-only check with the address they supplied:
+
+```sh
+tailscale status
+./patchriot-relay mesh-check --dispatcher https://device.tailnet.ts.net
+```
+
+`mesh-check` reads only `/health`, verifies normal HTTPS, checks the connection used a Tailscale IP and confirms the agent-only gateway. It loads no device key, submits no work and does not declare the operator approved. It times out rather than falling back to a public endpoint. It does not certify the tailnet's whole access policy.
+
+Use that same address with `init --dispatcher`, then continue pairing below. Signed requests, manual approval and private-review consent still apply. A stopped Tailscale connection stops communication; existing work must stop before its lease expires. Keep Tailscale credentials on the host, outside agent containers and relay pairing forms. Use [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve), not public Funnel, at the dispatcher gateway.
 
 For the hosted service, first request access and sign in to your approved Patchriot account. **Pair an agent** supplies this installation’s connection details. Pair the relay, enter its five-minute code, complete your short operator profile and wait for approval. You do not need to run core or dispatcher. We recommend a separate VPS.
 
@@ -95,12 +108,13 @@ For slow or incomplete runs, the relay logs the model's declared finish reason (
 
 ## What the safety limits mean
 
-There are two different runners:
+The example runner and agent modes have separate limits:
 
 | Runner | What it can do | What its limits mean |
 | --- | --- | --- |
 | **Known example (`--fixtures`)** | Run only the test programs built into the relay | Default limits are 3 seconds and 8,192 bytes of printed text per test, counting normal output and errors together. This stops stuck or noisy tests. |
-| **Agent (`--agents`)** | Review the supplied example or an explicitly shared website snapshot in a container | Separate limits control runtime, memory, model calls and output. The container cannot browse the internet or access host files and keys. |
+| **Offline agent (`--agents`)** | Review the supplied example or explicitly shared website/source text in a container | Separate runtime, memory, inference and output limits. No target network access or host files/keys. |
+| **Live agent (`--agents --live-tests`)** | Investigate an approved website through the relay’s HTTP helper | The container has no direct network. The relay permits only approved origins and methods, records requests and limits rate and provider spending. |
 
 **8 KiB means test output, not prompt size or model context.** The example runner removes inherited environment variables, uses a temporary working directory and stops its process group on timeout or cancellation. That alone is not a sandbox for arbitrary code; it accepts only the built-in tests.
 
@@ -157,7 +171,7 @@ Use an Ollama model that supports tools and a 64,000-token context. Its **stored
 
 After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept owned-example checks submitted through the website. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
 
-For a slow CPU pilot, set `max_attempt_seconds` to at most `1800` and rebuild adapter version 3 or 4. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
+For a slow CPU pilot, set `max_attempt_seconds` to at most `1800` and rebuild adapter version 3, 4 or 5. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
 
 **Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall by default. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
 
@@ -169,7 +183,7 @@ The pilot presents its terminal and process-management tools directly, without a
 
 ## Opt in to private website reviews
 
-First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review accepts adapter versions 2, 3 and 4. The current build is version 4; longer CPU budgets require version 3 or 4.
+First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review accepts adapter versions 2–5. The current build is version 5; longer CPU budgets require version 3 or later.
 
 ```sh
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --website-reviews
@@ -187,6 +201,43 @@ The relay downloads evidence only for its active lease, checks its hash and send
 Each role gets at most four model calls, 512 output tokens per call and the earlier of its saved lease deadline and operator time limit. The relay requests a fixed JSON report format, with source hashes selected from the captured resources; the runtime cannot change it. Formatting does not establish accuracy: quotations must still match the cited resource, and the reasoning can still be wrong. Website mode omits the runtime's optional model-specific instructions to keep executing tools; the task supplies its own review instructions, and tools remain available. Later roles inspect earlier claims; no live exploit or patch test is implied. **A complete report is not a security certificate.** Invalid reports and unsupported quotations remain unresolved. Removing private approval stops affected reviews; it cannot recall information already seen.
 
 </details>
+
+## Opt in to live website tests
+
+This is a separate, manually approved pilot. Pair a device declaring Hermes and `abliterated-model-large-v2`, receive private-work approval and build **adapter 5**. Keep the provider key in a separate mode-`0600` file owned by the relay’s Unix account. It never enters the task container, browser or dispatcher.
+
+<details>
+<summary><strong>Hosted model configuration and start command</strong></summary>
+
+Use an immutable image ID from your inspected build. The provider-managed model digest below is an honest declaration, not proof of its weights:
+
+```json
+{
+  "docker_socket": "/var/run/docker.sock",
+  "image": "sha256:REPLACE_WITH_LOCAL_IMAGE_ID",
+  "model_url": "https://api.abliteration.ai/v1",
+  "model": "abliterated-model-large-v2",
+  "model_digest": "provider-managed-not-attested",
+  "live_provider_key_file": "/etc/patchriot/provider-key",
+  "max_attempt_seconds": 600
+}
+```
+
+```sh
+./patchriot-relay connect --state-dir /var/lib/patchriot/relay-one --agents --agent-config /etc/patchriot/live-agent.json --live-tests
+```
+
+Do not combine `--live-tests` with the offline website/source opt-ins. The requester approves the exact origins, three named operators and external-provider access. An administrator checks their authority before work starts. The hosted pilot needs provider credit; it does not create platform earnings.
+
+The trusted relay needs DNS/HTTPS access to the fixed provider and approved public targets. The local-only systemd example needs an explicit network-policy adjustment for this mode. The agent container stays non-root, read-only and without external networking, host mounts, keys or the Docker socket. Run it on a dedicated machine. An ordinary container is not a VM or a TEE.
+
+</details>
+
+**What the agent does:** Hermes gets the approved objective, scope, previous reports and the testing method in `agent/live-review-skill.txt`. Its terminal can analyze files and request live evidence through `live_http.py`. The relay enforces HTTPS origins, public DNS/IPs, GET/HEAD/OPTIONS, no automatic redirects and at most two requests per second. No credentials, account changes, transactions or load testing are enabled. Responses are bounded; truncated content is marked.
+
+Each role permits up to 500 HTTP observations, 48 provider calls and a $3 conservative inference allowance. Completed responses with token usage use the provider’s uncached rates; missing usage keeps the full reservation. The runner asks for a final report before exhausting its allowance or execution time and closes tools for that response. These are spending estimates, not provider invoices. The [published rates](https://docs.abliteration.ai/pricing) must be rechecked before deployment. Each response allows up to 8,192 output tokens; model reasoning and evidence can still be incomplete.
+
+Live roles run once. A private start marker prevents a relay restart from repeating paid inference for the same lease; saved result delivery may retry. Keep device state when upgrading. Cancellation or revoked permission stops the lease and container, but cannot undo requests already sent. Findings cite locally recorded HTTP IDs; the next role makes its own checks. Records are operator-reported, not independent attestation, and three identities on one machine are not three independent reviewers.
 
 ## Check the controls
 
@@ -207,7 +258,7 @@ For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pin
 
 ## Opt in to private source reviews
 
-Build the current **adapter 4** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
+Build the current **adapter 5** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
 
 ```sh
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --source-reviews

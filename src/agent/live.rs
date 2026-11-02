@@ -1,0 +1,697 @@
+//! Live target access is outside the agent container. The relay checks every
+//! destination, pins DNS answers, records evidence and owns the provider key.
+use super::*;
+use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunState};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
+
+pub const MODEL: &str = "abliterated-model-large-v2";
+const API: &str = "https://api.abliteration.ai/v1";
+pub const MAX_FRAME: usize = 512 * 1024;
+const MAX_SPEND: u64 = 3_000_000; // $3 reservation per role; never retried by this broker.
+const RECORDED_HEADERS: &[&str] = &[
+    "content-type",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "strict-transport-security",
+    "x-frame-options",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
+    "cross-origin-opener-policy",
+    "cross-origin-embedder-policy",
+    "cross-origin-resource-policy",
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-expose-headers",
+    "cache-control",
+    "vary",
+    "age",
+    "etag",
+    "last-modified",
+    "expires",
+    "location",
+    "server",
+];
+
+pub struct Task {
+    pub role: ReviewRole,
+    pub scope_sha256: String,
+    pub evidence: PentestEvidence,
+}
+impl Task {
+    pub fn input(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if self.evidence.context.scope.normalized()? != self.evidence.context.scope
+            || self.evidence.context.scope.hash()? != self.scope_sha256
+            || self.evidence.context.scope_sha256 != self.scope_sha256
+            || self.evidence.context.provider != "abliteration.ai"
+            || self.evidence.previous_reports.len() > 2
+        {
+            return Err("invalid live assignment".into());
+        }
+        let mut bytes = serde_json::to_vec(
+            &json!({"kind":"live_http_v1","role":self.role,"evidence":self.evidence}),
+        )?;
+        if bytes.len() > 3 * 1024 * 1024 {
+            return Err("live assignment exceeds limit".into());
+        }
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+#[derive(Default)]
+struct Counters {
+    reserved: u64,
+    calls: u16,
+    evidence: Vec<HttpEvidence>,
+    evidence_bytes: usize,
+}
+pub struct LiveBroker {
+    client: reqwest::Client,
+    key: zeroize::Zeroizing<String>,
+    scope: LiveScope,
+    deadline: Instant,
+    counters: Mutex<Counters>,
+}
+impl LiveBroker {
+    pub fn new(
+        key_file: &Path,
+        scope: LiveScope,
+        deadline: Instant,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(key_file)?;
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.mode() & 0o077 != 0
+            || meta.len() > 4096
+            || meta.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err("provider key file must be private and owned by the relay user".into());
+        }
+        let mut key = zeroize::Zeroizing::new(String::new());
+        file.read_to_string(&mut key)?;
+        let key = zeroize::Zeroizing::new(key.trim().to_owned());
+        if key.len() < 16 || key.chars().any(char::is_whitespace) {
+            return Err("invalid provider key file".into());
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(180))
+            .build()?;
+        Ok(Arc::new(Self {
+            client,
+            key,
+            scope,
+            deadline,
+            counters: Mutex::new(Counters::default()),
+        }))
+    }
+    pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
+        if request.method != "POST" {
+            return Err("unsupported_model_method");
+        }
+        let input = request
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or("invalid_model_request")?;
+        if input.get("model") != Some(&json!(MODEL)) {
+            return Err("wrong_model");
+        }
+        let messages = input
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or("messages_required")?;
+        if messages.is_empty()
+            || messages.len() > 160
+            || messages.iter().any(|m| {
+                !matches!(
+                    m["role"].as_str(),
+                    Some("user" | "system" | "assistant" | "tool")
+                ) || !(m["content"].is_string() || m["content"].is_null())
+            })
+        {
+            return Err("invalid_model_messages");
+        }
+        // Construct the provider request: URLs, credentials and arbitrary routing
+        // fields supplied by a model or runtime never reach provider configuration.
+        let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2});
+        if let Some(tools) = input.get("tools") {
+            if !tools
+                .as_array()
+                .is_some_and(|v| v.len() <= 16 && v.iter().all(|t| t["type"] == "function"))
+            {
+                return Err("invalid_tools");
+            }
+            body["tools"] = tools.clone();
+        }
+        if body["stream"] == true {
+            body["stream_options"] = json!({"include_usage":true});
+        }
+        if serde_json::to_vec(&body)
+            .map_err(|_| "invalid_model_request")?
+            .len()
+            > MAX_FRAME
+        {
+            return Err("model_request_too_large");
+        }
+        Ok(body)
+    }
+    async fn model(
+        &self,
+        request: &Request,
+        output: &mpsc::Sender<Frame>,
+    ) -> Result<(), &'static str> {
+        let mut body = self.chat(request)?;
+        self.finish_before_limit(&mut body)?;
+        let bytes = serde_json::to_vec(&body).map_err(|_| "invalid_model_request")?;
+        if bytes.len() > MAX_FRAME {
+            return Err("model_request_too_large");
+        }
+        // UTF-8 bytes conservatively bound text token usage. Reserve the entire
+        // output allowance at published uncached prices, even if a call fails.
+        let reservation = (bytes.len() as u64 + 4096) * 3 + 8192 * 5;
+        {
+            let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+            if count.calls >= 48 || count.reserved + reservation > MAX_SPEND {
+                return Err("provider_budget_reached");
+            }
+            count.calls += 1;
+            count.reserved += reservation;
+        }
+        let mut response = self
+            .client
+            .post(format!("{API}/chat/completions"))
+            .bearer_auth(self.key.as_str())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| "provider_unavailable")?;
+        if !response.status().is_success() {
+            return Err("provider_rejected_request");
+        }
+        let content_type = if body["stream"] == true {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        if response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|v| v.split(';').next() != Some(content_type))
+        {
+            return Err("unexpected_provider_response");
+        }
+        output
+            .send(Frame::Start {
+                id: request.id,
+                status: 200,
+                content_type,
+            })
+            .await
+            .map_err(|_| "agent_disconnected")?;
+        let mut received = 0;
+        let mut usage_bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| "provider_stream_interrupted")?
+        {
+            received += chunk.len();
+            if received > 2 * 1024 * 1024 {
+                return Err("provider_response_limit");
+            }
+            usage_bytes.extend_from_slice(&chunk);
+            for chunk in chunk.chunks(4096) {
+                output
+                    .send(Frame::Chunk {
+                        id: request.id,
+                        hex: hex::encode(chunk),
+                    })
+                    .await
+                    .map_err(|_| "agent_disconnected")?;
+            }
+        }
+        if let Some(cost) = reported_cost(&usage_bytes, body["stream"] == true) {
+            let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+            count.reserved = count
+                .reserved
+                .saturating_sub(reservation)
+                .saturating_add(cost);
+        }
+        output
+            .send(Frame::End { id: request.id })
+            .await
+            .map_err(|_| "agent_disconnected")?;
+        Ok(())
+    }
+    fn finish_before_limit(&self, body: &mut Value) -> Result<(), &'static str> {
+        let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+        let next = (serde_json::to_vec(body)
+            .map_err(|_| "invalid_model_request")?
+            .len() as u64
+            + 4096)
+            * 3
+            + 8192 * 5;
+        if count.calls >= 36
+            || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180)
+            || MAX_SPEND.saturating_sub(count.reserved) < next.saturating_mul(2) + 150_000
+        {
+            body.as_object_mut()
+                .ok_or("invalid_model_request")?
+                .remove("tools");
+            body["tool_choice"] = json!("none");
+            body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
+        }
+        Ok(())
+    }
+
+    async fn http(&self, body: Value) -> Result<Value, &'static str> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Probe {
+            method: String,
+            url: String,
+            #[serde(default)]
+            headers: BTreeMap<String, String>,
+        }
+        let probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
+        let url = self.scope.permits(&probe.method, &probe.url)?;
+        if probe.headers.len() > 12
+            || probe.headers.iter().any(|(k, v)| {
+                k.len() > 80
+                    || v.len() > 1024
+                    || k.chars().any(char::is_control)
+                    || v.chars().any(char::is_control)
+                    || [
+                        "host",
+                        "authorization",
+                        "cookie",
+                        "connection",
+                        "content-length",
+                        "transfer-encoding",
+                        "proxy-authorization",
+                    ]
+                    .contains(&k.to_ascii_lowercase().as_str())
+            })
+        {
+            return Err("unsupported_probe_headers");
+        }
+        {
+            let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+            if count.evidence.len() >= MAX_HTTP_REQUESTS || count.evidence_bytes > 600 * 1024 {
+                return Err("target_request_budget_reached");
+            }
+        }
+        // Calls are serialized by the supervised bridge. This pause caps the
+        // rate even when the model launches a loop in its terminal tool.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let host = url.host_str().ok_or("target_hostname_required")?;
+        let addresses: Vec<SocketAddr> =
+            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
+                .await
+                .map_err(|_| "target_dns_timeout")?
+                .map_err(|_| "target_dns_failed")?
+                .collect();
+        if addresses.is_empty()
+            || addresses.len() > 32
+            || addresses.iter().any(|a| !public_ip(a.ip()))
+        {
+            return Err("target_dns_not_public");
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, &addresses)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| "target_client_unavailable")?;
+        let method = reqwest::Method::from_bytes(probe.method.as_bytes())
+            .map_err(|_| "unsupported_method")?;
+        let mut request = client
+            .request(method, url)
+            .header("user-agent", "Patchriot-authorized-review/0.0.2");
+        for (key, value) in &probe.headers {
+            request = request.header(key, value);
+        }
+        let response = request.send().await;
+        let mut evidence = HttpEvidence {
+            id: 0,
+            method: probe.method,
+            url: probe.url,
+            request_headers: probe.headers,
+            status: None,
+            headers: BTreeMap::new(),
+            body_excerpt: String::new(),
+            body_sha256: None,
+            truncated: false,
+            error: None,
+            observed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+        };
+        let mut received = Vec::new();
+        match response {
+            Err(_) => evidence.error = Some("target_request_failed".into()),
+            Ok(mut response) => {
+                evidence.status = Some(response.status().as_u16());
+                for &name in RECORDED_HEADERS {
+                    if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok())
+                    {
+                        evidence
+                            .headers
+                            .insert(name.into(), value.chars().take(1024).collect());
+                    }
+                }
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            let available = (256 * 1024usize).saturating_sub(received.len());
+                            received.extend_from_slice(&chunk[..available.min(chunk.len())]);
+                            if chunk.len() > available {
+                                evidence.truncated = true;
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            evidence.error = Some("target_body_interrupted".into());
+                            evidence.truncated = true;
+                            break;
+                        }
+                    }
+                }
+                evidence.body_sha256 = Some(hex::encode(Sha256::digest(&received)));
+                evidence.body_excerpt = String::from_utf8_lossy(&received)
+                    .chars()
+                    .take(2048)
+                    .collect();
+                evidence.truncated |= evidence.body_excerpt.len() < received.len();
+            }
+        }
+        let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+        evidence.id = count.evidence.len() as u32 + 1;
+        count.evidence_bytes += serde_json::to_vec(&evidence)
+            .map_err(|_| "evidence_encoding_failed")?
+            .len();
+        let reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":received.len()==256*1024});
+        count.evidence.push(evidence);
+        Ok(reply)
+    }
+    pub async fn respond(&self, request: Request, output: mpsc::Sender<Frame>) {
+        if request.path == "/v1/chat/completions" {
+            if let Err(reason) = self.model(&request, &output).await {
+                let _ = output
+                    .send(Frame::Failed {
+                        id: request.id,
+                        reason,
+                    })
+                    .await;
+            }
+            return;
+        }
+        let (status, body) = match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/models") => (
+                200,
+                json!({"object":"list","data":[{"id":MODEL,"object":"model","context_length":200000}]}),
+            ),
+            ("POST", "/patchriot/http") => {
+                match self.http(request.body.unwrap_or(Value::Null)).await {
+                    Ok(v) => (200, v),
+                    Err(e) => (400, json!({"error":e})),
+                }
+            }
+            _ => (404, json!({"error":"unsupported_bridge_route"})),
+        };
+        let _ = output
+            .send(Frame::Start {
+                id: request.id,
+                status,
+                content_type: "application/json",
+            })
+            .await;
+        for chunk in serde_json::to_vec(&body).unwrap_or_default().chunks(4096) {
+            if output
+                .send(Frame::Chunk {
+                    id: request.id,
+                    hex: hex::encode(chunk),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = output.send(Frame::End { id: request.id }).await;
+    }
+    pub(super) fn result(
+        &self,
+        report: &AgentRun,
+        settings: &Settings,
+        passed: bool,
+        cleanup: bool,
+    ) -> PentestResult {
+        let raw = report
+            .events
+            .iter()
+            .rev()
+            .find(|e| e["event"] == "result")
+            .and_then(|e| e["data"]["final_response"].as_str())
+            .unwrap_or("");
+        let cleaned = raw
+            .trim()
+            .strip_prefix("```json")
+            .or_else(|| raw.trim().strip_prefix("```"))
+            .and_then(|s| s.trim().strip_suffix("```"))
+            .unwrap_or(raw)
+            .trim();
+        let assessment = parse_assessment(cleaned);
+        let count = self.counters.lock().expect("live counters poisoned");
+        let mut result = PentestResult {
+            kind: PentestResultKind::PentestAgentV1,
+            scope_sha256: self.scope.hash().unwrap_or_default(),
+            execution: LiveExecution {
+                state: if passed {
+                    WebsiteRunState::Completed
+                } else {
+                    WebsiteRunState::Failed
+                },
+                provider: "abliteration.ai".into(),
+                model: MODEL.into(),
+                image_digest: settings.image.clone(),
+                duration_ms: report.duration_ms.min(u128::from(u64::MAX)) as u64,
+                inference_calls: count.calls,
+                http_requests: count.evidence.len() as u16,
+                cost_upper_microusd: count.reserved,
+                cleanup_confirmed: cleanup,
+                failure_reason: if passed {
+                    None
+                } else {
+                    Some(report.failure_reason.unwrap_or(report.outcome).to_owned())
+                },
+            },
+            assessment,
+            evidence: count.evidence.clone(),
+            raw_summary: {
+                let mut end = raw.len().min(24000);
+                while !raw.is_char_boundary(end) {
+                    end -= 1;
+                }
+                raw[..end].to_owned()
+            },
+        };
+        result.omit_binary_excerpts();
+        if !result.valid(&self.scope) {
+            result.assessment = None;
+        }
+        result
+    }
+}
+
+/// Provider usage is a billing observation, not proof of an invoice. Charge
+/// uncached rates conservatively. Missing usage keeps the original reservation.
+fn reported_cost(bytes: &[u8], stream: bool) -> Option<u64> {
+    fn cost(v: &Value) -> Option<u64> {
+        let p = v["usage"]["prompt_tokens"].as_u64()?;
+        let c = v["usage"]["completion_tokens"].as_u64()?;
+        if p == 0 || p > 10_000_000 || c > 1_000_000 {
+            return None;
+        }
+        p.checked_mul(3)?.checked_add(c.checked_mul(5)?)
+    }
+    if stream {
+        bytes
+            .split(|b| *b == b'\n')
+            .filter_map(|line| line.strip_prefix(b"data:"))
+            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+            .filter_map(|v| cost(&v))
+            .next_back()
+    } else {
+        serde_json::from_slice(bytes).ok().and_then(|v| cost(&v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn literal_line_breaks_are_preserved_but_malformed_claims_are_not_guessed() {
+        let report = "{\"summary\":\"Line one\nLine two\",\"findings\":[],\"limitations\":[\"Owned test only\"]}";
+        assert_eq!(
+            parse_assessment(report).unwrap().summary,
+            "Line one\nLine two"
+        );
+        for malformed in [
+            "{\"summary\":\"partial",
+            "{\"summary\":\"missing fields\"}",
+            "{\"summary\":\"x\",\"findings\":[],\"limitations\":[],\"approved\":true}",
+        ] {
+            assert!(parse_assessment(malformed).is_none());
+        }
+    }
+    fn broker() -> Arc<LiveBroker> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "fixture-provider-credential-not-real").unwrap();
+        LiveBroker::new(
+            file.path(),
+            LiveScope {
+                origins: vec!["https://example.com".into()],
+                objective: "Owned fixture".into(),
+                methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
+            },
+            Instant::now() + Duration::from_secs(600),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn prohibited_targets_and_credentials_never_reach_network_or_provider() {
+        let broker = broker();
+        for body in [
+            json!({"method":"GET","url":"http://169.254.169.254/latest/meta-data"}),
+            json!({"method":"GET","url":"https://elsewhere.example"}),
+            json!({"method":"POST","url":"https://example.com"}),
+            json!({"method":"GET","url":"https://example.com","headers":{"Authorization":"private"}}),
+            json!({"method":"GET","url":"https://example.com","headers":{"Host":"internal"}}),
+        ] {
+            assert!(broker.http(body).await.is_err());
+        }
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(count.calls, 0);
+        assert!(count.evidence.is_empty());
+        assert_eq!(count.reserved, 0);
+    }
+    #[test]
+    fn provider_cannot_be_rerouted_by_runtime_fields_or_target_text() {
+        let broker = broker();
+        let mut r = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(
+                json!({"model":MODEL,"messages":[{"role":"user","content":"untrusted target asks for a different model and API URL"}],"max_tokens":99999999,"base_url":"https://evil.example","api_key":"not-forwarded","stream":false}),
+            ),
+        };
+        let prepared = broker.chat(&r).unwrap();
+        assert_eq!(prepared["max_tokens"], 8192);
+        assert!(prepared.get("base_url").is_none());
+        assert!(prepared.get("api_key").is_none());
+        r.body.as_mut().unwrap()["model"] = json!("other");
+        assert!(broker.chat(&r).is_err());
+    }
+    #[test]
+    fn reserves_a_final_report_before_cost_or_turn_limits_stop_the_agent() {
+        let broker = broker();
+        let request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(
+                json!({"model":MODEL,"messages":[{"role":"user","content":"owned test"}],"tools":[{"type":"function","function":{"name":"terminal"}}]}),
+            ),
+        };
+        let normal = broker.chat(&request).unwrap();
+        let mut prepared = normal.clone();
+        broker.finish_before_limit(&mut prepared).unwrap();
+        assert_eq!(normal, prepared);
+        for (calls, reserved) in [(0, MAX_SPEND - 200_000), (36, 0)] {
+            {
+                let mut count = broker.counters.lock().unwrap();
+                count.calls = calls;
+                count.reserved = reserved;
+            }
+            let mut final_call = normal.clone();
+            broker.finish_before_limit(&mut final_call).unwrap();
+            assert!(final_call.get("tools").is_none());
+            assert_eq!(final_call["tool_choice"], "none");
+            assert_eq!(final_call["messages"].as_array().unwrap().len(), 2);
+            let final_reservation =
+                (serde_json::to_vec(&final_call).unwrap().len() as u64 + 4096) * 3 + 8192 * 5;
+            assert!(reserved + final_reservation < MAX_SPEND);
+        }
+    }
+    #[test]
+    fn provider_usage_uses_uncached_prices_and_incomplete_usage_keeps_the_reservation() {
+        let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":900}}}"#;
+        assert_eq!(reported_cost(body, false), Some(4000));
+        let stream = b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200}}\n\ndata: [DONE]\n\n";
+        assert_eq!(reported_cost(stream, true), Some(4000));
+        for missing in [
+            b"{}".as_slice(),
+            br#"{"usage":{"prompt_tokens":1000}}"#,
+            br#"{"usage":{"prompt_tokens":0,"completion_tokens":200}}"#,
+        ] {
+            assert_eq!(reported_cost(missing, false), None);
+        }
+        assert_eq!(reported_cost(b"data: {\"usage\":", true), None);
+    }
+    #[tokio::test]
+    async fn exhausted_cost_reservation_fails_before_a_provider_request() {
+        let broker = broker();
+        broker.counters.lock().unwrap().reserved = MAX_SPEND;
+        let r = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(json!({"model":MODEL,"messages":[{"role":"user","content":"fixture"}]})),
+        };
+        let (tx, _rx) = mpsc::channel(2);
+        assert_eq!(broker.model(&r, &tx).await, Err("provider_budget_reached"));
+        assert_eq!(broker.counters.lock().unwrap().calls, 0);
+    }
+    #[test]
+    fn shared_or_symlinked_provider_keys_are_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        std::fs::write(&key, "fixture-provider-credential-not-real").unwrap();
+        let scope = broker().scope.clone();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(600);
+        assert!(LiveBroker::new(&key, scope.clone(), deadline).is_err());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&key, &link).unwrap();
+        assert!(LiveBroker::new(&link, scope, deadline).is_err());
+    }
+    #[test]
+    fn a_slow_role_gets_time_to_write_its_report_before_lease_expiry() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().deadline = Instant::now() + Duration::from_secs(120);
+        let mut body = json!({"messages":[{"role":"user","content":"fixture"}],"tools":[]});
+        broker.finish_before_limit(&mut body).unwrap();
+        assert_eq!(body["tool_choice"], "none");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(broker.counters.lock().unwrap().calls, 0);
+    }
+}

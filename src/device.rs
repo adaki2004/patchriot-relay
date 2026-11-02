@@ -482,6 +482,7 @@ fn work_tick(
     agent: Option<&crate::agent::Settings>,
     website_reviews: bool,
     source_reviews: bool,
+    live_tests: bool,
 ) -> Result<(), Error> {
     send_result(directory, client)?;
     let (config, key) = {
@@ -508,6 +509,7 @@ fn work_tick(
             sequence: config.work_sequence,
             website_reviews,
             source_reviews,
+            live_tests,
         },
     )?;
     let Some(assignment) = reply.assignment else {
@@ -515,6 +517,14 @@ fn work_tick(
         return Ok(());
     };
     let allowed = match assignment.mode {
+        ReviewMode::PentestAgent => {
+            agent.is_some()
+                && live_tests
+                && assignment.scenario == FixtureScenario::LiveHttpV1
+                && assignment.pentest.is_some()
+                && assignment.source.is_none()
+                && assignment.website.is_none()
+        }
         ReviewMode::OwnedFixture => {
             agent.is_none()
                 && assignment.scenario == FixtureScenario::AccessControlV1
@@ -542,7 +552,7 @@ fn work_tick(
                 && assignment.website.is_none()
         }
     };
-    if !allowed {
+    if !allowed || (assignment.mode != ReviewMode::PentestAgent && assignment.pentest.is_some()) {
         return Err("assignment mode does not match the opted-in local runtime".into());
     }
     {
@@ -820,6 +830,37 @@ fn agent_work(
             } else {
                 None
             };
+            let live = if let Some(live) = &assignment.pentest {
+                let saved: patchriot_protocol::pentests::PentestEvidence = post_with_limit(
+                    client,
+                    &config,
+                    &read_key(directory)?,
+                    &format!("/v1/devices/{device_id}/work/pentest-evidence"),
+                    patchriot_protocol::website_reviews::ReadWorkEvidence {
+                        lease_id: assignment.lease_id,
+                    },
+                    3 * 1024 * 1024,
+                )?;
+                if saved.context.pentest_id != live.pentest_id {
+                    return Err("wrong live scope".into());
+                }
+                Some(crate::agent::live::Task {
+                    role: assignment.role,
+                    scope_sha256: live.scope_sha256.clone(),
+                    evidence: saved,
+                })
+            } else {
+                None
+            };
+            if live.is_some() {
+                // A process restart must not purchase the same role twice. The
+                // existing result outbox handles delivery retries separately.
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                    .open(directory.join(format!("live-{}.started",assignment.lease_id)))
+                    .map_err(|_|"live role already started or marker could not be saved; do not rerun paid inference")?
+                    .sync_all()?;
+            }
             let check = crate::agent::run(
                 settings,
                 Some(crate::agent::Assignment {
@@ -830,6 +871,7 @@ fn agent_work(
                 }),
                 website.as_ref(),
                 source.as_ref(),
+                live.as_ref(),
                 &|| stop.load(Ordering::Relaxed) || window.stopped_at(Instant::now()),
             )?;
             // Keep one bounded private trace for operator diagnosis. It is never
@@ -878,6 +920,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
     let mut agents = false;
     let mut website_reviews = false;
     let mut source_reviews = false;
+    let mut live_tests = false;
     let mut args = args[1..].iter();
     while let Some(name) = args.next() {
         if name == "--once" && action == "connect" && !once {
@@ -898,6 +941,10 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
         }
         if name == "--source-reviews" && action == "connect" && !source_reviews {
             source_reviews = true;
+            continue;
+        }
+        if name == "--live-tests" && action == "connect" && !live_tests {
+            live_tests = true;
             continue;
         }
         let allowed = name == "--state-dir"
@@ -949,7 +996,8 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
         "connect" => {
             if fixtures && agents
                 || agents != options.contains_key("--agent-config")
-                || (website_reviews || source_reviews) && !agents
+                || (website_reviews || source_reviews || live_tests) && !agents
+                || live_tests && (website_reviews || source_reviews)
             {
                 return Err(
                     "choose --fixtures or --agents --agent-config PATH; each is explicit opt-in"
@@ -968,6 +1016,12 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                 .get("--agent-config")
                 .map(|path| crate::agent::Settings::load(Path::new(path)))
                 .transpose()?;
+            if live_tests {
+                settings
+                    .as_ref()
+                    .ok_or("live tests require agent settings")?
+                    .require_live_adapter()?;
+            }
             if website_reviews {
                 settings
                     .as_ref()
@@ -1013,6 +1067,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                             settings.as_ref(),
                             website_reviews,
                             source_reviews,
+                            live_tests,
                         )?;
                     }
                     Ok(())
@@ -1116,6 +1171,7 @@ mod tests {
                     sequence: 1,
                     website_reviews: false,
                     source_reviews: false,
+                    live_tests: false,
                 },
             )
             .unwrap_err();

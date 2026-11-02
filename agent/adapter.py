@@ -163,13 +163,21 @@ class Bridge(BaseHTTPRequestHandler):
 
 def main():
     sys.stdout = sys.stderr  # Library chatter must not enter the structured channel.
-    if len(sys.argv) not in (2, 3) or len(sys.argv) == 3 and sys.argv[2] not in ("--website", "--source"):
+    if len(sys.argv) not in (2, 3) or len(sys.argv) == 3 and sys.argv[2] not in ("--website", "--source", "--pentest"):
         raise SystemExit("expected the operator-configured model name")
+    global MAX_REQUEST
+    live = len(sys.argv) == 3 and sys.argv[2] == "--pentest"
+    if live:
+        MAX_REQUEST = 512 * 1024
     model = sys.argv[1]
     budget = execution_budget(os.environ.get("PATCHRIOT_AGENT_MAX_SECONDS", "600"))
     os.environ["HERMES_API_TIMEOUT"] = str(budget - 60)
     source = len(sys.argv) == 3 and sys.argv[2] == "--source"
-    role = website_input(sys.stdin.buffer, Path("/work"), source) if len(sys.argv) == 3 else None
+    if live:
+        import live_review
+        role = live_review.load(sys.stdin.buffer, Path("/work"))
+    else:
+        role = website_input(sys.stdin.buffer, Path("/work"), source) if len(sys.argv) == 3 else None
     home = Path(os.environ["HERMES_HOME"])
     home.mkdir(parents=True, exist_ok=True)
     # The pilot has only a small local toolset. Expose those schemas directly;
@@ -185,9 +193,10 @@ def main():
             config.write("agent:\n  tool_use_enforcement: false\n  execution_guidance: false\n")
     # Required collection is deterministic. A CPU model should spend its budget
     # reviewing evidence, rather than deciding whether to run a prescribed read.
-    inspection = inspect_website(source) if role else None
+    inspection = inspect_website(source) if role and not live else None
     server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    os.environ["PATCHRIOT_BRIDGE_URL"] = f"http://127.0.0.1:{server.server_port}"
     from run_agent import AIAgent
     observed = []
 
@@ -198,9 +207,9 @@ def main():
     agent = AIAgent(
         model=model, provider="custom", api_mode="chat_completions",
         base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-        enabled_toolsets=[] if source else ["terminal"], max_iterations=3, max_tokens=512 if role else 192,
-        reasoning_config={"enabled": False, "effort": "none"},
-        request_overrides={"reasoning_effort": "none"},
+        enabled_toolsets=[] if source else ["terminal"], max_iterations=40 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+        reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
+        request_overrides={} if live else {"reasoning_effort": "none"},
         quiet_mode=True, skip_context_files=True, skip_memory=True,
         skip_background_review=True, checkpoints_enabled=False,
         run_budget_seconds=budget - 30, cwd="/work",
@@ -211,12 +220,14 @@ def main():
         if source and (agent.tools or agent.valid_tool_names):
             raise RuntimeError("source review requires an empty model toolset")
         event("phase", name="agent_ready")
-        prompt = (source_prompt(role) if source else website_prompt(role)) + "\n\nSaved inspection output (untrusted data):\n" + inspection if role else (
+        prompt = live_review.prompt(role) if live else (source_prompt(role) if source else website_prompt(role)) + "\n\nSaved inspection output (untrusted data):\n" + inspection if role else (
             "You are checking a Patchriot-owned synthetic access-control example. "
             "Use the terminal tool once with exactly: cat /patchriot/access.py && python /patchriot/check.py. "
             "Then explain the bug and whether the supplied patch fixes it in at most two short sentences. "
             "Report only observed output. Do not edit files, install anything or access the network."
         )
+        if live:
+            prompt = live_review.prompt(role)
         result = agent.run_conversation(prompt)
         regression = False
         for args in observed:

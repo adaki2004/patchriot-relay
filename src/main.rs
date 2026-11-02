@@ -8,6 +8,7 @@ mod device;
 mod docker;
 mod fixtures;
 mod inference;
+mod mesh;
 mod process;
 mod runner;
 mod sandbox;
@@ -25,9 +26,11 @@ patchriot-relay init --state-dir PATH --dispatcher URL --audience NAME --label N
 patchriot-relay pair --state-dir PATH
 patchriot-relay connect --state-dir PATH [--once] [--fixtures]
 patchriot-relay connect --state-dir PATH --agents --agent-config PATH [--once] [--website-reviews] [--source-reviews]
+patchriot-relay connect --state-dir PATH --agents --agent-config PATH --live-tests
 patchriot-relay status --state-dir PATH
 patchriot-relay pause --state-dir PATH
 patchriot-relay resume --state-dir PATH
+patchriot-relay mesh-check --dispatcher https://device.tailnet.ts.net
 
 patchriot-relay demo
 patchriot-relay fixture <case> [--timeout-ms N] [--max-output-bytes N] [--cancel-after-ms N]
@@ -59,6 +62,9 @@ fn execute() -> Result<u8, Box<dyn std::error::Error>> {
     }
     if ["init", "pair", "connect", "status", "pause", "resume"].contains(&args[0].as_str()) {
         return device::execute(&args);
+    }
+    if args[0] == "mesh-check" {
+        return mesh::execute(&args);
     }
     if args[0] == "sandbox-check" {
         return sandbox::execute(&args);
