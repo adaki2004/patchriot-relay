@@ -235,7 +235,7 @@ def main():
             "Report only observed output. Do not edit files, install anything or access the network."
         )
         if live:
-            prompt = live_review.prompt(role)
+            prompt = live_review.prompt(role) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         regression = False
         for args in observed:

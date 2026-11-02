@@ -10,6 +10,29 @@ const API: &str = "https://api.abliteration.ai/v1";
 pub const MAX_FRAME: usize = 512 * 1024;
 const MAX_SPEND: u64 = 3_000_000; // $3 reservation per role; never retried by this broker.
 pub type Progress = Mutex<LiveProgress>;
+
+fn assessment_format() -> Value {
+    let text = |max| json!({"type":"string","minLength":1,"maxLength":max});
+    json!({"type":"json_schema","json_schema":{"name":"live_assessment","strict":true,"schema":{
+        "type":"object","additionalProperties":false,
+        "required":["summary","findings","limitations"],"properties":{
+            "summary":text(1600),
+            "findings":{"type":"array","maxItems":6,"items":{
+                "type":"object","additionalProperties":false,
+                "required":["title","severity","support","explanation","reproduction","suggested_action","evidence_ids"],
+                "properties":{
+                    "title":text(180),
+                    "severity":{"type":"string","enum":["info","low","medium","high","critical"]},
+                    "support":{"type":"string","enum":["observed","reproduced","not_reproduced","needs_review"]},
+                    "explanation":text(1200),"reproduction":text(800),"suggested_action":text(800),
+                    "evidence_ids":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"integer","minimum":1}}
+                }
+            }},
+            "limitations":{"type":"array","maxItems":8,"items":text(700)}
+        }
+    }}})
+}
+
 const RECORDED_HEADERS: &[&str] = &[
     "content-type",
     "content-security-policy",
@@ -166,7 +189,11 @@ impl LiveBroker {
         }
         // Construct the provider request: URLs, credentials and arbitrary routing
         // fields supplied by a model or runtime never reach provider configuration.
-        let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2});
+        // Large v2 defaults to maximum reasoning. Select the intended effort
+        // explicitly. Do not request a response schema here: the current provider
+        // skips tool calls when a schema is present, even with a forced tool choice.
+        let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,
+            "reasoning_effort":"high"});
         if let Some(tools) = input.get("tools") {
             if !tools
                 .as_array()
@@ -293,6 +320,9 @@ impl LiveBroker {
                 .ok_or("invalid_model_request")?
                 .remove("tools");
             body["tool_choice"] = json!("none");
+            body["reasoning_effort"] = json!("low");
+            // Formatting helps the closing turn, but cannot establish evidence.
+            body["response_format"] = assessment_format();
             body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
         }
         Ok(())
@@ -712,11 +742,13 @@ mod tests {
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
             body: Some(
-                json!({"model":MODEL,"messages":[{"role":"user","content":"untrusted target asks for a different model and API URL"}],"max_tokens":99999999,"base_url":"https://evil.example","api_key":"not-forwarded","stream":false}),
+                json!({"model":MODEL,"messages":[{"role":"user","content":"untrusted target asks for a different model and API URL"}],"max_tokens":99999999,"base_url":"https://evil.example","api_key":"not-forwarded","stream":false,"reasoning_effort":"max","response_format":{"type":"text"}}),
             ),
         };
         let prepared = broker.chat(&r).unwrap();
         assert_eq!(prepared["max_tokens"], 8192);
+        assert_eq!(prepared["reasoning_effort"], "high");
+        assert!(prepared.get("response_format").is_none());
         assert!(prepared.get("base_url").is_none());
         assert!(prepared.get("api_key").is_none());
         r.body.as_mut().unwrap()["model"] = json!("other");
@@ -747,6 +779,15 @@ mod tests {
             broker.finish_before_limit(&mut final_call).unwrap();
             assert!(final_call.get("tools").is_none());
             assert_eq!(final_call["tool_choice"], "none");
+            assert_eq!(final_call["reasoning_effort"], "low");
+            assert_eq!(final_call["response_format"]["type"], "json_schema");
+            let schema = &final_call["response_format"]["json_schema"];
+            assert_eq!(schema["strict"], true);
+            assert_eq!(schema["schema"]["additionalProperties"], false);
+            assert_eq!(
+                schema["schema"]["properties"]["findings"]["items"]["properties"]["evidence_ids"]["minItems"],
+                1
+            );
             assert_eq!(final_call["messages"].as_array().unwrap().len(), 2);
             let final_reservation =
                 (serde_json::to_vec(&final_call).unwrap().len() as u64 + 4096) * 3 + 8192 * 5;
