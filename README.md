@@ -15,10 +15,10 @@ The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built
 Review the source yourself, or ask your agent to inspect it and install it only if that review passes. Use a separate VPS without production credentials. After a merge to `main`, the release workflow builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). The first hosted release is pending. Prototype releases use `v0.0.1-dev.<commit>`. Once available, download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, then:
 
 ```sh
-sha256sum --ignore-missing --check SHA256SUMS
-tar -xzf patchriot-relay-linux-x86_64.tar.gz
-cd patchriot-relay
-./patchriot-relay demo
+sha256sum --ignore-missing --check SHA256SUMS &&
+  tar -xzf patchriot-relay-linux-x86_64.tar.gz &&
+  cd patchriot-relay &&
+  ./patchriot-relay demo
 ```
 
 The archive includes agent/sandbox setup files, service examples and license notices. Use `./patchriot-relay` instead of `cargo run --locked --` in the commands below. Matching relay and protocol source is attached separately; macOS users can build from source. Model weights and the external agent runtime are installed separately.
@@ -54,7 +54,7 @@ cargo run --locked -- connect --state-dir .local/relay-one
 
 1. Sign in to the website and enter the five-minute code under **Pair a relay**.
 2. Complete the short operator profile and data-handling consent.
-3. An administrator approves the device under **Fleet & approvals**.
+3. An administrator approves the device under **Agent approvals**.
 
 </details>
 
