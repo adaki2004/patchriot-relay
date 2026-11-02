@@ -131,6 +131,7 @@ fn hermes_pairing_preserves_the_declaration_and_cannot_run_the_fixture_queue() {
     assert_eq!(value["runtime"], "hermes");
     assert_eq!(value["runtime_version"], "0.22.2");
     assert_eq!(value["declared_model"], "publisher/model:small");
+    assert_eq!(value["reported_os"], std::env::consts::OS);
     let denied = invoke(&path, "connect", &["--once", "--fixtures"]);
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("presence only"));

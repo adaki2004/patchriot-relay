@@ -29,6 +29,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub mod live;
+pub mod source;
 pub mod website;
 
 const IMAGE_ENTRY: [&str; 2] = ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"];
@@ -55,6 +57,8 @@ pub struct Settings {
     model_url: String,
     model: String,
     model_digest: String,
+    #[serde(default)]
+    live_provider_key_file: Option<PathBuf>,
     #[serde(default = "default_agent_attempt_seconds")]
     max_attempt_seconds: u64,
 }
@@ -68,18 +72,46 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3"].contains(
+            || !["2", "3", "4", "5"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "3"
+                && !["3", "4", "5"].contains(
+                    &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
+                        .as_str()
+                        .unwrap_or(""),
+                )
         {
             return Err(
-                "website reviews require adapter 2 or 3; longer CPU budgets require adapter 3"
+                "website reviews require adapter 2–5; longer CPU budgets require adapter 3–5"
                     .into(),
             );
+        }
+        Ok(())
+    }
+    pub fn require_live_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
+        if self.live_provider_key_file.is_none()
+            || image["Id"] != self.image
+            || image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "5"
+        {
+            return Err(
+                "live tests require the inspected adapter 5 and a private provider key file".into(),
+            );
+        }
+        Ok(())
+    }
+    pub fn require_source_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
+        if image["Id"] != self.image
+            || !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("4" | "5")
+            )
+        {
+            return Err("source reviews require the inspected adapter 4 image".into());
         }
         Ok(())
     }
@@ -101,7 +133,15 @@ impl Settings {
         {
             return Err("max_attempt_seconds must be 600..1800".into());
         }
-        crate::inference::origin(&settings.model_url)?;
+        if settings.live_provider_key_file.is_some() {
+            if settings.model != live::MODEL
+                || settings.model_url != "https://api.abliteration.ai/v1"
+            {
+                return Err("live model configuration must use the declared provider".into());
+            }
+        } else {
+            crate::inference::origin(&settings.model_url)?;
+        }
         Ok(settings)
     }
 }
@@ -168,6 +208,67 @@ pub fn recover(
     Ok(())
 }
 
+#[derive(Clone)]
+enum Bridge {
+    Local(Broker),
+    Live(Arc<live::LiveBroker>),
+}
+impl From<Broker> for Bridge {
+    fn from(b: Broker) -> Self {
+        Self::Local(b)
+    }
+}
+impl Bridge {
+    fn max_frame(&self) -> usize {
+        match self {
+            Self::Local(_) => MAX_REQUEST,
+            Self::Live(_) => live::MAX_FRAME,
+        }
+    }
+    fn output_limit(&self) -> usize {
+        match self {
+            Self::Local(_) => 1_048_576,
+            Self::Live(_) => 32 * 1024 * 1024,
+        }
+    }
+    fn max_requests(&self) -> usize {
+        match self {
+            Self::Local(_) => 32,
+            Self::Live(_) => 600,
+        }
+    }
+    fn max_calls(&self) -> usize {
+        match self {
+            Self::Local(_) => 4,
+            Self::Live(_) => 48,
+        }
+    }
+    fn max_tokens(&self) -> u64 {
+        match self {
+            Self::Local(b) => b.max_tokens(),
+            Self::Live(_) => 8192,
+        }
+    }
+    fn chat(&self, r: &Request) -> Result<Value, &'static str> {
+        match self {
+            Self::Local(b) => b.chat(r),
+            Self::Live(b) => b.chat(r),
+        }
+    }
+    fn matches_declaration(&self, s: &str) -> bool {
+        match self {
+            Self::Local(b) => b.matches_declaration(s),
+            Self::Live(_) => s == live::MODEL,
+        }
+    }
+    async fn respond(&self, r: Request, tx: mpsc::Sender<Frame>) {
+        match self {
+            Self::Local(b) => b.respond(r, tx).await,
+            Self::Live(b) => b.respond(r, tx).await,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Wire {
@@ -200,11 +301,12 @@ impl Drop for RequestTask {
 /// caller kills/removes the actual container even if the attach process exits.
 async fn supervise(
     command: std::process::Command,
-    broker: Broker,
+    broker: impl Into<Bridge>,
     cancelled: &impl Fn() -> bool,
     timeout: Duration,
     input: Option<Vec<u8>>,
 ) -> io::Result<AgentRun> {
+    let broker = broker.into();
     if cancelled() {
         return Ok(AgentRun {
             outcome: "cancelled",
@@ -303,7 +405,7 @@ async fn supervise(
                 let n = n?;
                 err_open = n != 0;
                 report.output_bytes += n;
-                if report.output_bytes > 1_048_576 {
+                if report.output_bytes > broker.output_limit() {
                     report.outcome = "output_limit";
                     break;
                 }
@@ -312,13 +414,13 @@ async fn supervise(
                 let n = n?;
                 out_open = n != 0;
                 report.output_bytes += n;
-                if report.output_bytes > 1_048_576 {
+                if report.output_bytes > broker.output_limit() {
                     report.outcome = "output_limit";
                     break;
                 }
                 pending.extend_from_slice(&out[..n]);
                 while let Some(end) = pending.iter().position(|&b| b == b'\n') {
-                    if end > MAX_REQUEST {
+                    if end > broker.max_frame() {
                         report.outcome = "invalid_protocol";
                         break 'running;
                     }
@@ -327,14 +429,14 @@ async fn supervise(
                     match wire {
                         Ok(Wire::Request { request }) => {
                             report.requests += 1;
-                            if active.is_some() || request.id <= last_id || report.requests > 32 || final_seen {
+                            if active.is_some() || request.id <= last_id || report.requests > broker.max_requests() || final_seen {
                                 report.outcome = "invalid_protocol";
                                 break 'running;
                             }
                             last_id = request.id;
                             active = Some(request.id);
                             if request.path == "/v1/chat/completions" {
-                                if report.inference_calls >= 4 {
+                                if report.inference_calls >= broker.max_calls() {
                                     report.outcome = "inference_limit";
                                     break 'running;
                                 }
@@ -376,7 +478,7 @@ async fn supervise(
                         }
                     }
                 }
-                if pending.len() > MAX_REQUEST {
+                if pending.len() > broker.max_frame() {
                     report.outcome = "invalid_protocol";
                     break;
                 }
@@ -494,7 +596,9 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
-    let check = run(&settings, None, None, &|| cancelled.load(Ordering::Relaxed))?;
+    let check = run(&settings, None, None, None, None, &|| {
+        cancelled.load(Ordering::Relaxed)
+    })?;
     serde_json::to_writer_pretty(io::stdout().lock(), &check.report)?;
     println!();
     Ok(u8::from(!check.result.matches_fixture()))
@@ -504,8 +608,18 @@ pub fn run(
     settings: &Settings,
     assignment: Option<Assignment<'_>>,
     website: Option<&website::Task>,
+    source: Option<&source::Task>,
+    live: Option<&live::Task>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Check, Box<dyn std::error::Error>> {
+    if [website.is_some(), source.is_some(), live.is_some()]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
+        > 1
+    {
+        return Err("assignment has conflicting material".into());
+    }
     if cancelled() {
         return Err("agent check cancelled before startup".into());
     }
@@ -515,19 +629,28 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3"].contains(
+        || !["1", "2", "3", "4", "5"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3"].contains(
+            && !["2", "3", "4", "5"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
+        || source.is_some()
+            && !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("4" | "5")
+            )
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "3"
+            && !["3", "4", "5"].contains(
+                &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
+                    .as_str()
+                    .unwrap_or(""),
+            )
         || !no_entries(&image["Config"]["OnBuild"])
         || !no_entries(&image["Config"]["Healthcheck"])
     {
@@ -536,21 +659,61 @@ pub fn run(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let broker = runtime.block_on(Broker::connect(
-        &settings.model_url,
-        &settings.model,
-        &settings.model_digest,
-        settings.max_attempt_seconds,
-    ))?;
-    let broker = if let Some(task) = website {
-        broker.for_website_review(&task.evidence.snapshot)
+    let live_broker = live
+        .map(|task| {
+            live::LiveBroker::new(
+                settings
+                    .live_provider_key_file
+                    .as_deref()
+                    .ok_or("live provider not configured")?,
+                task.evidence.context.scope.clone(),
+                assignment
+                    .as_ref()
+                    .map(|a| a.execution_deadline)
+                    .unwrap_or_else(|| {
+                        Instant::now() + Duration::from_secs(settings.max_attempt_seconds)
+                    })
+                    .min(Instant::now() + Duration::from_secs(settings.max_attempt_seconds)),
+            )
+        })
+        .transpose()?;
+    let broker = if let Some(broker) = &live_broker {
+        settings.require_live_adapter()?;
+        Bridge::Live(broker.clone())
     } else {
-        broker
+        if settings.live_provider_key_file.is_some() {
+            return Err("hosted inference accepts only opted-in live work".into());
+        }
+        let broker = runtime.block_on(Broker::connect(
+            &settings.model_url,
+            &settings.model,
+            &settings.model_digest,
+            settings.max_attempt_seconds,
+        ))?;
+        Bridge::Local(if let Some(task) = website {
+            broker.for_website_review(&task.evidence.snapshot)
+        } else if let Some(task) = source {
+            broker.for_source_review(&task.evidence.bundle)
+        } else {
+            broker
+        })
     };
-    let input = website.map(website::Task::input).transpose()?;
+    let input = if let Some(task) = live {
+        Some(task.input()?)
+    } else if let Some(task) = source {
+        Some(task.input()?)
+    } else {
+        website.map(website::Task::input).transpose()?
+    };
     let mut args = vec![settings.model.as_str()];
+    if live.is_some() {
+        args.push("--pentest");
+    }
     if website.is_some() {
         args.push("--website");
+    }
+    if source.is_some() {
+        args.push("--source");
     }
     if let Some(assignment) = &assignment
         && !broker.matches_declaration(assignment.declared_model)
@@ -678,7 +841,10 @@ pub fn run(
             && state["State"]["OOMKilled"] == false
             && report.events.iter().any(|e| {
                 e["event"] == "result"
-                    && (website.is_some() || e["data"]["observed_fixture_regression"] == true)
+                    && (website.is_some()
+                        || source.is_some()
+                        || live.is_some()
+                        || e["data"]["observed_fixture_regression"] == true)
                     && e["data"]["completed"] == true
             });
         Ok((report, stopped, state["State"]["OOMKilled"].clone(), passed))
@@ -688,6 +854,16 @@ pub fn run(
         return Err("agent cleanup could not be confirmed; inspect containers labelled io.patchriot.agent-check=1".into());
     }
     let (report, stopped, oom, passed) = result?;
+    if let Some(broker) = live_broker {
+        let result = broker.result(&report, settings, passed, cleanup);
+        if !result.valid(&live.ok_or("missing live task")?.evidence.context.scope) {
+            return Err("live result exceeded limits".into());
+        }
+        return Ok(Check {
+            result: WorkResult::Pentest(result),
+            report: None,
+        });
+    }
     if let Some(task) = website {
         let result = website::evidence(
             &report,
@@ -702,6 +878,23 @@ pub fn run(
         }
         return Ok(Check {
             result: WorkResult::Website(result),
+            report: None,
+        });
+    }
+    if let Some(task) = source {
+        let result = source::evidence(
+            &report,
+            settings,
+            assignment.as_ref().map(|a| a.declared_model),
+            task,
+            passed,
+            cleanup,
+        );
+        if !result.valid() {
+            return Err("source evidence exceeded the report limits".into());
+        }
+        return Ok(Check {
+            result: WorkResult::Source(result),
             report: None,
         });
     }
@@ -807,6 +1000,7 @@ mod tests {
 
     pub(super) fn settings() -> Settings {
         Settings {
+            live_provider_key_file: None,
             docker_socket: "/var/run/docker.sock".into(),
             image: format!("sha256:{}", "b".repeat(64)),
             model_url: "http://127.0.0.1:11434".into(),
