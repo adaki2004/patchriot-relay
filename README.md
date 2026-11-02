@@ -241,6 +241,8 @@ The trusted relay needs DNS/HTTPS access to the fixed provider and approved publ
 
 Each role permits up to 500 HTTP observations, 48 provider calls and a $3 conservative inference allowance. Completed responses with token usage use the provider’s uncached rates; missing usage keeps the full reservation. The runner asks for a final report before exhausting its allowance or execution time and closes tools for that response. These are spending estimates, not provider invoices. The [published rates](https://docs.abliteration.ai/pricing) must be rechecked before deployment. Each response allows up to 8,192 output tokens; model reasoning and evidence can still be incomplete.
 
+Live activity is sent with signed lease renewals: current stage, recorded request count, model calls and finished tool runs. The private dashboard shows the last server receipt time; these counts do not measure security coverage. Deploy the updated dispatcher before this relay.
+
 Live roles run once. A private start marker prevents a relay restart from repeating paid inference for the same lease; saved result delivery may retry. Keep device state when upgrading. Cancellation or revoked permission stops the lease and container, but cannot undo requests already sent. Findings cite locally recorded HTTP IDs; the next role makes its own checks. Records are operator-reported, not independent attestation, and three identities on one machine are not three independent reviewers.
 
 ## Check the controls

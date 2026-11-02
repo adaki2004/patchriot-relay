@@ -9,6 +9,7 @@ pub const MODEL: &str = "abliterated-model-large-v2";
 const API: &str = "https://api.abliteration.ai/v1";
 pub const MAX_FRAME: usize = 512 * 1024;
 const MAX_SPEND: u64 = 3_000_000; // $3 reservation per role; never retried by this broker.
+pub type Progress = Mutex<LiveProgress>;
 const RECORDED_HEADERS: &[&str] = &[
     "content-type",
     "content-security-policy",
@@ -76,6 +77,28 @@ pub struct LiveBroker {
     counters: Mutex<Counters>,
 }
 impl LiveBroker {
+    pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
+        serde_json::from_value::<LiveToolRun>(data.clone()).is_ok_and(|run| {
+            self.counters
+                .lock()
+                .is_ok_and(|count| run.valid(&count.evidence))
+        })
+    }
+    pub(super) fn update_progress(
+        &self,
+        progress: &Progress,
+        phase: LivePhase,
+        completed_tools: u8,
+    ) {
+        if let (Ok(count), Ok(mut current)) = (self.counters.lock(), progress.lock()) {
+            *current = LiveProgress {
+                phase,
+                http_requests: count.evidence.len() as u16,
+                inference_calls: count.calls,
+                completed_tools,
+            };
+        }
+    }
     pub fn new(
         key_file: &Path,
         scope: LiveScope,
@@ -639,22 +662,30 @@ mod tests {
             .iter()
             .map(|e| format!("printf '%s\\n' '{e}'"))
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+            + "\nsleep 0.1";
         let mut command = std::process::Command::new("/bin/sh");
         command.env_clear().args(["-c", &script]);
         let broker = broker();
+        let progress = Progress::default();
         let report = supervise(
             command,
             Bridge::Live(broker.clone()),
             &|| false,
             Duration::from_secs(2),
             None,
+            Some(&progress),
         )
         .await
         .unwrap();
         assert_eq!(report.outcome, "completed");
         assert_eq!(tool_records(&report.events, &[]).0.len(), 1);
         assert_eq!(broker.counters.lock().unwrap().calls, 0);
+        let observed = progress.lock().unwrap();
+        assert_eq!(observed.phase, LivePhase::Finishing);
+        assert_eq!(observed.completed_tools, 1);
+        assert_eq!(observed.http_requests, 0);
+        assert_eq!(observed.inference_calls, 0);
     }
     #[tokio::test]
     async fn prohibited_targets_and_credentials_never_reach_network_or_provider() {
