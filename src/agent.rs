@@ -72,20 +72,20 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5"].contains(
+            || !["2", "3", "4", "5", "6"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5"].contains(
+                && !["3", "4", "5", "6"].contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–5; longer CPU budgets require adapter 3–5"
+                "website reviews require adapter 2–6; longer CPU budgets require adapter 3–6"
                     .into(),
             );
         }
@@ -95,10 +95,14 @@ impl Settings {
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         if self.live_provider_key_file.is_none()
             || image["Id"] != self.image
-            || image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "5"
+            || !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("5" | "6")
+            )
         {
             return Err(
-                "live tests require the inspected adapter 5 and a private provider key file".into(),
+                "live tests require the inspected adapter 5 or 6 and a private provider key file"
+                    .into(),
             );
         }
         Ok(())
@@ -108,7 +112,7 @@ impl Settings {
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5")
+                Some("4" | "5" | "6")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -463,7 +467,8 @@ async fn supervise(
                             task.0 = Some(tokio::spawn(async move { broker.respond(request, tx).await; }));
                         }
                         Ok(Wire::Event { event, data })
-                            if ["phase", "tool_start", "tool_complete", "result"].contains(&event.as_str()) && !final_seen => {
+                            if (["phase", "tool_start", "tool_complete", "result"].contains(&event.as_str())
+                                || matches!(&broker, Bridge::Live(_)) && event == "live_tool") && !final_seen => {
                             if event == "result" {
                                 final_seen = true;
                             }
@@ -629,13 +634,13 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3", "4", "5"].contains(
+        || !["1", "2", "3", "4", "5", "6"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5"].contains(
+            && !["2", "3", "4", "5", "6"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -643,10 +648,10 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5")
+                Some("4" | "5" | "6")
             )
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5"].contains(
+            && !["3", "4", "5", "6"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),

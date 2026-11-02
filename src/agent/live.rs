@@ -478,6 +478,8 @@ impl LiveBroker {
             .trim();
         let assessment = parse_assessment(cleaned);
         let count = self.counters.lock().expect("live counters poisoned");
+        let (tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
+        let passed = passed && tools_valid;
         let mut result = PentestResult {
             kind: PentestResultKind::PentestAgentV1,
             scope_sha256: self.scope.hash().unwrap_or_default(),
@@ -495,7 +497,9 @@ impl LiveBroker {
                 http_requests: count.evidence.len() as u16,
                 cost_upper_microusd: count.reserved,
                 cleanup_confirmed: cleanup,
-                failure_reason: if passed {
+                failure_reason: if !tools_valid {
+                    Some("invalid_tool_records".into())
+                } else if passed {
                     None
                 } else {
                     Some(report.failure_reason.unwrap_or(report.outcome).to_owned())
@@ -503,6 +507,7 @@ impl LiveBroker {
             },
             assessment,
             evidence: count.evidence.clone(),
+            tool_runs,
             raw_summary: {
                 let mut end = raw.len().min(24000);
                 while !raw.is_char_boundary(end) {
@@ -517,6 +522,31 @@ impl LiveBroker {
         }
         result
     }
+}
+
+/// Only the fixed startup phase may attach tool transcripts. A later terminal
+/// print from the model cannot masquerade as that phase. HTTP evidence is still
+/// recorded separately by the Rust broker; neither source attests operator honesty.
+fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun>, bool) {
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    let mut valid = true;
+    for event in events
+        .iter()
+        .take_while(|e| !(e["event"] == "phase" && e["data"]["name"] == "agent_ready"))
+        .filter(|e| e["event"] == "live_tool")
+    {
+        let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
+        if let Ok(run) = parsed {
+            bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
+            if records.len() < 12 && bytes <= 192 * 1024 && run.valid(evidence) {
+                records.push(run);
+                continue;
+            }
+        }
+        valid = false;
+    }
+    (records, valid)
 }
 
 /// Provider usage is a billing observation, not proof of an invoice. Charge
@@ -546,6 +576,25 @@ fn reported_cost(bytes: &[u8], stream: bool) -> Option<u64> {
 mod tests {
     use super::*;
     #[test]
+    fn tool_records_only_come_from_startup_and_must_reference_real_requests() {
+        let run = json!({"tool":"nuclei","version":"3.11.1","arguments":[],
+            "started_at":1,"duration_ms":1,"exit_code":0,"failure":null,"evidence_ids":[],
+            "output_sha256":format!("{:x}", Sha256::digest(b"")),
+            "output_excerpt":"","output_truncated":false});
+        let mut events = vec![
+            json!({"event":"live_tool","data":{"run":run}}),
+            json!({"event":"phase","data":{"name":"agent_ready"}}),
+            json!({"event":"live_tool","data":{"run":{"tool":"invented"}}}),
+        ];
+        let (saved, valid) = tool_records(&events, &[]);
+        assert!(valid);
+        assert_eq!(saved.len(), 1);
+        events[0]["data"]["run"]["evidence_ids"] = json!([1]);
+        let (saved, valid) = tool_records(&events, &[]);
+        assert!(!valid);
+        assert!(saved.is_empty());
+    }
+    #[test]
     fn literal_line_breaks_are_preserved_but_malformed_claims_are_not_guessed() {
         let report = "{\"summary\":\"Line one\nLine two\",\"findings\":[],\"limitations\":[\"Owned test only\"]}";
         assert_eq!(
@@ -573,6 +622,39 @@ mod tests {
             Instant::now() + Duration::from_secs(600),
         )
         .unwrap()
+    }
+    #[tokio::test]
+    async fn live_tool_events_survive_the_supervised_pipe_without_provider_calls() {
+        let events = [
+            json!({"type":"event","event":"phase","data":{"name":"scoped_tools"}}),
+            json!({"type":"event","event":"live_tool","data":{"run":{
+                "tool":"nuclei","version":"3.11.1","arguments":[],"started_at":1,
+                "duration_ms":1,"exit_code":0,"failure":null,"evidence_ids":[],
+                "output_sha256":format!("{:x}", Sha256::digest(b"")),"output_excerpt":"","output_truncated":false}}}),
+            json!({"type":"event","event":"phase","data":{"name":"agent_ready"}}),
+            json!({"type":"event","event":"result","data":{"completed":true}}),
+        ];
+        // All values above are fixed test literals, not target/model strings.
+        let script = events
+            .iter()
+            .map(|e| format!("printf '%s\\n' '{e}'"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.env_clear().args(["-c", &script]);
+        let broker = broker();
+        let report = supervise(
+            command,
+            Bridge::Live(broker.clone()),
+            &|| false,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "completed");
+        assert_eq!(tool_records(&report.events, &[]).0.len(), 1);
+        assert_eq!(broker.counters.lock().unwrap().calls, 0);
     }
     #[tokio::test]
     async fn prohibited_targets_and_credentials_never_reach_network_or_provider() {
