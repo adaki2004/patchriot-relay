@@ -3,7 +3,35 @@
 use futures_util::StreamExt;
 use nearai_inference_sdk::*;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{future::Future, time::Duration};
+
+// Only evidence retrieval belongs here. Never pass a completion/send operation:
+// a network error after submission does not prove the provider did no paid work.
+async fn retry_preflight<T, F, R>(mut verify: F) -> Result<T, &'static str>
+where
+    F: FnMut() -> R,
+    R: Future<Output = Result<T, InferenceError>>,
+{
+    for attempt in 0..3 {
+        match verify().await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                // Stable codes only: never log provider bodies or private input.
+                eprintln!(
+                    "NEAR preflight: code={} retryable={} attempt={}",
+                    error.code(),
+                    error.retryable(),
+                    attempt + 1
+                );
+                if !error.retryable() || attempt == 2 {
+                    return Err("near_attestation_unavailable");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err("near_attestation_unavailable")
+}
 
 pub(super) fn client(key: &str) -> Result<InferenceClient, &'static str> {
     InferenceClient::with_options(InferenceClientOptions {
@@ -41,10 +69,7 @@ pub(super) async fn complete(
         .remove("stream_options");
     let model = body["model"].as_str().ok_or("wrong_model")?.to_string();
     let operation = async {
-        let preflight = client
-            .verify(&model)
-            .await
-            .map_err(|_| "near_attestation_unavailable")?;
+        let preflight = retry_preflight(|| client.verify(&model)).await?;
         if preflight.models.is_empty() {
             return Err("near_model_attestation_required");
         }
@@ -122,6 +147,55 @@ pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn preflight_retries_transient_evidence_reads_and_stops_at_three() {
+        let mut calls = 0;
+        let recovered = retry_preflight(|| {
+            calls += 1;
+            std::future::ready(if calls < 3 {
+                Err(ApiError::HttpStatus {
+                    resource: ApiResource::ModelAttestation,
+                    status: 503,
+                }
+                .into())
+            } else {
+                Ok("verified fixture")
+            })
+        })
+        .await;
+        assert_eq!(recovered, Ok("verified fixture"));
+        assert_eq!(calls, 3);
+        calls = 0;
+        let unavailable: Result<(), _> = retry_preflight(|| {
+            calls += 1;
+            std::future::ready(Err(VerificationError::QuoteCollateralUnavailable.into()))
+        })
+        .await;
+        assert_eq!(unavailable, Err("near_attestation_unavailable"));
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn preflight_never_retries_invalid_evidence_or_policy_failures() {
+        for error in [
+            InferenceError::from(ApiError::NonceMismatch {
+                resource: ApiResource::ModelAttestation,
+            }),
+            InferenceError::from(VerificationError::DebugEnabled),
+            InferenceError::from(VerificationError::SignatureInvalid {
+                signing_algo: SigningAlgo::Ed25519,
+            }),
+        ] {
+            let mut calls = 0;
+            let result: Result<(), _> = retry_preflight(|| {
+                calls += 1;
+                std::future::ready(Err(error.clone()))
+            })
+            .await;
+            assert_eq!(result, Err("near_attestation_unavailable"));
+            assert_eq!(calls, 1);
+        }
+    }
     #[tokio::test]
     #[ignore = "one bounded paid call; requires a private key and a new attempt file"]
     async fn private_model_tool_reply_has_verified_signature() {
