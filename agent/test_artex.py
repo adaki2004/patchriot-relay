@@ -8,6 +8,8 @@ import tempfile
 import threading
 import time
 import unittest
+import subprocess
+import urllib.error
 from unittest.mock import patch
 
 import artex
@@ -123,6 +125,32 @@ class ImageSmoke(unittest.TestCase):
             with ScopeMirror(SCOPE['origins'][0], deadline, fixture) as mirror:
                 with artex.Engine(Path('/work/artex-state'), f'http://127.0.0.1:{server.server_port}', deadline) as engine:
                     outcome = engine.assess(SCOPE, [mirror.url], 'investigator')
+                    # Exercise shipped auth handlers without a connection flood,
+                    # shell payload or an external target.
+                    public = artex.Client()
+                    self.assertTrue(public.call('/api/auth/status')['initialized'])
+                    with self.assertRaises(urllib.error.HTTPError) as denied:
+                        public.call('/api/auth/init', {'password': 'fixture-cannot-replace-admin'})
+                    self.assertEqual(denied.exception.code, 403)
+                    sql = [artex.POSTGRES + 'psql', '-h', '127.0.0.1', '-p', '15432',
+                           '-U', 'patchriot', '-d', 'patchriot', '-v', 'ON_ERROR_STOP=1', '-c']
+                    subprocess.run(sql + ['ALTER TABLE settings RENAME TO unavailable_settings'],
+                                   check=True, capture_output=True, timeout=5)
+                    try:
+                        for path, body in [('/api/auth/status', None),
+                                           ('/api/auth/init', {'password': 'fixture-cannot-replace-admin'}),
+                                           ('/api/auth/login', {'username': 'ARTEX', 'password': 'fixture-invalid-login'})]:
+                            with self.subTest(database_unavailable=path):
+                                with self.assertRaises(urllib.error.HTTPError) as unavailable:
+                                    public.call(path, body)
+                                self.assertEqual(unavailable.exception.code, 503)
+                    finally:
+                        subprocess.run(sql + ['ALTER TABLE unavailable_settings RENAME TO settings'],
+                                       check=True, capture_output=True, timeout=5)
+                    self.assertTrue(public.call('/api/auth/status')['initialized'])
+                    with self.assertRaises(urllib.error.HTTPError) as still_denied:
+                        public.call('/api/auth/init', {'password': 'fixture-cannot-replace-admin'})
+                    self.assertEqual(still_denied.exception.code, 403)
                 self.assertIsNotNone(engine.process.poll(), 'engine process must be stopped')
                 self.assertIsNotNone(engine.pg.poll(), 'database process must be stopped')
             self.assertIn(('GET', 'https://owned.example/'), requested)
