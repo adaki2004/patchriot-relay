@@ -110,6 +110,8 @@ For slow or incomplete runs, the relay logs the model's declared finish reason (
 
 ## What the safety limits mean
 
+The hosted service deletes private report content twelve hours after the requester first exports a finished report. The relay clears its pending result after accepted delivery; a repeated acknowledgement cannot restore a deleted server report. This cannot erase copies an operator saved outside the relay or data already sent to a model provider. Keep assigned material out of host logs, shared folders and backups; cleanup and operator conduct remain separate responsibilities.
+
 Live website reports permit up to 4 MiB of compact JSON per role, including recorded HTTP evidence and tool excerpts. The private delivery outbox and follow-up input support that size. Before its evidence allowance fills, the relay refuses new probes instead of removing records already cited in findings. Response capture and excerpt limits remain separate; truncated excerpts are marked. Update core and dispatcher/gateway first, then rebuild the adapter image and relay together. The offline example's 1 MiB printed-output limit is unchanged.
 
 The example runner and agent modes have separate limits:
