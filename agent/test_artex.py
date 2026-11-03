@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 from unittest.mock import patch
 
@@ -151,6 +152,31 @@ class ImageSmoke(unittest.TestCase):
                     with self.assertRaises(urllib.error.HTTPError) as still_denied:
                         public.call('/api/auth/init', {'password': 'fixture-cannot-replace-admin'})
                     self.assertEqual(still_denied.exception.code, 403)
+                    # Only this disposable fixture database: two initializers
+                    # must not both obtain admin access or replace the winner.
+                    subprocess.run(sql + ["DELETE FROM settings WHERE key='auth.password_hash'"],
+                                   check=True, capture_output=True, timeout=5)
+                    self.assertFalse(public.call('/api/auth/status')['initialized'])
+                    barrier = threading.Barrier(2)
+                    def initialize(number):
+                        barrier.wait(timeout=5)
+                        try:
+                            public.call('/api/auth/init', {'password': 'fixture-race-password-' + str(number)})
+                            return number, 200
+                        except urllib.error.HTTPError as error:
+                            return number, error.code
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        attempts = list(pool.map(initialize, (1, 2)))
+                    self.assertEqual(sum(status == 200 for _, status in attempts), 1)
+                    self.assertTrue(all(status in (200, 403, 409) for _, status in attempts))
+                    for number, status in attempts:
+                        login = {'username': 'ARTEX', 'password': 'fixture-race-password-' + str(number)}
+                        if status == 200:
+                            self.assertTrue(public.call('/api/auth/login', login)['token'])
+                        else:
+                            with self.assertRaises(urllib.error.HTTPError) as loser:
+                                public.call('/api/auth/login', login)
+                            self.assertEqual(loser.exception.code, 401)
                 self.assertIsNotNone(engine.process.poll(), 'engine process must be stopped')
                 self.assertIsNotNone(engine.pg.poll(), 'database process must be stopped')
             self.assertIn(('GET', 'https://owned.example/'), requested)
