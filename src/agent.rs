@@ -49,6 +49,16 @@ const TMPFS: [(&str, &str); 3] = [
     ),
 ];
 
+fn temporary_storage(engine: bool) -> [(&'static str, &'static str); 3] {
+    let mut mounts = TMPFS;
+    if engine {
+        // The selected engine needs a disposable PostgreSQL data directory.
+        // Still memory-backed, non-executable, and inside the same 2 GiB cap.
+        mounts[2].1 = "rw,nosuid,nodev,noexec,size=536870912,uid=65534,gid=65534";
+    }
+    mounts
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -72,20 +82,20 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5", "6"].contains(
+            || !["2", "3", "4", "5", "6", "7", "8"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5", "6"].contains(
+                && !["3", "4", "5", "6", "7", "8"].contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–6; longer CPU budgets require adapter 3–6"
+                "website reviews require adapter 2–8; longer CPU budgets require adapter 3–8"
                     .into(),
             );
         }
@@ -97,22 +107,42 @@ impl Settings {
             || image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("5" | "6")
+                Some("5" | "6" | "7" | "8")
             )
         {
             return Err(
-                "live tests require the inspected adapter 5 or 6 and a private provider key file"
+                "live tests require the inspected adapter 5–8 and a private provider key file"
                     .into(),
             );
         }
         Ok(())
+    }
+    pub fn live_tools(
+        &self,
+    ) -> Result<Vec<patchriot_protocol::pentests::LiveToolProfile>, Box<dyn std::error::Error>>
+    {
+        self.require_live_adapter()?;
+        let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
+        Ok(
+            if image["Config"]["Labels"]["io.patchriot.agent-adapter"] == "8" {
+                vec![
+                    patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1,
+                    patchriot_protocol::pentests::LiveToolProfile::ActiveWebV1,
+                    patchriot_protocol::pentests::LiveToolProfile::AuthenticatedHttpV1,
+                ]
+            } else if image["Config"]["Labels"]["io.patchriot.agent-adapter"] == "7" {
+                vec![patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1]
+            } else {
+                vec![]
+            },
+        )
     }
     pub fn require_source_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6")
+                Some("4" | "5" | "6" | "7" | "8")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -135,7 +165,7 @@ impl Settings {
         if !(DEFAULT_AGENT_ATTEMPT_SECONDS..=MAX_AGENT_ATTEMPT_SECONDS)
             .contains(&settings.max_attempt_seconds)
         {
-            return Err("max_attempt_seconds must be 600..1800".into());
+            return Err("max_attempt_seconds must be 600..3600".into());
         }
         if settings.live_provider_key_file.is_some() {
             if settings.model != live::MODEL
@@ -239,13 +269,23 @@ impl Bridge {
     fn max_requests(&self) -> usize {
         match self {
             Self::Local(_) => 32,
-            Self::Live(_) => 600,
+            // Leave room for all allowed target/model calls and rejected local
+            // retries, so transport does not silently shorten either allowance.
+            Self::Live(_) => {
+                patchriot_protocol::pentests::MAX_HTTP_REQUESTS
+                    + usize::from(patchriot_protocol::pentests::MAX_LIVE_INFERENCE_CALLS)
+                    + 100
+            }
         }
     }
-    fn max_calls(&self) -> usize {
+    fn model_attempt_limit(&self) -> Option<usize> {
         match self {
-            Self::Local(_) => 4,
-            Self::Live(_) => 48,
+            Self::Local(_) => Some(4),
+            // The live broker caps actual provider calls and spend. ARTEX may
+            // retry its locally rejected requests while shutting down; charging
+            // those attempts to the provider-call allowance killed the final report.
+            // Transport still has its own bounded allowance and execution deadline.
+            Self::Live(_) => None,
         }
     }
     fn max_tokens(&self) -> u64 {
@@ -446,8 +486,8 @@ async fn supervise(
                             }
                             last_id = request.id;
                             active = Some(request.id);
-                            if request.path == "/v1/chat/completions" {
-                                if report.inference_calls >= broker.max_calls() {
+                            if live::is_chat_path(&request.path) {
+                                if broker.model_attempt_limit().is_some_and(|limit| report.inference_calls >= limit) {
                                     report.outcome = "inference_limit";
                                     break 'running;
                                 }
@@ -464,7 +504,7 @@ async fn supervise(
                                     eprintln!("runtime output request capped at {} tokens", broker.max_tokens());
                                 }
                                 report.inference_calls += 1;
-                                eprintln!("agent requested model call {}", report.inference_calls);
+                                eprintln!("agent requested model attempt {}", report.inference_calls);
                             }
                             if let Some(previous) = task.0.take() {
                                 previous.abort();
@@ -488,7 +528,7 @@ async fn supervise(
                             }
                             if event == "live_tool" && report.inference_calls == 0
                                 && matches!(&broker, Bridge::Live(b) if b.valid_tool_record(&data["run"])) {
-                                completed_tools = completed_tools.saturating_add(1).min(12);
+                                completed_tools = completed_tools.saturating_add(1).min(16);
                             }
                             if event == "tool_start" {
                                 eprintln!("agent started a tool");
@@ -551,13 +591,13 @@ async fn supervise(
     }
     report.duration_ms = started.elapsed().as_millis();
     eprintln!(
-        "agent stopped: outcome={} exit_code={:?} inference_calls={} final_event={} duration_ms={}",
+        "agent stopped: outcome={} exit_code={:?} inference_attempts={} final_event={} duration_ms={}",
         report.outcome, report.exit_code, report.inference_calls, final_seen, report.duration_ms,
     );
     Ok(report)
 }
 
-fn policy(container: &Value, image: &str, args: &[&str], seconds: u64) -> bool {
+fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: bool) -> bool {
     let h = &container["HostConfig"];
     let c = &container["Config"];
     container["Image"] == image
@@ -582,7 +622,7 @@ fn policy(container: &Value, image: &str, args: &[&str], seconds: u64) -> bool {
         && h["RestartPolicy"]["Name"] == "no"
         && h["Tmpfs"]
             == json!(
-                TMPFS
+                temporary_storage(engine)
                     .into_iter()
                     .collect::<std::collections::BTreeMap<_, _>>()
             )
@@ -652,13 +692,13 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3", "4", "5", "6"].contains(
+        || !["1", "2", "3", "4", "5", "6", "7", "8"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5", "6"].contains(
+            && !["2", "3", "4", "5", "6", "7", "8"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -666,10 +706,25 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6")
+                Some("4" | "5" | "6" | "7" | "8")
             )
+        || live
+            .as_ref()
+            .is_some_and(|task| !task.evidence.context.scope.tools.is_empty())
+            && !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("7" | "8")
+            )
+        || live.as_ref().is_some_and(|task| {
+            task.evidence
+                .context
+                .scope
+                .tools
+                .iter()
+                .any(|tool| *tool != patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
+        }) && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "8"
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5", "6"].contains(
+            && !["3", "4", "5", "6", "7", "8"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -684,7 +739,7 @@ pub fn run(
         .build()?;
     let live_broker = live
         .map(|task| {
-            live::LiveBroker::new(
+            live::LiveBroker::new_with_credentials(
                 settings
                     .live_provider_key_file
                     .as_deref()
@@ -697,6 +752,7 @@ pub fn run(
                         Instant::now() + Duration::from_secs(settings.max_attempt_seconds)
                     })
                     .min(Instant::now() + Duration::from_secs(settings.max_attempt_seconds)),
+                task.evidence.credentials.as_ref(),
             )
         })
         .transpose()?;
@@ -812,7 +868,14 @@ pub fn run(
         ]
         .map(str::to_owned),
     );
-    for (path, options) in TMPFS {
+    let engine = live.is_some_and(|task| {
+        task.evidence
+            .context
+            .scope
+            .tools
+            .contains(&patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
+    });
+    for (path, options) in temporary_storage(engine) {
         command.extend(["--tmpfs".into(), format!("{path}:{options}")]);
     }
     command.push(settings.image.clone());
@@ -830,6 +893,7 @@ pub fn run(
             &settings.image,
             &args,
             settings.max_attempt_seconds,
+            engine,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -1218,7 +1282,40 @@ mod tests {
     }
     #[test]
     fn docker_configuration_must_preserve_the_execution_boundary() {
-        assert!(policy(&container(), "owned-image", &["owned-model"], 600));
+        assert!(policy(
+            &container(),
+            "owned-image",
+            &["owned-model"],
+            600,
+            false
+        ));
+        let mut expanded = container();
+        expanded["HostConfig"]["Tmpfs"] = json!(
+            temporary_storage(true)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        assert!(!policy(
+            &expanded,
+            "owned-image",
+            &["owned-model"],
+            600,
+            false
+        ));
+        assert!(policy(
+            &expanded,
+            "owned-image",
+            &["owned-model"],
+            600,
+            true
+        ));
+        assert!(!policy(
+            &container(),
+            "owned-image",
+            &["owned-model"],
+            600,
+            true
+        ));
         for (pointer, value) in [
             ("/HostConfig/NetworkMode", json!("host")),
             ("/HostConfig/ReadonlyRootfs", json!(false)),
@@ -1235,7 +1332,13 @@ mod tests {
             let mut value_container = container();
             *value_container.pointer_mut(pointer).unwrap() = value;
             assert!(
-                !policy(&value_container, "owned-image", &["owned-model"], 600),
+                !policy(
+                    &value_container,
+                    "owned-image",
+                    &["owned-model"],
+                    600,
+                    false
+                ),
                 "{pointer}"
             );
         }
@@ -1243,7 +1346,7 @@ mod tests {
             let mut value = container();
             value["HostConfig"][key] = json!(["unexpected"]);
             assert!(
-                !policy(&value, "owned-image", &["owned-model"], 600),
+                !policy(&value, "owned-image", &["owned-model"], 600, false),
                 "{key}"
             );
         }
@@ -1258,16 +1361,16 @@ mod tests {
             Settings::load(file.path()).unwrap().max_attempt_seconds(),
             600
         );
-        input["max_attempt_seconds"] = json!(1800);
+        input["max_attempt_seconds"] = json!(3600);
         std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
         assert_eq!(
             Settings::load(file.path()).unwrap().max_attempt_seconds(),
-            1800
+            3600
         );
         for value in [
             json!(599),
-            json!(1801),
-            json!("1800"),
+            json!(3601),
+            json!("3600"),
             json!(-1),
             json!(null),
         ] {

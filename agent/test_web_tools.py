@@ -70,6 +70,23 @@ class WebToolsTests(unittest.TestCase):
             self.assertEqual(len(self.requests), 1)
             self.assertEqual(mirror.refs, [1])
 
+    def test_active_mirror_forwards_only_bounded_approved_bodies_and_same_origin_redirects(self):
+        requests = []
+        def fixture(method, url, headers=None, **kwargs):
+            requests.append((method, url, kwargs))
+            return {"body": "fixture", "evidence": {"id": 1, "status": 302, "headers": {"location": "https://owned.example/next"}}}
+        with tools.ScopeMirror('https://owned.example', time.monotonic()+5, fixture, methods=['GET','POST']) as mirror:
+            def post(body, content='application/json'):
+                client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+                client.request('POST', '/test', body, {'Content-Type': content})
+                reply = client.getresponse(); result = reply.status, reply.getheader('Location')
+                reply.read(); client.close(); return result
+            self.assertEqual(post('{"fixture":true}'), (302, '/next'))
+            self.assertEqual(requests[0], ('POST', 'https://owned.example/test', {'data':'{"fixture":true}'}))
+            self.assertEqual(post('x' * 16385)[0], 400)
+            self.assertEqual(post('file upload', 'multipart/form-data')[0], 415)
+            self.assertEqual(len(requests), 1)
+
     def test_broker_failure_does_not_look_like_a_success_to_scanner(self):
         with tools.ScopeMirror('https://owned.example', time.monotonic() + 5,
                                lambda *_: {'error':'scope_denied'}) as mirror:

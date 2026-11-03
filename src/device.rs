@@ -19,8 +19,64 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 type Error = Box<dyn std::error::Error>;
-// Includes one pending structured result. Never store the website snapshot here.
-const MAX_STATE: u64 = 128 * 1024;
+// One protocol-sized result plus the device identity and assignment. Keeping
+// this below the accepted result size loses completed work before delivery.
+// Compact JSON makes this bound independent of pretty-print indentation.
+const MAX_STATE: u64 = patchriot_protocol::pentests::MAX_RESULT_BYTES as u64 + 128 * 1024;
+
+// Read data rather than sourcing this file as a shell script. Only OS name and
+// version leave the machine; hostname, kernel details and IDs are not collected.
+fn os_release(text: &str) -> Option<(String, Option<String>)> {
+    if text.len() > 16 * 1024 {
+        return None;
+    }
+    let field = |key: &str| {
+        text.lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(name, value)| {
+                if name != key {
+                    return None;
+                }
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                    .unwrap_or(value);
+                (!value.trim().is_empty()
+                    && value.len() <= 80
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || " ._-/()+".contains(c)))
+                .then(|| value.to_owned())
+            })
+    };
+    Some((field("NAME")?, field("VERSION_ID")))
+}
+
+fn reported_system() -> AgentSystem {
+    let release = if cfg!(target_os = "linux") {
+        ["/etc/os-release", "/usr/lib/os-release"]
+            .into_iter()
+            .find_map(|path| {
+                let mut text = String::new();
+                File::open(path)
+                    .ok()?
+                    .take(16 * 1024 + 1)
+                    .read_to_string(&mut text)
+                    .ok()?;
+                os_release(&text)
+            })
+    } else {
+        None
+    };
+    let (os_name, os_version) = release.unwrap_or_else(|| (std::env::consts::OS.into(), None));
+    AgentSystem {
+        os_name,
+        os_version,
+        architecture: std::env::consts::ARCH.into(),
+        relay_version: env!("CARGO_PKG_VERSION").into(),
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -89,7 +145,12 @@ fn read_config(directory: &Path) -> Result<Config, Error> {
     if file.metadata()?.len() > MAX_STATE {
         return Err("state file too large".into());
     }
-    let config: Config = serde_json::from_reader(file)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE {
+        return Err("state file too large".into());
+    }
+    let config: Config = serde_json::from_slice(&bytes)?;
     if config.schema_version != 1 {
         return Err("unsupported state version".into());
     }
@@ -99,7 +160,7 @@ fn read_config(directory: &Path) -> Result<Config, Error> {
 }
 
 fn write_config(directory: &Path, config: &Config) -> Result<(), Error> {
-    let bytes = serde_json::to_vec_pretty(config)?;
+    let bytes = serde_json::to_vec(config)?;
     if bytes.len() as u64 + 1 > MAX_STATE {
         return Err("state file too large".into());
     }
@@ -409,6 +470,7 @@ fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<S
         &key,
         &format!("/v1/devices/{id}/heartbeat"),
         Heartbeat {
+            system: Some(reported_system()),
             sequence: config.sequence,
             paused: config.paused,
             running: u16::from(config.active_assignment.as_ref().is_some_and(|a| {
@@ -510,6 +572,13 @@ fn work_tick(
             website_reviews,
             source_reviews,
             live_tests,
+            live_tools: if live_tests {
+                agent
+                    .ok_or("live tools require agent settings")?
+                    .live_tools()?
+            } else {
+                vec![]
+            },
         },
     )?;
     let Some(assignment) = reply.assignment else {
@@ -886,11 +955,6 @@ fn agent_work(
                 live.as_ref(),
                 &|| stop.load(Ordering::Relaxed) || window.stopped_at(Instant::now()),
             )?;
-            // Keep one bounded private trace for operator diagnosis. It is never
-            // printed or sent to the website; only typed observations are sent.
-            if let Some(report) = &check.report {
-                write_agent_report(directory, report)?;
-            }
             if stop.load(Ordering::Relaxed)
                 || window.stopped_at(Instant::now())
                 || !locally_ready(directory, assignment.lease_id)
@@ -907,6 +971,15 @@ fn agent_work(
                     result: check.result,
                 });
                 write_config(directory, &latest)?;
+            }
+            // The result outbox is durable before optional diagnostic output.
+            // A trace failure must not lose evidence or trigger new inference.
+            if let Some(report) = &check.report
+                && write_agent_report(directory, report).is_err()
+            {
+                eprintln!(
+                    "diagnostic trace could not be saved; result remains queued for delivery"
+                );
             }
             send_result(directory, client)
         })();
@@ -1120,6 +1193,30 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reports_os_release_without_sourcing_commands_or_machine_details() {
+        assert_eq!(
+            super::os_release(
+                "NAME=\"Kali GNU/Linux\"\nVERSION_ID=\"2026.3\"\nHOSTNAME=private-host\n"
+            ),
+            Some(("Kali GNU/Linux".into(), Some("2026.3".into())))
+        );
+        assert_eq!(
+            super::os_release("NAME='Debian GNU/Linux'\n"),
+            Some(("Debian GNU/Linux".into(), None))
+        );
+        assert_eq!(super::os_release("NAME=$(id)\n"), None);
+        assert_eq!(
+            super::os_release("NAME=\"Linux\"\nVERSION_ID=\"$(id)\"\n"),
+            Some(("Linux".into(), None))
+        );
+        assert_eq!(
+            super::os_release(&format!("NAME=Linux\n{}", "x".repeat(16 * 1024))),
+            None
+        );
+        assert_eq!(super::os_release("NAME=\"broken\n"), None);
+        super::reported_system().validate().unwrap();
+    }
     use super::*;
 
     #[test]
@@ -1184,6 +1281,7 @@ mod tests {
                     website_reviews: false,
                     source_reviews: false,
                     live_tests: false,
+                    live_tools: vec![],
                 },
             )
             .unwrap_err();
@@ -1224,6 +1322,138 @@ mod tests {
         config.introduction.label = "x".repeat(MAX_STATE as usize);
         assert!(write_config(directory.path(), &config).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn live_outbox_survives_restart_and_delivery_retries_at_the_protocol_limit() {
+        use patchriot_protocol::pentests::{LiveScope, MAX_RESULT_BYTES, PentestResult};
+        use std::net::TcpListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("relay");
+        initialize(
+            &state,
+            &HashMap::from([
+                ("--dispatcher", "http://127.0.0.1:1"),
+                ("--audience", "test"),
+                ("--label", "Owned fixture"),
+                ("--compute-group", "owned"),
+            ]),
+        )
+        .unwrap();
+        let scope: LiveScope = serde_json::from_value(serde_json::json!({
+            "origins":["https://example.com"], "methods":["GET", "HEAD", "OPTIONS"],
+            "profile":"web_baseline_v1"
+        }))
+        .unwrap();
+        let scope = scope.normalized().unwrap();
+        let mut result: PentestResult = serde_json::from_value(serde_json::json!({
+            "kind":"pentest_agent_v1", "scope_sha256":scope.hash().unwrap(),
+            "execution":{"state":"completed", "provider":"abliteration.ai",
+                "model":"abliterated-model-large-v2", "image_digest":"owned-fixture",
+                "duration_ms":100, "inference_calls":1, "http_requests":120,
+                "cost_upper_microusd":1, "cleanup_confirmed":true},
+            "assessment":null, "evidence":[], "raw_summary":""
+        }))
+        .unwrap();
+        // Escaped characters and many records are realistic HTML/tool output.
+        // Fill to the wire limit, not an arbitrary 'large enough' test size.
+        for id in 1..=120 {
+            result.evidence.push(
+                serde_json::from_value(serde_json::json!({
+                    "id":id,"method":"GET","url":format!("https://example.com/{id}"),
+                    "request_headers":{},"status":200,"headers":{},
+                    "body_excerpt":"\"\\".repeat(2100),"truncated":true,"error":null,"observed_at":1
+                }))
+                .unwrap(),
+            );
+        }
+        let size = serde_json::to_vec(&result).unwrap().len();
+        assert!(size < MAX_RESULT_BYTES && MAX_RESULT_BYTES - size < 24_000);
+        result.raw_summary = "x".repeat(MAX_RESULT_BYTES - size);
+        assert!(result.valid(&scope));
+        assert_eq!(serde_json::to_vec(&result).unwrap().len(), MAX_RESULT_BYTES);
+        let lease_id = Uuid::new_v4();
+        let expected = CompleteWork {
+            lease_id,
+            result: WorkResult::Pentest(result),
+        };
+        let mut config = read_config(&state).unwrap();
+        config.device_id = Some(Uuid::new_v4());
+        config.pending_result = Some(expected.clone());
+        write_config(&state, &config).unwrap();
+        let before = fs::read(state.join("relay.json")).unwrap();
+        assert!(before.len() > 128 * 1024);
+        assert_eq!(
+            serde_json::to_value(read_config(&state).unwrap().pending_result).unwrap(),
+            serde_json::to_value(Some(&expected)).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(state.join("relay.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        // Refuse an oversized replacement without corrupting the saved result.
+        config.introduction.label = "x".repeat(MAX_STATE as usize);
+        assert!(write_config(&state, &config).is_err());
+        assert_eq!(fs::read(state.join("relay.json")).unwrap(), before);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = read_config(&state).unwrap();
+        config.dispatcher = format!("http://{}/", listener.local_addr().unwrap());
+        write_config(&state, &config).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for status in [503, 200] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let (end, length) = loop {
+                    let mut buffer = [0; 8192];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0 && bytes.len() < MAX_RESULT_BYTES + 8192);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break (end + 4, length);
+                        }
+                    }
+                };
+                let signed: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                requests.push(signed["payload"].clone());
+                let body = if status == 503 {
+                    "{}"
+                } else {
+                    "{\"accepted\":true,\"fixture_matches\":false,\"evidence_complete\":false,\"replayed\":true}"
+                };
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let client = client().unwrap();
+        assert!(retryable_dispatcher_error(
+            &send_result(&state, &client).unwrap_err()
+        ));
+        assert!(read_config(&state).unwrap().pending_result.is_some());
+        send_result(&state, &client).unwrap();
+        assert!(read_config(&state).unwrap().pending_result.is_none());
+        let requests = server.join().unwrap();
+        assert_eq!(requests, vec![serde_json::to_value(&expected).unwrap(); 2]);
     }
 
     #[test]
@@ -1320,12 +1550,17 @@ mod tests {
             agent_execution_deadline(start, &renewal, 1800).unwrap(),
             start + Duration::from_secs(1739)
         );
+        renewal.deadline_at = 4600;
+        assert_eq!(
+            agent_execution_deadline(start, &renewal, 3600).unwrap(),
+            start + Duration::from_secs(3539)
+        );
         renewal.deadline_at = 1600;
         assert_eq!(
-            agent_execution_deadline(start, &renewal, 1800).unwrap(),
+            agent_execution_deadline(start, &renewal, 3600).unwrap(),
             start + Duration::from_secs(539)
         );
-        for invalid in [0, 599, 1801, u64::MAX] {
+        for invalid in [0, 599, 3601, u64::MAX] {
             assert!(agent_execution_deadline(start, &renewal, invalid).is_err());
         }
     }

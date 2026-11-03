@@ -112,8 +112,8 @@ def event(kind, **data):
 
 def execution_budget(value):
     """Operator-selected limit; website text and models cannot change it."""
-    if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 1800:
-        raise ValueError("agent time limit must be 600..1800 seconds")
+    if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 3600:
+        raise ValueError("agent time limit must be 600..3600 seconds")
     return int(value)
 
 
@@ -202,9 +202,19 @@ def main():
     if live:
         import web_tools
         event("phase", name="scoped_tools")
-        web_tools.run(json.loads(Path("/work/scope.json").read_text())["scope"],
-                      json.loads(Path("/work/previous.json").read_text()),
-                      emit=lambda result: event("live_tool", run=result))
+        scope = json.loads(Path("/work/scope.json").read_text())["scope"]
+        tools = web_tools.run(scope, json.loads(Path("/work/previous.json").read_text()),
+                              emit=lambda result: event("live_tool", run=result))
+        if "artex_engine_v1" in scope.get("tools", []):
+            import artex
+            # Keep at least four minutes for the review and final report. ARTEX
+            # also shares the relay's total model and target-request allowances.
+            event("phase", name="artex_engine")
+            engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
+            result = artex.run(scope, role, engine_deadline)
+            tools["tool_runs"].append(result)
+            (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
+            event("live_tool", run=result)
     from run_agent import AIAgent
     observed = []
 
@@ -215,7 +225,7 @@ def main():
     agent = AIAgent(
         model=model, provider="custom", api_mode="chat_completions",
         base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-        enabled_toolsets=[] if source else ["terminal"], max_iterations=40 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+        enabled_toolsets=[] if source else ["terminal"], max_iterations=160 if live else 3, max_tokens=8192 if live else (512 if role else 192),
         reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
         request_overrides={} if live else {"reasoning_effort": "none"},
         quiet_mode=True, skip_context_files=True, skip_memory=True,

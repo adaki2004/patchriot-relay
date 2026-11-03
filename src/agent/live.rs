@@ -4,11 +4,21 @@ use super::*;
 use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunState};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
+mod access;
 
 pub const MODEL: &str = "abliterated-model-large-v2";
 const API: &str = "https://api.abliteration.ai/v1";
 pub const MAX_FRAME: usize = 512 * 1024;
-const MAX_SPEND: u64 = 3_000_000; // $3 reservation per role; never retried by this broker.
+pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
+pub fn is_chat_path(path: &str) -> bool {
+    path == "/v1/chat/completions" || path == ENGINE_CHAT
+}
+// Generous pilot ceilings. Stop investigation early enough to save a report;
+// increasing time/calls must not let the engine spend the reviewer's reserve.
+const MAX_SPEND: u64 = 10_000_000;
+const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
+const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
+const REVIEWER_RESERVE: u64 = 1_500_000;
 pub type Progress = Mutex<LiveProgress>;
 
 fn assessment_format() -> Value {
@@ -76,7 +86,7 @@ impl Task {
             return Err("invalid live assignment".into());
         }
         let mut bytes = serde_json::to_vec(
-            &json!({"kind":"live_http_v1","role":self.role,"evidence":self.evidence}),
+            &json!({"kind":"live_http_v1","role":self.role,"evidence":{"context":self.evidence.context,"previous_reports":self.evidence.previous_reports}}),
         )?;
         if bytes.len() > 3 * 1024 * 1024 {
             return Err("live assignment exceeds limit".into());
@@ -98,6 +108,7 @@ pub struct LiveBroker {
     scope: LiveScope,
     deadline: Instant,
     counters: Mutex<Counters>,
+    access: access::Access,
 }
 impl LiveBroker {
     pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
@@ -122,10 +133,19 @@ impl LiveBroker {
             };
         }
     }
+    #[cfg(test)]
     pub fn new(
         key_file: &Path,
         scope: LiveScope,
         deadline: Instant,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Self::new_with_credentials(key_file, scope, deadline, None)
+    }
+    pub fn new_with_credentials(
+        key_file: &Path,
+        scope: LiveScope,
+        deadline: Instant,
+        credentials: Option<&TestCredentials>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let mut file = std::fs::OpenOptions::new()
@@ -152,15 +172,23 @@ impl LiveBroker {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(180))
             .build()?;
+        let access = access::Access::new(&scope, credentials)?;
         Ok(Arc::new(Self {
             client,
             key,
             scope,
             deadline,
             counters: Mutex::new(Counters::default()),
+            access,
         }))
     }
     pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
+        let engine = request.path == ENGINE_CHAT;
+        if !is_chat_path(&request.path)
+            || engine && !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1)
+        {
+            return Err("engine_not_selected");
+        }
         if request.method != "POST" {
             return Err("unsupported_model_method");
         }
@@ -195,10 +223,9 @@ impl LiveBroker {
         let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,
             "reasoning_effort":"high"});
         if let Some(tools) = input.get("tools") {
-            if !tools
-                .as_array()
-                .is_some_and(|v| v.len() <= 16 && v.iter().all(|t| t["type"] == "function"))
-            {
+            if !tools.as_array().is_some_and(|v| {
+                v.len() <= if engine { 64 } else { 16 } && v.iter().all(|t| t["type"] == "function")
+            }) {
                 return Err("invalid_tools");
             }
             body["tools"] = tools.clone();
@@ -221,7 +248,10 @@ impl LiveBroker {
         output: &mpsc::Sender<Frame>,
     ) -> Result<(), &'static str> {
         let mut body = self.chat(request)?;
-        self.finish_before_limit(&mut body)?;
+        let engine = request.path == ENGINE_CHAT;
+        if !engine {
+            self.finish_before_limit(&mut body)?;
+        }
         let bytes = serde_json::to_vec(&body).map_err(|_| "invalid_model_request")?;
         if bytes.len() > MAX_FRAME {
             return Err("model_request_too_large");
@@ -231,7 +261,13 @@ impl LiveBroker {
         let reservation = (bytes.len() as u64 + 4096) * 3 + 8192 * 5;
         {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
-            if count.calls >= 48 || count.reserved + reservation > MAX_SPEND {
+            // ARTEX has its own response format and planner. Stop it cleanly
+            // instead of injecting the later reviewer's final-report schema.
+            // Leave time and inference for that reviewer to check its leads.
+            if engine && self.engine_budget_reached(&count, reservation) {
+                return Err("engine_budget_reached");
+            }
+            if count.calls >= MAX_LIVE_INFERENCE_CALLS || count.reserved + reservation > MAX_SPEND {
                 return Err("provider_budget_reached");
             }
             count.calls += 1;
@@ -304,6 +340,11 @@ impl LiveBroker {
             .map_err(|_| "agent_disconnected")?;
         Ok(())
     }
+    fn engine_budget_reached(&self, count: &Counters, reservation: u64) -> bool {
+        count.calls >= ENGINE_CALL_LIMIT
+            || count.reserved.saturating_add(reservation) > MAX_SPEND - REVIEWER_RESERVE
+            || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(240)
+    }
     fn finish_before_limit(&self, body: &mut Value) -> Result<(), &'static str> {
         let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
         let next = (serde_json::to_vec(body)
@@ -312,7 +353,7 @@ impl LiveBroker {
             + 4096)
             * 3
             + 8192 * 5;
-        if count.calls >= 36
+        if count.calls >= FINAL_REPORT_CALL
             || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180)
             || MAX_SPEND.saturating_sub(count.reserved) < next.saturating_mul(2) + 150_000
         {
@@ -336,10 +377,44 @@ impl LiveBroker {
             url: String,
             #[serde(default)]
             headers: BTreeMap<String, String>,
+            #[serde(default)]
+            data: Option<String>,
+            #[serde(default = "enabled")]
+            authenticated: bool,
+        }
+        fn enabled() -> bool {
+            true
         }
         let probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
         let url = self.scope.permits(&probe.method, &probe.url)?;
+        if let Some(data) = &probe.data {
+            let content = probe
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.split(';').next().unwrap_or("").trim());
+            if probe.method != "POST"
+                || data.len() > 16384
+                || data.contains('\0')
+                || !matches!(
+                    content,
+                    Some("application/json" | "application/x-www-form-urlencoded")
+                )
+            {
+                return Err("unsupported_probe_body");
+            }
+            if content == Some("application/json") && serde_json::from_str::<Value>(data).is_err() {
+                return Err("invalid_json_probe_body");
+            }
+        }
         if probe.headers.len() > 12
+            || probe
+                .headers
+                .keys()
+                .map(|k| k.to_ascii_lowercase())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != probe.headers.len()
             || probe.headers.iter().any(|(k, v)| {
                 k.len() > 80
                     || v.len() > 1024
@@ -392,13 +467,26 @@ impl LiveBroker {
         let method = reqwest::Method::from_bytes(probe.method.as_bytes())
             .map_err(|_| "unsupported_method")?;
         let mut request = client
-            .request(method, url)
+            .request(method, url.clone())
             .header("user-agent", "Patchriot-authorized-review/0.0.2");
         for (key, value) in &probe.headers {
             request = request.header(key, value);
         }
+        let authorization = self.access.authorization(probe.authenticated);
+        request = self.access.apply(request, &url, probe.authenticated);
+        if let Some(data) = &probe.data {
+            request = request.body(data.clone());
+        }
         let response = request.send().await;
+        let retained_body = probe.data.as_ref().map(|v| self.access.redact(v));
         let mut evidence = HttpEvidence {
+            request_body_excerpt: retained_body
+                .as_ref()
+                .map(|v| v.chars().take(2048).collect()),
+            request_body_sha256: retained_body
+                .as_ref()
+                .map(|v| hex::encode(Sha256::digest(v.as_bytes()))),
+            authenticated: authorization.is_some(),
             id: 0,
             method: probe.method,
             url: probe.url,
@@ -415,16 +503,20 @@ impl LiveBroker {
                 .as_secs() as i64,
         };
         let mut received = Vec::new();
+        let mut body_truncated = false;
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
             Ok(mut response) => {
+                self.access
+                    .remember(&url, response.headers(), probe.authenticated);
                 evidence.status = Some(response.status().as_u16());
                 for &name in RECORDED_HEADERS {
                     if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok())
                     {
-                        evidence
-                            .headers
-                            .insert(name.into(), value.chars().take(1024).collect());
+                        evidence.headers.insert(
+                            name.into(),
+                            self.access.redact(value).chars().take(1024).collect(),
+                        );
                     }
                 }
                 loop {
@@ -433,18 +525,26 @@ impl LiveBroker {
                             let available = (256 * 1024usize).saturating_sub(received.len());
                             received.extend_from_slice(&chunk[..available.min(chunk.len())]);
                             if chunk.len() > available {
+                                body_truncated = true;
                                 evidence.truncated = true;
                                 break;
                             }
                         }
                         Ok(None) => break,
                         Err(_) => {
+                            body_truncated = true;
                             evidence.error = Some("target_body_interrupted".into());
                             evidence.truncated = true;
                             break;
                         }
                     }
                 }
+                let (redacted, shortened) = self
+                    .access
+                    .redact_limited(&String::from_utf8_lossy(&received), 256 * 1024);
+                received = redacted.into_bytes();
+                body_truncated |= shortened;
+                evidence.truncated |= shortened;
                 evidence.body_sha256 = Some(hex::encode(Sha256::digest(&received)));
                 evidence.body_excerpt = String::from_utf8_lossy(&received)
                     .chars()
@@ -458,19 +558,41 @@ impl LiveBroker {
         count.evidence_bytes += serde_json::to_vec(&evidence)
             .map_err(|_| "evidence_encoding_failed")?
             .len();
-        let reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":received.len()==256*1024});
+        let reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":body_truncated});
         count.evidence.push(evidence);
         Ok(reply)
     }
     pub async fn respond(&self, request: Request, output: mpsc::Sender<Frame>) {
-        if request.path == "/v1/chat/completions" {
-            if let Err(reason) = self.model(&request, &output).await {
-                let _ = output
-                    .send(Frame::Failed {
-                        id: request.id,
-                        reason,
-                    })
-                    .await;
+        if is_chat_path(&request.path) {
+            match self.model(&request, &output).await {
+                Err("engine_budget_reached") => {
+                    // Upstream pauses after consecutive 429s. Its wrapper
+                    // collects the partial report and shuts down the engine.
+                    // No provider request is sent for these rejected calls.
+                    let _ = output
+                        .send(Frame::Start {
+                            id: request.id,
+                            status: 429,
+                            content_type: "application/json",
+                        })
+                        .await;
+                    let _ = output
+                        .send(Frame::Chunk {
+                            id: request.id,
+                            hex: hex::encode(br#"{"error":"engine_budget_reached"}"#),
+                        })
+                        .await;
+                    let _ = output.send(Frame::End { id: request.id }).await;
+                }
+                Err(reason) => {
+                    let _ = output
+                        .send(Frame::Failed {
+                            id: request.id,
+                            reason,
+                        })
+                        .await;
+                }
+                Ok(()) => {}
             }
             return;
         }
@@ -531,7 +653,18 @@ impl LiveBroker {
             .trim();
         let assessment = parse_assessment(cleaned);
         let count = self.counters.lock().expect("live counters poisoned");
-        let (tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
+        let (mut tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
+        for run in &mut tool_runs {
+            run.arguments
+                .iter_mut()
+                .for_each(|v| *v = self.access.redact_limited(v, 4096).0);
+            let (cleaned, shortened) = self.access.redact_limited(&run.output_excerpt, 24 * 1024);
+            run.output_truncated |= shortened;
+            if cleaned != run.output_excerpt {
+                run.output_sha256 = hex::encode(Sha256::digest(cleaned.as_bytes()));
+                run.output_excerpt = cleaned;
+            }
+        }
         let passed = passed && tools_valid;
         let mut result = PentestResult {
             kind: PentestResultKind::PentestAgentV1,
@@ -558,10 +691,16 @@ impl LiveBroker {
                     Some(report.failure_reason.unwrap_or(report.outcome).to_owned())
                 },
             },
-            assessment,
+            assessment: assessment.and_then(|a| {
+                let mut value = serde_json::to_value(a).ok()?;
+                self.access.redact_json(&mut value);
+                serde_json::from_value(value).ok()
+            }),
             evidence: count.evidence.clone(),
             tool_runs,
             raw_summary: {
+                let redacted = self.access.redact(raw);
+                let raw = redacted.as_str();
                 let mut end = raw.len().min(24000);
                 while !raw.is_char_boundary(end) {
                     end -= 1;
@@ -592,7 +731,7 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
         if let Ok(run) = parsed {
             bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
-            if records.len() < 12 && bytes <= 192 * 1024 && run.valid(evidence) {
+            if records.len() < 20 && bytes <= 256 * 1024 && run.valid(evidence) {
                 records.push(run);
                 continue;
             }
@@ -668,9 +807,13 @@ mod tests {
         LiveBroker::new(
             file.path(),
             LiveScope {
+                authentication: None,
+                auth_check_path: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
+                profile: None,
+                tools: vec![],
             },
             Instant::now() + Duration::from_secs(600),
         )
@@ -718,6 +861,70 @@ mod tests {
         assert_eq!(observed.inference_calls, 0);
     }
     #[tokio::test]
+    async fn rejected_engine_retries_do_not_consume_the_reviewers_call_allowance() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT;
+        // Exercise the real supervised pipe and real 429 responses. The engine
+        // has spent its allowance; these retries must never contact a provider
+        // or prevent the subsequent final report from arriving.
+        let script = r#"
+            i=1
+            while [ "$i" -le 60 ]; do
+                printf '%s\n' '{"type":"request","request":{"id":'"$i"',"method":"POST","path":"/patchriot/artex/v1/chat/completions","body":{"model":"abliterated-model-large-v2","messages":[{"role":"user","content":"fixture"}]}}}'
+                while IFS= read -r frame; do
+                    case "$frame" in *'"type":"end"'*) break ;; esac
+                done
+                i=$((i + 1))
+            done
+            printf '%s\n' '{"type":"event","event":"phase","data":{"name":"agent_ready"}}'
+            printf '%s\n' '{"type":"event","event":"result","data":{"completed":true,"final_response":"saved fixture report"}}'
+        "#;
+        let mut command = std::process::Command::new("/bin/sh");
+        command.env_clear().args(["-c", script]);
+        let report = supervise(
+            command,
+            Bridge::Live(broker.clone()),
+            &|| false,
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "completed");
+        assert_eq!(
+            report.inference_calls, 60,
+            "transport attempts are distinct from paid calls"
+        );
+        assert_eq!(
+            report.events.last().unwrap()["data"]["final_response"],
+            "saved fixture report"
+        );
+        {
+            let count = broker.counters.lock().unwrap();
+            assert_eq!(count.calls, ENGINE_CALL_LIMIT);
+            assert_eq!(count.reserved, 0);
+        }
+        // The spend and provider-call cap are still enforced by model(), as
+        // covered by the exhausted-budget regression below.
+        assert_eq!(Bridge::Live(broker.clone()).max_requests(), 800);
+        broker.counters.lock().unwrap().calls = MAX_LIVE_INFERENCE_CALLS;
+        let (tx, _rx) = mpsc::channel(4);
+        let request = Request {
+            id: 61,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(json!({"model":MODEL,"messages":[{"role":"user","content":"fixture"}]})),
+        };
+        assert_eq!(
+            broker.model(&request, &tx).await,
+            Err("provider_budget_reached")
+        );
+        assert_eq!(broker.counters.lock().unwrap().reserved, 0);
+    }
+
+    #[tokio::test]
     async fn prohibited_targets_and_credentials_never_reach_network_or_provider() {
         let broker = broker();
         for body in [
@@ -733,6 +940,54 @@ mod tests {
         assert_eq!(count.calls, 0);
         assert!(count.evidence.is_empty());
         assert_eq!(count.reserved, 0);
+    }
+    #[test]
+    fn plaintext_credentials_never_enter_the_container_assignment() {
+        let scope:LiveScope=serde_json::from_value(json!({"origins":["https://example.com"],"methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1","tools":["authenticated_http_v1"],"authentication":"bearer","auth_check_path":"/private"})).unwrap();
+        let scope = scope.normalized().unwrap();
+        let hash = scope.hash().unwrap();
+        let task = Task {
+            role: ReviewRole::Investigator,
+            scope_sha256: hash.clone(),
+            evidence: PentestEvidence {
+                context: PentestContext {
+                    pentest_id: uuid::Uuid::new_v4(),
+                    scope,
+                    scope_sha256: hash,
+                    reviewers: vec![],
+                    provider: "abliteration.ai".into(),
+                },
+                previous_reports: vec![],
+                credentials: Some(TestCredentials::Bearer {
+                    token: "synthetic-test-token-never-for-model".into(),
+                }),
+            },
+        };
+        let bytes = task.input().unwrap();
+        let encoded = String::from_utf8(bytes).unwrap();
+        assert!(!encoded.contains("synthetic-test-token"));
+        let input: Value = serde_json::from_str(&encoded).unwrap();
+        assert!(input["evidence"].get("credentials").is_none());
+        assert!(encoded.contains("auth_check_path"));
+    }
+    #[tokio::test]
+    async fn active_scope_rejects_unapproved_bodies_and_header_overrides_before_io() {
+        let mut broker = broker();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV1);
+        inner.scope.tools = vec![LiveToolProfile::ActiveWebV1];
+        for body in [
+            json!({"method":"POST","url":"https://example.com/","headers":{"content-type":"text/plain"},"data":"test"}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"content-type":"application/json"},"data":"{"}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"content-type":"application/json"},"data":"x".repeat(16385)}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"Content-Type":"application/json","content-type":"application/json"},"data":"{}"}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"Cookie":"injected"}}),
+            json!({"method":"POST","url":"https://elsewhere.example/","data":"{}"}),
+        ] {
+            assert!(broker.http(body).await.is_err());
+        }
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
     }
     #[test]
     fn provider_cannot_be_rerouted_by_runtime_fields_or_target_text() {
@@ -754,6 +1009,57 @@ mod tests {
         r.body.as_mut().unwrap()["model"] = json!("other");
         assert!(broker.chat(&r).is_err());
     }
+    #[tokio::test]
+    async fn full_engine_requires_consent_and_keeps_the_reviewers_budget() {
+        let mut broker = broker();
+        let mut request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: ENGINE_CHAT.into(),
+            body: Some(
+                json!({"model":MODEL,"messages":[{"role":"user","content":"owned fixture"}],
+                "tools":(0..31).map(|n| json!({"type":"function","function":{"name":format!("fixture{n}")}})).collect::<Vec<_>>() }),
+            ),
+        };
+        assert_eq!(broker.chat(&request).unwrap_err(), "engine_not_selected");
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        let prepared = broker.chat(&request).unwrap();
+        assert_eq!(prepared["tools"].as_array().unwrap().len(), 31);
+        assert!(prepared.get("response_format").is_none());
+        request.path = "/v1/chat/completions".into();
+        assert_eq!(broker.chat(&request).unwrap_err(), "invalid_tools");
+        request.path = ENGINE_CHAT.into();
+        assert!(!broker.engine_budget_reached(&Counters::default(), 100));
+        assert!(broker.engine_budget_reached(
+            &Counters {
+                calls: ENGINE_CALL_LIMIT,
+                ..Default::default()
+            },
+            100
+        ));
+        assert!(broker.engine_budget_reached(
+            &Counters {
+                reserved: MAX_SPEND - REVIEWER_RESERVE,
+                ..Default::default()
+            },
+            100
+        ));
+        Arc::get_mut(&mut broker).unwrap().deadline = Instant::now() + Duration::from_secs(239);
+        let (tx, mut rx) = mpsc::channel(4);
+        broker.respond(request, tx).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Frame::Start { status: 429, .. })
+        ));
+        assert!(matches!(rx.recv().await, Some(Frame::Chunk { .. })));
+        assert!(matches!(rx.recv().await, Some(Frame::End { .. })));
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(
+            count.calls, 0,
+            "local budget rejection must not contact provider"
+        );
+        assert_eq!(count.reserved, 0);
+    }
     #[test]
     fn reserves_a_final_report_before_cost_or_turn_limits_stop_the_agent() {
         let broker = broker();
@@ -769,7 +1075,7 @@ mod tests {
         let mut prepared = normal.clone();
         broker.finish_before_limit(&mut prepared).unwrap();
         assert_eq!(normal, prepared);
-        for (calls, reserved) in [(0, MAX_SPEND - 200_000), (36, 0)] {
+        for (calls, reserved) in [(0, MAX_SPEND - 200_000), (FINAL_REPORT_CALL, 0)] {
             {
                 let mut count = broker.counters.lock().unwrap();
                 count.calls = calls;
