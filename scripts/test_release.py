@@ -127,6 +127,17 @@ class ReleaseTests(unittest.TestCase):
         self.metadata["resolve"]["nodes"][0]["deps"].append({"pkg": "compiler", "dep_kinds": [{"kind": "build"}]})
         self.assertIn(b"Permission notice fixture", release.license_text(self.metadata, self.bundle))
 
+    def test_legacy_dual_license_accepts_one_complete_alternative_only(self):
+        entry = self.bundle["third_party_libraries"][0]
+        entry["licenses"] = [{"license": "MIT", "text": "NOT FOUND"},
+                             {"license": "Apache-2.0", "text": "Complete Apache notice fixture"}]
+        for expression in ("Apache-2.0/MIT", "MIT/Apache-2.0", "Apache-2.0 OR MIT"):
+            entry["license"] = expression
+            self.assertIn(b"Complete Apache notice", release.license_text(self.metadata, self.bundle))
+        entry["license"] = "Apache-2.0 AND MIT"
+        with self.assertRaisesRegex(ValueError, "Incomplete license"):
+            release.license_text(self.metadata, self.bundle)
+
 
 if __name__ == "__main__":
     unittest.main()

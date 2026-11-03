@@ -52,7 +52,7 @@ jobs:
       - name: Package and check the download
         id: package
         run: |
-          cargo bundle-licenses --format json --output "$RUNNER_TEMP/licenses.json"
+          cargo bundle-licenses --format json --previous licenses/supplemental.json --output "$RUNNER_TEMP/licenses.json"
           python3 scripts/package-release.py target/release-linux/release/patchriot-relay "$RUNNER_TEMP/licenses.json" dist
           cd dist
           sha256sum --check SHA256SUMS

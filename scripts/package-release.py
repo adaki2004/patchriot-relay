@@ -61,7 +61,10 @@ def license_text(metadata, bundle):
             raise ValueError("Missing license text for " + package["name"])
         # Missing alternatives are acceptable only for an OR expression. An AND
         # obligation must retain every text, rather than silently dropping one.
-        if len(found) != len(entry["licenses"]) and (" AND " in entry["license"] or " OR " not in entry["license"]):
+        # Older published crates used Cargo's legacy slash spelling for this
+        # dual license. Selecting Apache-2.0 still fulfils that alternative.
+        alternative = " OR " in entry["license"] or entry["license"] in ("Apache-2.0/MIT", "MIT/Apache-2.0")
+        if len(found) != len(entry["licenses"]) and (" AND " in entry["license"] or not alternative):
             raise ValueError("Incomplete license expression for " + package["name"])
         text.append(f"\n{'=' * 72}\n{package['name']} {package['version']} — {entry['license']}")
         text.extend(f"\n{part['license']}\n{part['text']}" for part in found)
