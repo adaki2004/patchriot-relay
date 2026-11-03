@@ -204,8 +204,8 @@ def main():
         event("phase", name="scoped_tools")
         scope = json.loads(Path("/work/scope.json").read_text())["scope"]
         tools = web_tools.run(scope, json.loads(Path("/work/previous.json").read_text()),
-                              emit=lambda result: event("live_tool", run=result))
-        if "artex_engine_v1" in scope.get("tools", []):
+                              emit=lambda result: event("live_tool", run=result), role=role)
+        if live_review.runs_discovery(role) and "artex_engine_v1" in scope.get("tools", []):
             import artex
             # Keep at least four minutes for the review and final report. ARTEX
             # also shares the relay's total model and target-request allowances.

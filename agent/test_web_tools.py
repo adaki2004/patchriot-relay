@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from urllib.error import URLError
 
 import web_tools as tools
@@ -24,7 +25,7 @@ class WebToolsTests(unittest.TestCase):
                     'http://owned.example/', 'https://owned.example/\nnext', '//other.example/']:
             self.assertFalse(tools.allowed('https://owned.example', url), url)
 
-    def fixture(self, method, url, headers=None):
+    def fixture(self, method, url, headers=None, **_):
         self.requests.append((method, url, headers or {}))
         number = len(self.requests)
         return {'body':'<a href="/docs">Docs</a><a href="https://external.example/">Elsewhere</a>',
@@ -107,6 +108,34 @@ class WebToolsTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 4)
         self.assertEqual(self.requests[-1], ('GET','https://owned.example/check', {'Origin':'null'}))
         self.assertEqual(record['evidence_ids'], [1,2,3,4])
+
+    def test_followups_do_not_repeat_scanners_or_lose_fresh_control_evidence(self):
+        scope = {'origins': ['https://owned.example'], 'methods': ['GET', 'HEAD', 'OPTIONS']}
+        for role in ['investigator', 'reproducer', 'challenger']:
+            with tempfile.TemporaryDirectory() as temp, patch('baseline.run', return_value={'tool': 'baseline'}) as baseline, \
+                    patch.object(tools, 'crawl', return_value={'tool': 'crawl'}) as crawl, \
+                    patch.object(tools, 'scanner', return_value={'tool': 'nuclei'}) as scanner, \
+                    patch.object(tools, 'controls', return_value={'tool': 'controls'}) as controls:
+                emitted = []
+                result = tools.run(scope, [], Path(temp), emitted.append, role=role)
+                self.assertEqual(result['tool_runs'], emitted)
+                self.assertEqual(controls.call_count, 1)
+                for tool in (baseline, crawl, scanner):
+                    self.assertEqual(tool.call_count, int(role == 'investigator'))
+                self.assertEqual(json.loads((Path(temp) / 'tool-results.json').read_text())['role'], role)
+
+    def test_repeated_prior_claims_do_not_duplicate_requests_or_lose_auth_controls(self):
+        calls = []
+        def fetch(method, url, headers=None, authenticated=True):
+            calls.append((url, authenticated))
+            return {'evidence': {'id': len(calls), 'status': 200}}
+        prior = {'assessment': {'findings': [{'evidence_ids': [1]}]}, 'evidence': [
+            {'id': 1, 'method': 'GET', 'url': 'https://owned.example/private', 'authenticated': True}]}
+        result = tools.controls('https://owned.example', time.monotonic() + 5, [prior, prior], fetch, '/private')
+        self.assertEqual(calls.count(('https://owned.example/private', True)), 1)
+        self.assertEqual(calls.count(('https://owned.example/private', False)), 1)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(result['evidence_ids'], [1, 2, 3, 4, 5])
 
     def test_subprocess_timeout_and_output_limit(self):
         timed = tools.capture([sys.executable, '-c', 'import time; time.sleep(3)'], timeout=.1)
