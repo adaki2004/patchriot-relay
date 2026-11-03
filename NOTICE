@@ -44,3 +44,7 @@ https://github.com/projectdiscovery/nuclei
 MIT license. The agent image downloads the pinned, checksum-verified release.
 Its upstream copyright and full license are retained at /usr/share/licenses/nuclei/LICENSE.md.
 The three selected templates are authored here; no upstream template pack is bundled.
+
+ARTEX — Autumn-27; English fork BaaRai/ARTEX
+https://github.com/BaaRai/ARTEX/tree/9ebc8b6703ead14dc83979d44a4bc482d36cecd8
+AGPL-3.0. The optional agent image builds the full, unmodified upstream Go engine from a checksum-verified source archive. Its license and corresponding source are retained at /usr/share/licenses/artex; the archive includes upstream dependency manifests and notices. The engine uses BaaRai/Norma v0.4.4 as pinned by those manifests. Patchriot's separate adapter restricts execution and target access; it does not replace the upstream planner. A container-local service and disposable database are started only for an approved engine selection. The image includes the bundled skills, not every optional external tool they mention.

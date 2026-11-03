@@ -49,6 +49,16 @@ const TMPFS: [(&str, &str); 3] = [
     ),
 ];
 
+fn temporary_storage(engine: bool) -> [(&'static str, &'static str); 3] {
+    let mut mounts = TMPFS;
+    if engine {
+        // The selected engine needs a disposable PostgreSQL data directory.
+        // Still memory-backed, non-executable, and inside the same 2 GiB cap.
+        mounts[2].1 = "rw,nosuid,nodev,noexec,size=536870912,uid=65534,gid=65534";
+    }
+    mounts
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -72,20 +82,20 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5", "6"].contains(
+            || !["2", "3", "4", "5", "6", "7"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5", "6"].contains(
+                && !["3", "4", "5", "6", "7"].contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–6; longer CPU budgets require adapter 3–6"
+                "website reviews require adapter 2–7; longer CPU budgets require adapter 3–7"
                     .into(),
             );
         }
@@ -97,22 +107,36 @@ impl Settings {
             || image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("5" | "6")
+                Some("5" | "6" | "7")
             )
         {
             return Err(
-                "live tests require the inspected adapter 5 or 6 and a private provider key file"
+                "live tests require the inspected adapter 5–7 and a private provider key file"
                     .into(),
             );
         }
         Ok(())
+    }
+    pub fn live_tools(
+        &self,
+    ) -> Result<Vec<patchriot_protocol::pentests::LiveToolProfile>, Box<dyn std::error::Error>>
+    {
+        self.require_live_adapter()?;
+        let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
+        Ok(
+            if image["Config"]["Labels"]["io.patchriot.agent-adapter"] == "7" {
+                vec![patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1]
+            } else {
+                vec![]
+            },
+        )
     }
     pub fn require_source_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6")
+                Some("4" | "5" | "6" | "7")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -446,7 +470,7 @@ async fn supervise(
                             }
                             last_id = request.id;
                             active = Some(request.id);
-                            if request.path == "/v1/chat/completions" {
+                            if live::is_chat_path(&request.path) {
                                 if report.inference_calls >= broker.max_calls() {
                                     report.outcome = "inference_limit";
                                     break 'running;
@@ -488,7 +512,7 @@ async fn supervise(
                             }
                             if event == "live_tool" && report.inference_calls == 0
                                 && matches!(&broker, Bridge::Live(b) if b.valid_tool_record(&data["run"])) {
-                                completed_tools = completed_tools.saturating_add(1).min(12);
+                                completed_tools = completed_tools.saturating_add(1).min(16);
                             }
                             if event == "tool_start" {
                                 eprintln!("agent started a tool");
@@ -557,7 +581,7 @@ async fn supervise(
     Ok(report)
 }
 
-fn policy(container: &Value, image: &str, args: &[&str], seconds: u64) -> bool {
+fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: bool) -> bool {
     let h = &container["HostConfig"];
     let c = &container["Config"];
     container["Image"] == image
@@ -582,7 +606,7 @@ fn policy(container: &Value, image: &str, args: &[&str], seconds: u64) -> bool {
         && h["RestartPolicy"]["Name"] == "no"
         && h["Tmpfs"]
             == json!(
-                TMPFS
+                temporary_storage(engine)
                     .into_iter()
                     .collect::<std::collections::BTreeMap<_, _>>()
             )
@@ -652,13 +676,13 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3", "4", "5", "6"].contains(
+        || !["1", "2", "3", "4", "5", "6", "7"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5", "6"].contains(
+            && !["2", "3", "4", "5", "6", "7"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -666,10 +690,14 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6")
+                Some("4" | "5" | "6" | "7")
             )
+        || live
+            .as_ref()
+            .is_some_and(|task| !task.evidence.context.scope.tools.is_empty())
+            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "7"
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5", "6"].contains(
+            && !["3", "4", "5", "6", "7"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -812,7 +840,14 @@ pub fn run(
         ]
         .map(str::to_owned),
     );
-    for (path, options) in TMPFS {
+    let engine = live.is_some_and(|task| {
+        task.evidence
+            .context
+            .scope
+            .tools
+            .contains(&patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
+    });
+    for (path, options) in temporary_storage(engine) {
         command.extend(["--tmpfs".into(), format!("{path}:{options}")]);
     }
     command.push(settings.image.clone());
@@ -830,6 +865,7 @@ pub fn run(
             &settings.image,
             &args,
             settings.max_attempt_seconds,
+            engine,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -1218,7 +1254,40 @@ mod tests {
     }
     #[test]
     fn docker_configuration_must_preserve_the_execution_boundary() {
-        assert!(policy(&container(), "owned-image", &["owned-model"], 600));
+        assert!(policy(
+            &container(),
+            "owned-image",
+            &["owned-model"],
+            600,
+            false
+        ));
+        let mut expanded = container();
+        expanded["HostConfig"]["Tmpfs"] = json!(
+            temporary_storage(true)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        assert!(!policy(
+            &expanded,
+            "owned-image",
+            &["owned-model"],
+            600,
+            false
+        ));
+        assert!(policy(
+            &expanded,
+            "owned-image",
+            &["owned-model"],
+            600,
+            true
+        ));
+        assert!(!policy(
+            &container(),
+            "owned-image",
+            &["owned-model"],
+            600,
+            true
+        ));
         for (pointer, value) in [
             ("/HostConfig/NetworkMode", json!("host")),
             ("/HostConfig/ReadonlyRootfs", json!(false)),
@@ -1235,7 +1304,13 @@ mod tests {
             let mut value_container = container();
             *value_container.pointer_mut(pointer).unwrap() = value;
             assert!(
-                !policy(&value_container, "owned-image", &["owned-model"], 600),
+                !policy(
+                    &value_container,
+                    "owned-image",
+                    &["owned-model"],
+                    600,
+                    false
+                ),
                 "{pointer}"
             );
         }
@@ -1243,7 +1318,7 @@ mod tests {
             let mut value = container();
             value["HostConfig"][key] = json!(["unexpected"]);
             assert!(
-                !policy(&value, "owned-image", &["owned-model"], 600),
+                !policy(&value, "owned-image", &["owned-model"], 600, false),
                 "{key}"
             );
         }

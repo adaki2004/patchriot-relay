@@ -283,7 +283,8 @@ def run(scope, previous, directory=Path("/work"), emit=lambda _: None):
     deadline = time.monotonic() + 180
     records = []
     for origin in scope["origins"]:
-        for check in (lambda: crawl(origin, deadline), lambda: scanner(origin, deadline), lambda: controls(origin, deadline, previous)):
+        checks = [lambda: crawl(origin, deadline), lambda: scanner(origin, deadline), lambda: controls(origin, deadline, previous)]
+        for check in checks:
             if time.monotonic() >= deadline:
                 break
             result = check()

@@ -173,7 +173,7 @@ Use an Ollama model that supports tools and a 64,000-token context. Its **stored
 
 After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept owned-example checks submitted through the website. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
 
-For a slow CPU pilot, set `max_attempt_seconds` to at most `1800` and rebuild adapter version 3–6. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
+For a slow CPU pilot, set `max_attempt_seconds` to at most `1800` and rebuild adapter version 3–7. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
 
 **Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall by default. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
 
@@ -185,7 +185,7 @@ The pilot presents its terminal and process-management tools directly, without a
 
 ## Opt in to private website reviews
 
-First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review accepts adapter versions 2–6. The current build is version 6; longer CPU budgets require version 3 or later.
+First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review accepts adapter versions 2–7. The current build is version 7; longer CPU budgets require version 3 or later.
 
 ```sh
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --website-reviews
@@ -229,7 +229,7 @@ Use an immutable image ID from your inspected build. The provider-managed model 
 ./patchriot-relay connect --state-dir /var/lib/patchriot/relay-one --agents --agent-config /etc/patchriot/live-agent.json --live-tests
 ```
 
-Do not combine `--live-tests` with the offline website/source opt-ins. The requester approves the exact origins, three named operators and external-provider access. The requester proves control of every approved hostname with an expiring DNS TXT record. An administrator approves the exact scope before work starts. The hosted pilot needs provider credit; it does not create platform earnings.
+Do not combine `--live-tests` with the offline website/source opt-ins. The requester approves the exact origins, three named operators and external-provider access. The requester proves control of every approved hostname with an expiring DNS TXT record. An administrator approves the exact scope before work starts. The hosted pilot needs provider credit. Core owns customer checkout and operator accounting; the relay never receives treasury keys.
 
 The trusted relay needs DNS/HTTPS access to the fixed provider and approved public targets. The local-only systemd example needs an explicit network-policy adjustment for this mode. The agent container stays non-root, read-only and without external networking, host mounts, keys or the Docker socket. Run it on a dedicated machine. An ordinary container is not a VM or a TEE.
 
@@ -239,7 +239,11 @@ The trusted relay needs DNS/HTTPS access to the fixed provider and approved publ
 
 Each role starts with a compact scope and prior-findings overview; full transcripts remain available in separate files. Every finding must cite relevant requests recorded during that role. Earlier claims it could not check belong in the limitations. The relay pins the provider's reasoning setting. When time or allowance runs low, it closes tools and requests a bounded JSON report with reduced reasoning. Malformed or unsupported reports remain incomplete.
 
-**Tools before inference:** adapter 6 runs a bounded static-link crawl, Nuclei 3.11.1 with three curated checks (Git configuration exposure, directory-listing markers and CORS reflection), then control requests. Nuclei connects only to a local mirror; the mirror uses the same scoped HTTP broker as the agent. No remote template updates, broad CVE packs, browser execution or network scans. Tool versions, arguments, output excerpts and HTTP references are saved with the private report. Scanner matches are leads; no matches does not establish safety. The scanner sees selected headers and decoded text, so its loopback host/IP and suggested curl commands are not the target’s actual connection. Use the recorded HTTP evidence.
+**Baseline tools:** adapters 6 and 7 run a bounded static-link crawl, Nuclei 3.11.1 with three curated checks (Git configuration exposure, directory-listing markers and CORS reflection), then control requests. Nuclei connects only to a local mirror; the mirror uses the same scoped HTTP broker as the agent. No remote template updates, broad CVE packs, browser execution or network scans. Tool versions, arguments, output excerpts and HTTP references are saved with the private report. Scanner matches are leads; no matches does not establish safety. The scanner sees selected headers and decoded text, so its loopback host/IP and suggested curl commands are not the target’s actual connection. Use the recorded HTTP evidence.
+
+**Optional ARTEX engine:** adapter 7 advertises `artex_engine_v1`. It runs the pinned upstream planner, worker and bundled skills with a fresh local database. It uses installed tools, not every optional binary mentioned by upstream. The requester must select it before scope approval and checkout; an older image cannot accept that assignment. Target traffic still crosses the same Rust broker, and the model key stays outside the container. The engine shares the role's existing price/time/request limits; up to 24 provider calls are allowed before reserving at least $0.75 of the allowance and four minutes for the reviewer. Its own timer may stop it sooner. The reviewer checks its leads rather than treating its findings as proof.
+
+The selected engine gets a 512 MiB temporary `/work` directory for disposable PostgreSQL, within the same 2 GiB container limit. Its API and database listen only on container loopback, with no published ports or persistent state. Scope-bound GET/HEAD/OPTIONS are the only supported target methods; login, state-changing tests, general network scans, browser execution and external callbacks are not enabled. Engine startup errors, unavailable tools and unfinished plans stay visible. Partial evidence is saved, but cannot mark the assessment complete. Source and dependency archives and the upstream license are included under `/usr/share/licenses/artex`.
 
 **What the agent does:** Hermes gets the approved objective, scope, previous reports and the testing method in `agent/live-review-skill.txt`. Its terminal can analyze files and request live evidence through `live_http.py`. The relay enforces HTTPS origins, public DNS/IPs, GET/HEAD/OPTIONS, no automatic redirects and at most two requests per second. No credentials, account changes, transactions or load testing are enabled. Responses are bounded; truncated content is marked.
 
@@ -268,7 +272,7 @@ For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pin
 
 ## Opt in to private source reviews
 
-Build the current **adapter 6** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
+Build the current **adapter 7** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
 
 ```sh
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --source-reviews

@@ -510,6 +510,13 @@ fn work_tick(
             website_reviews,
             source_reviews,
             live_tests,
+            live_tools: if live_tests {
+                agent
+                    .ok_or("live tools require agent settings")?
+                    .live_tools()?
+            } else {
+                vec![]
+            },
         },
     )?;
     let Some(assignment) = reply.assignment else {
@@ -1184,6 +1191,7 @@ mod tests {
                     website_reviews: false,
                     source_reviews: false,
                     live_tests: false,
+                    live_tools: vec![],
                 },
             )
             .unwrap_err();
