@@ -4,6 +4,7 @@ use super::*;
 use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunState};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
+mod access;
 
 pub const MODEL: &str = "abliterated-model-large-v2";
 const API: &str = "https://api.abliteration.ai/v1";
@@ -80,7 +81,7 @@ impl Task {
             return Err("invalid live assignment".into());
         }
         let mut bytes = serde_json::to_vec(
-            &json!({"kind":"live_http_v1","role":self.role,"evidence":self.evidence}),
+            &json!({"kind":"live_http_v1","role":self.role,"evidence":{"context":self.evidence.context,"previous_reports":self.evidence.previous_reports}}),
         )?;
         if bytes.len() > 3 * 1024 * 1024 {
             return Err("live assignment exceeds limit".into());
@@ -102,6 +103,7 @@ pub struct LiveBroker {
     scope: LiveScope,
     deadline: Instant,
     counters: Mutex<Counters>,
+    access: access::Access,
 }
 impl LiveBroker {
     pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
@@ -126,10 +128,19 @@ impl LiveBroker {
             };
         }
     }
+    #[cfg(test)]
     pub fn new(
         key_file: &Path,
         scope: LiveScope,
         deadline: Instant,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Self::new_with_credentials(key_file, scope, deadline, None)
+    }
+    pub fn new_with_credentials(
+        key_file: &Path,
+        scope: LiveScope,
+        deadline: Instant,
+        credentials: Option<&TestCredentials>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let mut file = std::fs::OpenOptions::new()
@@ -156,12 +167,14 @@ impl LiveBroker {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(180))
             .build()?;
+        let access = access::Access::new(&scope, credentials)?;
         Ok(Arc::new(Self {
             client,
             key,
             scope,
             deadline,
             counters: Mutex::new(Counters::default()),
+            access,
         }))
     }
     pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
@@ -359,10 +372,44 @@ impl LiveBroker {
             url: String,
             #[serde(default)]
             headers: BTreeMap<String, String>,
+            #[serde(default)]
+            data: Option<String>,
+            #[serde(default = "enabled")]
+            authenticated: bool,
+        }
+        fn enabled() -> bool {
+            true
         }
         let probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
         let url = self.scope.permits(&probe.method, &probe.url)?;
+        if let Some(data) = &probe.data {
+            let content = probe
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.split(';').next().unwrap_or("").trim());
+            if probe.method != "POST"
+                || data.len() > 16384
+                || data.contains('\0')
+                || !matches!(
+                    content,
+                    Some("application/json" | "application/x-www-form-urlencoded")
+                )
+            {
+                return Err("unsupported_probe_body");
+            }
+            if content == Some("application/json") && serde_json::from_str::<Value>(data).is_err() {
+                return Err("invalid_json_probe_body");
+            }
+        }
         if probe.headers.len() > 12
+            || probe
+                .headers
+                .keys()
+                .map(|k| k.to_ascii_lowercase())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != probe.headers.len()
             || probe.headers.iter().any(|(k, v)| {
                 k.len() > 80
                     || v.len() > 1024
@@ -415,13 +462,26 @@ impl LiveBroker {
         let method = reqwest::Method::from_bytes(probe.method.as_bytes())
             .map_err(|_| "unsupported_method")?;
         let mut request = client
-            .request(method, url)
+            .request(method, url.clone())
             .header("user-agent", "Patchriot-authorized-review/0.0.2");
         for (key, value) in &probe.headers {
             request = request.header(key, value);
         }
+        let authorization = self.access.authorization(probe.authenticated);
+        request = self.access.apply(request, &url, probe.authenticated);
+        if let Some(data) = &probe.data {
+            request = request.body(data.clone());
+        }
         let response = request.send().await;
+        let retained_body = probe.data.as_ref().map(|v| self.access.redact(v));
         let mut evidence = HttpEvidence {
+            request_body_excerpt: retained_body
+                .as_ref()
+                .map(|v| v.chars().take(2048).collect()),
+            request_body_sha256: retained_body
+                .as_ref()
+                .map(|v| hex::encode(Sha256::digest(v.as_bytes()))),
+            authenticated: authorization.is_some(),
             id: 0,
             method: probe.method,
             url: probe.url,
@@ -441,13 +501,16 @@ impl LiveBroker {
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
             Ok(mut response) => {
+                self.access
+                    .remember(&url, response.headers(), probe.authenticated);
                 evidence.status = Some(response.status().as_u16());
                 for &name in RECORDED_HEADERS {
                     if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok())
                     {
-                        evidence
-                            .headers
-                            .insert(name.into(), value.chars().take(1024).collect());
+                        evidence.headers.insert(
+                            name.into(),
+                            self.access.redact(value).chars().take(1024).collect(),
+                        );
                     }
                 }
                 loop {
@@ -468,6 +531,10 @@ impl LiveBroker {
                         }
                     }
                 }
+                received = self
+                    .access
+                    .redact(&String::from_utf8_lossy(&received))
+                    .into_bytes();
                 evidence.body_sha256 = Some(hex::encode(Sha256::digest(&received)));
                 evidence.body_excerpt = String::from_utf8_lossy(&received)
                     .chars()
@@ -576,7 +643,17 @@ impl LiveBroker {
             .trim();
         let assessment = parse_assessment(cleaned);
         let count = self.counters.lock().expect("live counters poisoned");
-        let (tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
+        let (mut tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
+        for run in &mut tool_runs {
+            run.arguments
+                .iter_mut()
+                .for_each(|v| *v = self.access.redact(v));
+            let cleaned = self.access.redact(&run.output_excerpt);
+            if cleaned != run.output_excerpt {
+                run.output_sha256 = hex::encode(Sha256::digest(cleaned.as_bytes()));
+                run.output_excerpt = cleaned;
+            }
+        }
         let passed = passed && tools_valid;
         let mut result = PentestResult {
             kind: PentestResultKind::PentestAgentV1,
@@ -603,10 +680,16 @@ impl LiveBroker {
                     Some(report.failure_reason.unwrap_or(report.outcome).to_owned())
                 },
             },
-            assessment,
+            assessment: assessment.and_then(|a| {
+                let mut value = serde_json::to_value(a).ok()?;
+                self.access.redact_json(&mut value);
+                serde_json::from_value(value).ok()
+            }),
             evidence: count.evidence.clone(),
             tool_runs,
             raw_summary: {
+                let redacted = self.access.redact(raw);
+                let raw = redacted.as_str();
                 let mut end = raw.len().min(24000);
                 while !raw.is_char_boundary(end) {
                     end -= 1;
@@ -637,7 +720,7 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
         if let Ok(run) = parsed {
             bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
-            if records.len() < 16 && bytes <= 256 * 1024 && run.valid(evidence) {
+            if records.len() < 20 && bytes <= 256 * 1024 && run.valid(evidence) {
                 records.push(run);
                 continue;
             }
@@ -713,6 +796,8 @@ mod tests {
         LiveBroker::new(
             file.path(),
             LiveScope {
+                authentication: None,
+                auth_check_path: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
@@ -844,6 +929,54 @@ mod tests {
         assert_eq!(count.calls, 0);
         assert!(count.evidence.is_empty());
         assert_eq!(count.reserved, 0);
+    }
+    #[test]
+    fn plaintext_credentials_never_enter_the_container_assignment() {
+        let scope:LiveScope=serde_json::from_value(json!({"origins":["https://example.com"],"methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1","tools":["authenticated_http_v1"],"authentication":"bearer","auth_check_path":"/private"})).unwrap();
+        let scope = scope.normalized().unwrap();
+        let hash = scope.hash().unwrap();
+        let task = Task {
+            role: ReviewRole::Investigator,
+            scope_sha256: hash.clone(),
+            evidence: PentestEvidence {
+                context: PentestContext {
+                    pentest_id: uuid::Uuid::new_v4(),
+                    scope,
+                    scope_sha256: hash,
+                    reviewers: vec![],
+                    provider: "abliteration.ai".into(),
+                },
+                previous_reports: vec![],
+                credentials: Some(TestCredentials::Bearer {
+                    token: "synthetic-test-token-never-for-model".into(),
+                }),
+            },
+        };
+        let bytes = task.input().unwrap();
+        let encoded = String::from_utf8(bytes).unwrap();
+        assert!(!encoded.contains("synthetic-test-token"));
+        let input: Value = serde_json::from_str(&encoded).unwrap();
+        assert!(input["evidence"].get("credentials").is_none());
+        assert!(encoded.contains("auth_check_path"));
+    }
+    #[tokio::test]
+    async fn active_scope_rejects_unapproved_bodies_and_header_overrides_before_io() {
+        let mut broker = broker();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV1);
+        inner.scope.tools = vec![LiveToolProfile::ActiveWebV1];
+        for body in [
+            json!({"method":"POST","url":"https://example.com/","headers":{"content-type":"text/plain"},"data":"test"}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"content-type":"application/json"},"data":"{"}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"content-type":"application/json"},"data":"x".repeat(16385)}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"Content-Type":"application/json","content-type":"application/json"},"data":"{}"}),
+            json!({"method":"POST","url":"https://example.com/","headers":{"Cookie":"injected"}}),
+            json!({"method":"POST","url":"https://elsewhere.example/","data":"{}"}),
+        ] {
+            assert!(broker.http(body).await.is_err());
+        }
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
     }
     #[test]
     fn provider_cannot_be_rerouted_by_runtime_fields_or_target_text() {

@@ -30,10 +30,10 @@ MAX_PAGES = 12
 NUCLEI_VERSION = "3.11.1"
 
 
-def fetch_checked(fetch, method, url, headers=None):
+def fetch_checked(fetch, method, url, headers=None, **kwargs):
     """A transport failure stays incomplete; never replace it with HTTP 200."""
     try:
-        return fetch(method, url, headers or {})
+        return fetch(method, url, headers or {}, **kwargs)
     except (OSError, ValueError, URLError):
         return {"error": "request_error", "body": "", "evidence": {}}
 
@@ -169,7 +169,8 @@ def crawl(origin, deadline, fetch=request):
 
 class ScopeMirror:
     """The scanner's loopback URL maps to exactly one approved origin."""
-    def __init__(self, origin, deadline, fetch=request):
+    def __init__(self, origin, deadline, fetch=request, methods=None):
+        self.methods = methods or ["GET", "HEAD", "OPTIONS"]
         self.origin, self.fetch, self.deadline, self.refs = origin, fetch, deadline, []
         mirror = self
 
@@ -186,14 +187,21 @@ class ScopeMirror:
             def do_OPTIONS(self):
                 self.exchange()
 
+            def do_POST(self):
+                self.exchange()
+
             def exchange(self):
                 self.close_connection = True
                 # BaseHTTPRequestHandler normalizes a leading //; reject the
                 # original target before that normalization can hide it.
                 raw_target = self.requestline.split(" ", 2)[1]
-                if (time.monotonic() >= mirror.deadline or not self.path.startswith("/")
+                raw_length = self.headers.get("Content-Length", "0")
+                if not raw_length.isdecimal() or len(self.headers.get_all("Content-Length", [])) > 1:
+                    self.send_error(400); return
+                length = int(raw_length)
+                if (self.command not in mirror.methods or length > 16384 or self.command != "POST" and length != 0
+                        or time.monotonic() >= mirror.deadline or not self.path.startswith("/")
                         or raw_target.startswith("//") or not allowed(origin, origin + self.path)
-                        or self.headers.get("Content-Length", "0") != "0"
                         or self.headers.get("Transfer-Encoding")
                         or self.headers.get("Host") != f"127.0.0.1:{self.server.server_port}"):
                     self.send_error(400)
@@ -201,7 +209,15 @@ class ScopeMirror:
                 headers = {k: v for k, v in self.headers.items()
                            if k.lower() not in ("host", "connection", "content-length", "accept-encoding", "user-agent")}
                 try:
-                    reply = fetch_checked(mirror.fetch, self.command, origin + self.path, headers)
+                    self.connection.settimeout(2)
+                    raw = self.rfile.read(length) if length else b""
+                    if len(raw) != length:
+                        self.send_error(400); return
+                    data = raw.decode("utf-8") if length else None
+                    if data is not None and self.headers.get("Content-Type", "").split(';')[0].strip() not in ("application/json", "application/x-www-form-urlencoded"):
+                        self.send_error(415); return
+                    kwargs = {"data": data} if data is not None else {}
+                    reply = fetch_checked(mirror.fetch, self.command, origin + self.path, headers, **kwargs)
                     evidence = reply.get("evidence", {})
                     if evidence.get("id"):
                         mirror.refs.append(evidence["id"])
@@ -210,6 +226,11 @@ class ScopeMirror:
                     self.send_response(status or 502)
                     for name, value in evidence.get("headers", {}).items():
                         if name.lower() not in ("connection", "content-length", "transfer-encoding", "content-encoding") and "\r" not in value and "\n" not in value:
+                            if name.lower() == "location":
+                                destination = urljoin(origin + self.path, value)
+                                if allowed(origin, destination):
+                                    parsed = urlsplit(destination)
+                                    value = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
                             self.send_header(name, value)
                     self.send_header("Content-Length", str(len(payload)))
                     self.send_header("Connection", "close")
@@ -279,9 +300,16 @@ def controls(origin, deadline, previous, fetch=request):
                   1 if failure else 0, failure)
 
 
+def fetch_checked_request(method, url, **kwargs):
+    return fetch_checked(request, method, url, **kwargs)
+
+
 def run(scope, previous, directory=Path("/work"), emit=lambda _: None):
     deadline = time.monotonic() + 180
-    records = []
+    import baseline
+    initial = baseline.run(scope, deadline, fetch_checked_request, record)
+    records = [initial]
+    emit(initial)
     for origin in scope["origins"]:
         checks = [lambda: crawl(origin, deadline), lambda: scanner(origin, deadline), lambda: controls(origin, deadline, previous)]
         for check in checks:

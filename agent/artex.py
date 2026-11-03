@@ -71,7 +71,7 @@ def task_body(scope, targets, seconds, role):
             'These mirrors forward real requests to their corresponding approved websites. They are not the ARTEX admin API. '
             'Inspect the reachable application, use suitable installed tools, validate material leads with benign control requests and record your findings. '
             'Finish within the supplied time and request allowance. Reporting coverage limits is a valid outcome; do not keep creating new work. '
-            'Only GET, HEAD and OPTIONS are approved. No form submissions, credentials, account changes, fund movement, brute force, load testing or persistence. '
+            'Use only the methods in the approved scope. POST is available only in web_active_v1 for the owner-approved disposable test environment; use JSON or URL-encoded bodies up to 16 KiB. The relay injects any declared test account; never ask for credentials. No fund movement, real purchases, brute force, load testing or persistence. '
             'External network and other hosts are unavailable. Some absolute links and redirects cannot be followed through a mirror; record that limit. '
             'The mirrors return selected response headers and bounded decoded text. They cannot establish TLS configuration, binary-file behavior or real browser execution. '
             'Do not call static reflection a proven XSS exploit. Do not install tools. Use only the reported target HTTP responses as evidence. '
@@ -221,7 +221,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None):
         if time.monotonic() >= deadline:
             raise TimeoutError('no engine time remaining')
         with ExitStack() as stack:
-            mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or request)) for origin in scope['origins']]
+            mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or request, methods=scope['methods'])) for origin in scope['origins']]
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline))
             try:
                 result = engine.assess(scope, [mirror.url for mirror in mirrors], role)
@@ -240,7 +240,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None):
     result['limitations'] = [
         'This is the full upstream planner/worker engine under the approved web profile; it does not run every installed skill or optional external tool.',
         'Only recorded broker requests establish that a target was contacted. Engine findings and command counts are not independent verification.',
-        'No form submissions, login tests, network discovery, external callbacks or unrestricted egress were allowed. Missing binaries and blocked tests are coverage gaps.',
+        'Only the methods and test-account access declared in scope were allowed. Browser login, network discovery, external callbacks and unrestricted egress are unsupported. Missing binaries and blocked tests are coverage gaps.',
         'A budget-limited run may contain useful findings while leaving goals unfinished. Review its stop reason and the later agents’ control requests.',
     ]
     # Keep coverage and stop information ahead of potentially long transcripts

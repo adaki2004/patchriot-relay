@@ -27,10 +27,10 @@ COPY --from=engine /src/skills /opt/artex/skills
 COPY --from=engine /src/LICENSE /usr/share/licenses/artex/LICENSE
 COPY --from=engine /tmp/artex.tar.gz /usr/share/licenses/artex/corresponding-source.tar.gz
 COPY --from=engine /out/dependency-source.tar.gz /usr/share/licenses/artex/dependency-source.tar.gz
-COPY adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py artex.py /patchriot/
+COPY adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py baseline.py artex.py /patchriot/
 COPY templates /patchriot/templates
 USER 65534:65534
 WORKDIR /work
 ENV HOME=/opt/data HERMES_HOME=/opt/data/hermes PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/hermes TERMINAL_ENV=local TERMINAL_CWD=/work HERMES_API_TIMEOUT=540 NORMA_RIPGREP_NO_INSTALL=1
-LABEL io.patchriot.agent-adapter="7"
+LABEL io.patchriot.agent-adapter="8"
 ENTRYPOINT ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"]
