@@ -11,7 +11,7 @@ def request(method, url, headers=None, data=None, authenticated=True):
     req = Request(os.environ["PATCHRIOT_BRIDGE_URL"] + "/patchriot/http", data=body,
                   headers={"Content-Type": "application/json"})
     try:
-        with urlopen(req, timeout=25) as response:
+        with urlopen(req, timeout=75) as response:
             return json.loads(response.read(2 * 1024 * 1024))
     except HTTPError as error:
         return json.loads(error.read(8192))

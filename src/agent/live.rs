@@ -5,6 +5,7 @@ use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunSta
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
+mod login;
 
 pub const MODEL: &str = "abliterated-model-large-v2";
 const API: &str = "https://api.abliteration.ai/v1";
@@ -106,6 +107,22 @@ struct Counters {
     evidence: Vec<HttpEvidence>,
     evidence_bytes: usize,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Probe {
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default = "enabled")]
+    authenticated: bool,
+}
+fn enabled() -> bool {
+    true
+}
+
 pub struct LiveBroker {
     client: reqwest::Client,
     key: zeroize::Zeroizing<String>,
@@ -113,6 +130,9 @@ pub struct LiveBroker {
     deadline: Instant,
     counters: Mutex<Counters>,
     access: access::Access,
+    login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
+    #[cfg(test)]
+    test_target: Option<SocketAddr>,
 }
 impl LiveBroker {
     pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
@@ -184,6 +204,9 @@ impl LiveBroker {
             deadline,
             counters: Mutex::new(Counters::default()),
             access,
+            login_state: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_target: None,
         }))
     }
     pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
@@ -374,23 +397,22 @@ impl LiveBroker {
     }
 
     async fn http(&self, body: Value) -> Result<Value, &'static str> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Probe {
-            method: String,
-            url: String,
-            #[serde(default)]
-            headers: BTreeMap<String, String>,
-            #[serde(default)]
-            data: Option<String>,
-            #[serde(default = "enabled")]
-            authenticated: bool,
-        }
-        fn enabled() -> bool {
-            true
-        }
         let probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
-        let url = self.scope.permits(&probe.method, &probe.url)?;
+        self.probe_url(&probe, false)?;
+        if probe.authenticated {
+            self.ensure_session().await?;
+        }
+        self.exchange(probe, false).await
+    }
+
+    fn probe_url(&self, probe: &Probe, login: bool) -> Result<url::Url, &'static str> {
+        let url = if login && self.scope.permits_login(&probe.method, &probe.url) {
+            public_url(&probe.url)?
+        } else if login {
+            return Err("outside_approved_scope");
+        } else {
+            self.scope.permits(&probe.method, &probe.url)?
+        };
         if let Some(data) = &probe.data {
             let content = probe
                 .headers
@@ -438,6 +460,14 @@ impl LiveBroker {
         {
             return Err("unsupported_probe_headers");
         }
+        Ok(url)
+    }
+
+    async fn exchange(&self, probe: Probe, login: bool) -> Result<Value, &'static str> {
+        let url = self.probe_url(&probe, login)?;
+        if Instant::now() >= self.deadline {
+            return Err("role_deadline_reached");
+        }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
             if count.evidence.len() >= MAX_HTTP_REQUESTS
@@ -449,31 +479,28 @@ impl LiveBroker {
         // Calls are serialized by the supervised bridge. This pause caps the
         // rate even when the model launches a loop in its terminal tool.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let host = url.host_str().ok_or("target_hostname_required")?;
-        let addresses: Vec<SocketAddr> =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
-                .await
-                .map_err(|_| "target_dns_timeout")?
-                .map_err(|_| "target_dns_failed")?
-                .collect();
-        let client = target_client(host, &addresses)?
-            .build()
-            .map_err(|_| "target_client_unavailable")?;
+        let (client, destination) = self.target_transport(&url).await?;
         let method = reqwest::Method::from_bytes(probe.method.as_bytes())
             .map_err(|_| "unsupported_method")?;
         let mut request = client
-            .request(method, url.clone())
+            .request(method, destination)
             .header("user-agent", "Patchriot-authorized-review/0.0.2");
         for (key, value) in &probe.headers {
             request = request.header(key, value);
         }
-        let authorization = self.access.authorization(probe.authenticated);
+        let authenticated = !login
+            && self.scope.authentication.is_some()
+            && self.access.authenticated(&url, probe.authenticated);
         request = self.access.apply(request, &url, probe.authenticated);
         if let Some(data) = &probe.data {
             request = request.body(data.clone());
         }
         let response = request.send().await;
-        let retained_body = probe.data.as_ref().map(|v| self.access.redact(v));
+        let retained_body = if login {
+            None
+        } else {
+            probe.data.as_ref().map(|v| self.access.redact(v))
+        };
         let mut evidence = HttpEvidence {
             request_body_excerpt: retained_body
                 .as_ref()
@@ -481,11 +508,16 @@ impl LiveBroker {
             request_body_sha256: retained_body
                 .as_ref()
                 .map(|v| hex::encode(Sha256::digest(v.as_bytes()))),
-            authenticated: authorization.is_some(),
+            authenticated,
+            login,
             id: 0,
             method: probe.method,
             url: probe.url,
-            request_headers: probe.headers,
+            request_headers: if login {
+                BTreeMap::new()
+            } else {
+                probe.headers
+            },
             status: None,
             headers: BTreeMap::new(),
             body_excerpt: String::new(),
@@ -498,6 +530,7 @@ impl LiveBroker {
                 .as_secs() as i64,
         };
         let mut received = Vec::new();
+        let mut login_redirect = None;
         let mut body_truncated = false;
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
@@ -505,6 +538,13 @@ impl LiveBroker {
                 self.access
                     .remember(&url, response.headers(), probe.authenticated);
                 evidence.status = Some(response.status().as_u16());
+                if login {
+                    login_redirect = response
+                        .headers()
+                        .get("location")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                }
                 for &name in RECORDED_HEADERS {
                     if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok())
                     {
@@ -534,9 +574,12 @@ impl LiveBroker {
                         }
                     }
                 }
-                let (redacted, shortened) = self
-                    .access
-                    .redact_limited(&String::from_utf8_lossy(&received), 256 * 1024);
+                let (redacted, shortened) = if login {
+                    (String::from_utf8_lossy(&received).into_owned(), false)
+                } else {
+                    self.access
+                        .redact_limited(&String::from_utf8_lossy(&received), 256 * 1024)
+                };
                 received = redacted.into_bytes();
                 body_truncated |= shortened;
                 evidence.truncated |= shortened;
@@ -548,14 +591,53 @@ impl LiveBroker {
                 evidence.truncated |= evidence.body_excerpt.len() < received.len();
             }
         }
+        if login {
+            evidence.headers.clear();
+            evidence.body_excerpt.clear();
+            evidence.body_sha256 = None;
+            evidence.truncated = true;
+        }
         let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
         evidence.id = count.evidence.len() as u32 + 1;
         count.evidence_bytes += serde_json::to_vec(&evidence)
             .map_err(|_| "evidence_encoding_failed")?
             .len();
-        let reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":body_truncated});
+        let mut reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":body_truncated});
         count.evidence.push(evidence);
+        if login {
+            reply["login_redirect"] = json!(login_redirect);
+        }
         Ok(reply)
+    }
+    async fn target_transport(
+        &self,
+        url: &url::Url,
+    ) -> Result<(reqwest::Client, url::Url), &'static str> {
+        #[cfg(test)]
+        if let Some(address) = self.test_target {
+            let mut destination = url.clone();
+            destination.set_scheme("http").unwrap();
+            destination.set_host(Some("127.0.0.1")).unwrap();
+            destination.set_port(Some(address.port())).unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            return Ok((client, destination));
+        }
+        let host = url.host_str().ok_or("target_hostname_required")?;
+        let addresses: Vec<SocketAddr> =
+            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
+                .await
+                .map_err(|_| "target_dns_timeout")?
+                .map_err(|_| "target_dns_failed")?
+                .collect();
+        let client = target_client(host, &addresses)?
+            .build()
+            .map_err(|_| "target_client_unavailable")?;
+        Ok((client, url.clone()))
     }
     pub async fn respond(&self, request: Request, output: mpsc::Sender<Frame>) {
         if is_chat_path(&request.path) {
@@ -826,6 +908,7 @@ mod tests {
             LiveScope {
                 authentication: None,
                 auth_check_path: None,
+                session_login: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],

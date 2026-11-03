@@ -177,7 +177,7 @@ Use an Ollama model that supports tools and a 64,000-token context. Its **stored
 
 After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept owned-example checks submitted through the website. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
 
-For a slow CPU pilot, set `max_attempt_seconds` to at most `3600` and rebuild the current adapter 9 image. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
+For a slow CPU pilot, set `max_attempt_seconds` to at most `3600` and rebuild the current adapter 10 image. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
 
 **Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall by default. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
 
@@ -278,7 +278,7 @@ For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pin
 
 ## Opt in to private source reviews
 
-Build the current **adapter 9** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
+Build the current **adapter 10** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
 
 ```sh
 cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --source-reviews
@@ -352,3 +352,5 @@ POST requires an immutable `web_active_v1` scope and requester consent to change
 **Rolling upgrades:** update core before exposing new capability names, then update dispatcher/gateway, then the relays. Old core versions reject unknown capability names. Advanced options become available only when all selected components support them.
 
 The hosted calibration run uses 3,600 seconds per role (set both the dispatcher’s `PATCHRIOT_AGENT_ATTEMPT_SECONDS` and the relay’s `max_attempt_seconds`). The combined three-role ceiling is $30 of conservative model allowance; it is not a customer price or a forecast of the bill. ARTEX receives at most half the calls. The final-report reserve remains enforced. Deploy core and dispatcher/gateway with the expanded protocol limit and migration 20 before upgrading relays; existing assignments keep their saved time limits.
+
+**Session login (adapter 10):** `session_login_v1` adds a single form or JSON POST to the exact owner-declared login endpoint, optionally preceded by the declared login page for a hidden CSRF token. The relay owns the password and session cookie; the agent never receives them. Login request/response bodies and headers are withheld from evidence. The resulting cookie is used only within the approved origin; anonymous controls send no cookie or account. Login is attempted once per role, including on failure. Redirects are not followed. The protected endpoint must return 2xx with the account and 401/403 without it before authenticated coverage is complete. SSO, MFA, CAPTCHA, JavaScript-driven login and token-only JSON responses are unsupported. Other POST actions still need their separate scope permission. Deploy dispatcher migration 24 and the matching core before upgrading relays.

@@ -82,20 +82,20 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5", "6", "7", "8", "9"].contains(
+            || !["2", "3", "4", "5", "6", "7", "8", "9", "10"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5", "6", "7", "8", "9"].contains(
+                && !["3", "4", "5", "6", "7", "8", "9", "10"].contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–9; longer CPU budgets require adapter 3–9"
+                "website reviews require adapter 2–10; longer CPU budgets require adapter 3–10"
                     .into(),
             );
         }
@@ -107,11 +107,11 @@ impl Settings {
             || image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("5" | "6" | "7" | "8" | "9")
+                Some("5" | "6" | "7" | "8" | "9" | "10")
             )
         {
             return Err(
-                "live tests require the inspected adapter 5–9 and a private provider key file"
+                "live tests require the inspected adapter 5–10 and a private provider key file"
                     .into(),
             );
         }
@@ -124,7 +124,14 @@ impl Settings {
         self.require_live_adapter()?;
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         Ok(
-            if matches!(
+            if image["Config"]["Labels"]["io.patchriot.agent-adapter"] == "10" {
+                vec![
+                    patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1,
+                    patchriot_protocol::pentests::LiveToolProfile::ActiveWebV1,
+                    patchriot_protocol::pentests::LiveToolProfile::AuthenticatedHttpV1,
+                    patchriot_protocol::pentests::LiveToolProfile::SessionLoginV1,
+                ]
+            } else if matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
                 Some("8" | "9")
             ) {
@@ -145,7 +152,7 @@ impl Settings {
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -695,13 +702,13 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3", "4", "5", "6", "7", "8", "9"].contains(
+        || !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5", "6", "7", "8", "9"].contains(
+            && !["2", "3", "4", "5", "6", "7", "8", "9", "10"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -709,14 +716,14 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10")
             )
         || live
             .as_ref()
             .is_some_and(|task| !task.evidence.context.scope.tools.is_empty())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("7" | "8" | "9")
+                Some("7" | "8" | "9" | "10")
             )
         || live.as_ref().is_some_and(|task| {
             task.evidence
@@ -727,10 +734,14 @@ pub fn run(
                 .any(|tool| *tool != patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
         }) && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("8" | "9")
+            Some("8" | "9" | "10")
         )
+        || live
+            .as_ref()
+            .is_some_and(|task| task.evidence.context.scope.session_login.is_some())
+            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "10"
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5", "6", "7", "8", "9"].contains(
+            && !["3", "4", "5", "6", "7", "8", "9", "10"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
