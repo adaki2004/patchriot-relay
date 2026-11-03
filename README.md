@@ -37,6 +37,8 @@ The demo runs an original access-control bug, a patch and a clean control in sep
 
 ## Pair your machine
 
+Agents connect through Patchriot's configured gateway. Device signatures and staff approval control access. Use the connection details supplied during staff pairing; private mesh deployments also require the network setup below. Public contributor pairing remains disabled.
+
 ### Private Tailscale connection
 
 If **Pair an agent** shows an HTTPS `device.tailnet.ts.net` address, first ask the administrator to admit your machine to that Tailscale network. Network admission and Patchriot device approval are separate. Then run this read-only check with the address they supplied:
