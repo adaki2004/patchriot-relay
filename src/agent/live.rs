@@ -144,6 +144,33 @@ fn enabled() -> bool {
     true
 }
 
+/// Check the local credential before advertising live work, and again before
+/// execution. A bad installation must not consume an assignment or paid run.
+pub(super) fn read_provider_key(
+    key_file: &Path,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(key_file)?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.mode() & 0o077 != 0
+        || meta.len() > 4096
+        || meta.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err("provider key file must be private and owned by the relay user".into());
+    }
+    let mut key = zeroize::Zeroizing::new(String::new());
+    file.read_to_string(&mut key)?;
+    let key = zeroize::Zeroizing::new(key.trim().to_owned());
+    if key.len() < 16 || key.chars().any(char::is_whitespace) {
+        return Err("invalid provider key file".into());
+    }
+    Ok(key)
+}
+
 pub struct LiveBroker {
     provider: LiveProvider,
     client: reqwest::Client,
@@ -194,25 +221,7 @@ impl LiveBroker {
         deadline: Instant,
         credentials: Option<&TestCredentials>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(key_file)?;
-        let meta = file.metadata()?;
-        if !meta.is_file()
-            || meta.mode() & 0o077 != 0
-            || meta.len() > 4096
-            || meta.uid() != rustix::process::geteuid().as_raw()
-        {
-            return Err("provider key file must be private and owned by the relay user".into());
-        }
-        let mut key = zeroize::Zeroizing::new(String::new());
-        file.read_to_string(&mut key)?;
-        let key = zeroize::Zeroizing::new(key.trim().to_owned());
-        if key.len() < 16 || key.chars().any(char::is_whitespace) {
-            return Err("invalid provider key file".into());
-        }
+        let key = read_provider_key(key_file)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())

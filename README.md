@@ -210,7 +210,7 @@ Each role gets at most four model calls, 512 output tokens per call and the earl
 
 ## Opt in to live website tests
 
-This is a separate, manually approved pilot. Pair a device declaring Hermes and `abliterated-model-large-v2`, receive private-work approval and build **adapter 6**. Keep the provider key in a separate mode-`0600` file owned by the relay’s Unix account. It never enters the task container, browser or dispatcher.
+This is a separate, manually approved pilot. Pair a device declaring Hermes and `abliterated-model-large-v2`, receive private-work approval and build **adapter 6**. Keep the provider key in a separate mode-`0600` file owned by the relay’s Unix account. The relay checks that file before advertising live capacity, on each work poll and before execution. An invalid key file stops admission before an assignment is accepted. It never enters the task container, browser or dispatcher.
 
 <details>
 <summary><strong>Hosted model configuration and start command</strong></summary>

@@ -102,6 +102,13 @@ impl Settings {
         Ok(())
     }
     pub fn require_live_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // This runs before the first heartbeat/poll and before each later poll.
+        // Do not offer capacity that cannot read its private provider credential.
+        live::read_provider_key(
+            self.live_provider_key_file
+                .as_deref()
+                .ok_or("live tests require a private provider key file")?,
+        )?;
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         if patchriot_protocol::pentests::LiveProvider::from_model(&self.model)
             == Some(patchriot_protocol::pentests::LiveProvider::Venice)
@@ -1413,6 +1420,48 @@ mod tests {
             assert!(Settings::load(file.path()).is_err());
         }
     }
+    #[test]
+    fn invalid_provider_key_stops_live_admission_before_docker_or_work_polling() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("provider.key");
+        let config = directory.path().join("agent.json");
+        std::fs::write(&key, "synthetic-provider-credential-for-tests").unwrap();
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "docker_socket": directory.path().join("absent-docker.sock"),
+                "image": format!("sha256:{}", "b".repeat(64)),
+                "model_url":"https://api.venice.ai/api/v1",
+                "model":"abliteration-abliterated-model-large-v2",
+                "model_digest":"", "live_provider_key_file":key
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let settings = Settings::load(&config).unwrap();
+        for mode in [0o644, 0o640] {
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                settings.require_live_adapter().unwrap_err().to_string(),
+                "provider key file must be private and owned by the relay user"
+            );
+        }
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !settings
+                .require_live_adapter()
+                .unwrap_err()
+                .to_string()
+                .contains("provider key")
+        );
+        std::fs::write(&key, "invalid").unwrap();
+        assert_eq!(
+            settings.require_live_adapter().unwrap_err().to_string(),
+            "invalid provider key file"
+        );
+    }
+
     #[test]
     fn hosted_model_configuration_requires_the_matching_fixed_provider() {
         use patchriot_protocol::pentests::LiveProvider;
