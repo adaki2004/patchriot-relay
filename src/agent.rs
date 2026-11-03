@@ -266,10 +266,14 @@ impl Bridge {
             Self::Live(_) => 600,
         }
     }
-    fn max_calls(&self) -> usize {
+    fn model_attempt_limit(&self) -> Option<usize> {
         match self {
-            Self::Local(_) => 4,
-            Self::Live(_) => 48,
+            Self::Local(_) => Some(4),
+            // The live broker caps actual provider calls and spend. ARTEX may
+            // retry its locally rejected requests while shutting down; charging
+            // those attempts to the 48-call allowance killed the final report.
+            // Transport still has a separate 600-request and execution deadline.
+            Self::Live(_) => None,
         }
     }
     fn max_tokens(&self) -> u64 {
@@ -471,7 +475,7 @@ async fn supervise(
                             last_id = request.id;
                             active = Some(request.id);
                             if live::is_chat_path(&request.path) {
-                                if report.inference_calls >= broker.max_calls() {
+                                if broker.model_attempt_limit().is_some_and(|limit| report.inference_calls >= limit) {
                                     report.outcome = "inference_limit";
                                     break 'running;
                                 }
@@ -488,7 +492,7 @@ async fn supervise(
                                     eprintln!("runtime output request capped at {} tokens", broker.max_tokens());
                                 }
                                 report.inference_calls += 1;
-                                eprintln!("agent requested model call {}", report.inference_calls);
+                                eprintln!("agent requested model attempt {}", report.inference_calls);
                             }
                             if let Some(previous) = task.0.take() {
                                 previous.abort();
@@ -575,7 +579,7 @@ async fn supervise(
     }
     report.duration_ms = started.elapsed().as_millis();
     eprintln!(
-        "agent stopped: outcome={} exit_code={:?} inference_calls={} final_event={} duration_ms={}",
+        "agent stopped: outcome={} exit_code={:?} inference_attempts={} final_event={} duration_ms={}",
         report.outcome, report.exit_code, report.inference_calls, final_seen, report.duration_ms,
     );
     Ok(report)

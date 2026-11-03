@@ -765,6 +765,70 @@ mod tests {
         assert_eq!(observed.inference_calls, 0);
     }
     #[tokio::test]
+    async fn rejected_engine_retries_do_not_consume_the_reviewers_call_allowance() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        broker.counters.lock().unwrap().calls = 24;
+        // Exercise the real supervised pipe and real 429 responses. The engine
+        // has spent its allowance; these retries must never contact a provider
+        // or prevent the subsequent final report from arriving.
+        let script = r#"
+            i=1
+            while [ "$i" -le 60 ]; do
+                printf '%s\n' '{"type":"request","request":{"id":'"$i"',"method":"POST","path":"/patchriot/artex/v1/chat/completions","body":{"model":"abliterated-model-large-v2","messages":[{"role":"user","content":"fixture"}]}}}'
+                while IFS= read -r frame; do
+                    case "$frame" in *'"type":"end"'*) break ;; esac
+                done
+                i=$((i + 1))
+            done
+            printf '%s\n' '{"type":"event","event":"phase","data":{"name":"agent_ready"}}'
+            printf '%s\n' '{"type":"event","event":"result","data":{"completed":true,"final_response":"saved fixture report"}}'
+        "#;
+        let mut command = std::process::Command::new("/bin/sh");
+        command.env_clear().args(["-c", script]);
+        let report = supervise(
+            command,
+            Bridge::Live(broker.clone()),
+            &|| false,
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "completed");
+        assert_eq!(
+            report.inference_calls, 60,
+            "transport attempts are distinct from paid calls"
+        );
+        assert_eq!(
+            report.events.last().unwrap()["data"]["final_response"],
+            "saved fixture report"
+        );
+        {
+            let count = broker.counters.lock().unwrap();
+            assert_eq!(count.calls, 24);
+            assert_eq!(count.reserved, 0);
+        }
+        // The spend and provider-call cap are still enforced by model(), as
+        // covered by the exhausted-budget regression below.
+        assert_eq!(Bridge::Live(broker.clone()).max_requests(), 600);
+        broker.counters.lock().unwrap().calls = 48;
+        let (tx, _rx) = mpsc::channel(4);
+        let request = Request {
+            id: 61,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(json!({"model":MODEL,"messages":[{"role":"user","content":"fixture"}]})),
+        };
+        assert_eq!(
+            broker.model(&request, &tx).await,
+            Err("provider_budget_reached")
+        );
+        assert_eq!(broker.counters.lock().unwrap().reserved, 0);
+    }
+
+    #[tokio::test]
     async fn prohibited_targets_and_credentials_never_reach_network_or_provider() {
         let broker = broker();
         for body in [
