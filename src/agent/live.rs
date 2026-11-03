@@ -15,7 +15,7 @@ pub fn is_chat_path(path: &str) -> bool {
 }
 // Generous pilot ceilings. Stop investigation early enough to save a report;
 // increasing time/calls must not let the engine spend the reviewer's reserve.
-const MAX_SPEND: u64 = 6_000_000;
+const MAX_SPEND: u64 = 10_000_000;
 const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
 const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
 const REVIEWER_RESERVE: u64 = 1_500_000;
@@ -908,7 +908,7 @@ mod tests {
         }
         // The spend and provider-call cap are still enforced by model(), as
         // covered by the exhausted-budget regression below.
-        assert_eq!(Bridge::Live(broker.clone()).max_requests(), 600);
+        assert_eq!(Bridge::Live(broker.clone()).max_requests(), 800);
         broker.counters.lock().unwrap().calls = MAX_LIVE_INFERENCE_CALLS;
         let (tx, _rx) = mpsc::channel(4);
         let request = Request {

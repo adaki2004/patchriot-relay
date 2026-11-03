@@ -165,7 +165,7 @@ impl Settings {
         if !(DEFAULT_AGENT_ATTEMPT_SECONDS..=MAX_AGENT_ATTEMPT_SECONDS)
             .contains(&settings.max_attempt_seconds)
         {
-            return Err("max_attempt_seconds must be 600..1800".into());
+            return Err("max_attempt_seconds must be 600..3600".into());
         }
         if settings.live_provider_key_file.is_some() {
             if settings.model != live::MODEL
@@ -269,7 +269,13 @@ impl Bridge {
     fn max_requests(&self) -> usize {
         match self {
             Self::Local(_) => 32,
-            Self::Live(_) => 600,
+            // Leave room for all allowed target/model calls and rejected local
+            // retries, so transport does not silently shorten either allowance.
+            Self::Live(_) => {
+                patchriot_protocol::pentests::MAX_HTTP_REQUESTS
+                    + usize::from(patchriot_protocol::pentests::MAX_LIVE_INFERENCE_CALLS)
+                    + 100
+            }
         }
     }
     fn model_attempt_limit(&self) -> Option<usize> {
@@ -278,7 +284,7 @@ impl Bridge {
             // The live broker caps actual provider calls and spend. ARTEX may
             // retry its locally rejected requests while shutting down; charging
             // those attempts to the provider-call allowance killed the final report.
-            // Transport still has a separate 600-request and execution deadline.
+            // Transport still has its own bounded allowance and execution deadline.
             Self::Live(_) => None,
         }
     }
@@ -1355,16 +1361,16 @@ mod tests {
             Settings::load(file.path()).unwrap().max_attempt_seconds(),
             600
         );
-        input["max_attempt_seconds"] = json!(1800);
+        input["max_attempt_seconds"] = json!(3600);
         std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
         assert_eq!(
             Settings::load(file.path()).unwrap().max_attempt_seconds(),
-            1800
+            3600
         );
         for value in [
             json!(599),
-            json!(1801),
-            json!("1800"),
+            json!(3601),
+            json!("3600"),
             json!(-1),
             json!(null),
         ] {

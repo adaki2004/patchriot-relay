@@ -50,9 +50,9 @@ class LiveOverviewTests(unittest.TestCase):
 
 class BridgeTests(unittest.TestCase):
     def test_execution_budget_is_explicit_bounded_and_not_model_controlled(self):
-        for value in ["600", "1200", "1800"]:
+        for value in ["600", "1200", "1800", "3600"]:
             self.assertEqual(adapter.execution_budget(value), int(value))
-        for value in ["", "0", "599", "1801", " 600", "600.0", "-600", "٦٠٠"]:
+        for value in ["", "0", "599", "3601", " 600", "600.0", "-600", "٦٠٠"]:
             with self.assertRaises(ValueError):
                 adapter.execution_budget(value)
 
