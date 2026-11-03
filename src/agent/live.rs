@@ -671,6 +671,7 @@ mod tests {
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
+                profile: None,
             },
             Instant::now() + Duration::from_secs(600),
         )
