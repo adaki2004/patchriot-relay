@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
 mod login;
+mod near;
 
 #[cfg(test)]
 pub const MODEL: &str = LiveProvider::MODELS[0];
@@ -174,6 +175,7 @@ pub(super) fn read_provider_key(
 pub struct LiveBroker {
     provider: LiveProvider,
     client: reqwest::Client,
+    near: Option<nearai_inference_sdk::InferenceClient>,
     key: zeroize::Zeroizing<String>,
     scope: LiveScope,
     deadline: Instant,
@@ -229,9 +231,15 @@ impl LiveBroker {
             .timeout(Duration::from_secs(180))
             .build()?;
         let access = access::Access::new(&scope, credentials)?;
+        let near = if provider == LiveProvider::NearDeepSeek {
+            Some(near::client(&key)?)
+        } else {
+            None
+        };
         Ok(Arc::new(Self {
             provider,
             client,
+            near,
             key,
             scope,
             deadline,
@@ -298,6 +306,11 @@ impl LiveBroker {
                     "enable_x_search":false
                 });
             }
+            LiveProvider::NearDeepSeek => {
+                body["store"] = json!(false);
+                // No provider search, fallback, model aliases or extra routing
+                // options from the agent. NEAR's SDK owns encrypted transport.
+            }
         }
         if let Some(tools) = input.get("tools") {
             if !tools.as_array().is_some_and(|v| {
@@ -335,7 +348,8 @@ impl LiveBroker {
         }
         // UTF-8 bytes conservatively bound text token usage. Reserve the entire
         // output allowance at published uncached prices, even if a call fails.
-        let reservation = (bytes.len() as u64 + 4096) * 3 + 8192 * 5;
+        let reservation = token_cost(self.provider, bytes.len() as u64 + 4096, 8192)
+            .ok_or("provider_budget_reached")?;
         {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
             // ARTEX has its own response format and planner. Stop it cleanly
@@ -349,6 +363,44 @@ impl LiveBroker {
             }
             count.calls += 1;
             count.reserved += reservation;
+        }
+        if let Some(client) = &self.near {
+            let stream = body["stream"] == true;
+            let completion = near::complete(client, body).await?;
+            let bytes = near::response_bytes(&completion, stream)?;
+            output
+                .send(Frame::Start {
+                    id: request.id,
+                    status: 200,
+                    content_type: if stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                })
+                .await
+                .map_err(|_| "agent_disconnected")?;
+            for chunk in bytes.chunks(4096) {
+                output
+                    .send(Frame::Chunk {
+                        id: request.id,
+                        hex: hex::encode(chunk),
+                    })
+                    .await
+                    .map_err(|_| "agent_disconnected")?;
+            }
+            if let Some(cost) = reported_cost(&bytes, stream, self.provider) {
+                let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+                count.reserved = count
+                    .reserved
+                    .saturating_sub(reservation)
+                    .saturating_add(cost);
+            }
+            output
+                .send(Frame::End { id: request.id })
+                .await
+                .map_err(|_| "agent_disconnected")?;
+            return Ok(());
         }
         let mut response = self
             .client
@@ -404,7 +456,7 @@ impl LiveBroker {
                     .map_err(|_| "agent_disconnected")?;
             }
         }
-        if let Some(cost) = reported_cost(&usage_bytes, body["stream"] == true) {
+        if let Some(cost) = reported_cost(&usage_bytes, body["stream"] == true, self.provider) {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
             count.reserved = count
                 .reserved
@@ -424,12 +476,15 @@ impl LiveBroker {
     }
     fn finish_before_limit(&self, body: &mut Value) -> Result<(), &'static str> {
         let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
-        let next = (serde_json::to_vec(body)
-            .map_err(|_| "invalid_model_request")?
-            .len() as u64
-            + 4096)
-            * 3
-            + 8192 * 5;
+        let next = token_cost(
+            self.provider,
+            serde_json::to_vec(body)
+                .map_err(|_| "invalid_model_request")?
+                .len() as u64
+                + 4096,
+            8192,
+        )
+        .ok_or("provider_budget_reached")?;
         if count.calls >= FINAL_REPORT_CALL
             || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180)
             || MAX_SPEND.saturating_sub(count.reserved) < next.saturating_mul(2) + 150_000
@@ -440,7 +495,11 @@ impl LiveBroker {
             body["tool_choice"] = json!("none");
             body["reasoning_effort"] = json!("low");
             // Formatting helps the closing turn, but cannot establish evidence.
-            body["response_format"] = assessment_format();
+            // DeepSeek's current NEAR route advertises tools, not structured
+            // output. Its final JSON still passes the same local validation.
+            if self.provider != LiveProvider::NearDeepSeek {
+                body["response_format"] = assessment_format();
+            }
             body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
         }
         Ok(())
@@ -892,15 +951,30 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
 
 /// Provider usage is a billing observation, not proof of an invoice. Charge
 /// uncached rates conservatively. Missing usage keeps the original reservation.
-fn reported_cost(bytes: &[u8], stream: bool) -> Option<u64> {
-    fn cost(v: &Value) -> Option<u64> {
+fn token_cost(provider: LiveProvider, input: u64, output: u64) -> Option<u64> {
+    // Published uncached USD per million tokens, checked 2026-11-03.
+    // Integer microdollars, rounded up; cached discounts are not assumed.
+    let (input_rate, output_rate) = match provider {
+        LiveProvider::Abliteration | LiveProvider::Venice => (3_000_000, 5_000_000),
+        LiveProvider::NearDeepSeek => (300_000, 1_200_000),
+    };
+    Some(
+        input
+            .checked_mul(input_rate)?
+            .checked_add(output.checked_mul(output_rate)?)?
+            .div_ceil(1_000_000),
+    )
+}
+
+fn reported_cost(bytes: &[u8], stream: bool, provider: LiveProvider) -> Option<u64> {
+    let cost = |v: &Value| -> Option<u64> {
         let p = v["usage"]["prompt_tokens"].as_u64()?;
         let c = v["usage"]["completion_tokens"].as_u64()?;
         if p == 0 || p > 10_000_000 || c > 1_000_000 {
             return None;
         }
-        p.checked_mul(3)?.checked_add(c.checked_mul(5)?)
-    }
+        token_cost(provider, p, c)
+    };
     if stream {
         bytes
             .split(|b| *b == b'\n')
@@ -1318,6 +1392,38 @@ mod tests {
         assert_eq!(broker.chat(&request), Err("wrong_model"));
     }
     #[test]
+    fn near_uses_its_pinned_model_and_closes_tools_without_unsupported_schema() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().provider = LiveProvider::NearDeepSeek;
+        let request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(json!({"model":LiveProvider::NearDeepSeek.model(),
+                "messages":[{"role":"user","content":"Owned example"}],
+                "tools":[{"type":"function","function":{"name":"terminal"}}],
+                "store":true,"base_url":"https://other.example","api_key":"must-not-forward",
+                "response_format":{"type":"json_schema"},"fallbacks":["other"]})),
+        };
+        let mut prepared = broker.chat(&request).unwrap();
+        assert_eq!(prepared["model"], LiveProvider::NearDeepSeek.model());
+        assert_eq!(prepared["store"], false);
+        for key in ["base_url", "api_key", "response_format", "fallbacks"] {
+            assert!(prepared.get(key).is_none());
+        }
+        broker.counters.lock().unwrap().calls = FINAL_REPORT_CALL;
+        broker.finish_before_limit(&mut prepared).unwrap();
+        assert!(prepared.get("tools").is_none());
+        assert!(prepared.get("response_format").is_none());
+        assert_eq!(prepared["tool_choice"], "none");
+        assert!(
+            prepared["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("unfinished checks")
+        );
+    }
+    #[test]
     fn mixed_provider_assignment_binds_each_role_and_rejects_a_false_disclosure() {
         let scope = broker().scope.clone();
         let mut selected = reviewers();
@@ -1437,18 +1543,33 @@ mod tests {
     }
     #[test]
     fn provider_usage_uses_uncached_prices_and_incomplete_usage_keeps_the_reservation() {
+        assert_eq!(token_cost(LiveProvider::NearDeepSeek, 1000, 200), Some(540));
+        assert_eq!(token_cost(LiveProvider::NearDeepSeek, 1, 0), Some(1));
+        assert_eq!(token_cost(LiveProvider::NearDeepSeek, u64::MAX, 1), None);
         let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":900}}}"#;
-        assert_eq!(reported_cost(body, false), Some(4000));
+        assert_eq!(
+            reported_cost(body, false, LiveProvider::Abliteration),
+            Some(4000)
+        );
         let stream = b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200}}\n\ndata: [DONE]\n\n";
-        assert_eq!(reported_cost(stream, true), Some(4000));
+        assert_eq!(
+            reported_cost(stream, true, LiveProvider::Abliteration),
+            Some(4000)
+        );
         for missing in [
             b"{}".as_slice(),
             br#"{"usage":{"prompt_tokens":1000}}"#,
             br#"{"usage":{"prompt_tokens":0,"completion_tokens":200}}"#,
         ] {
-            assert_eq!(reported_cost(missing, false), None);
+            assert_eq!(
+                reported_cost(missing, false, LiveProvider::Abliteration),
+                None
+            );
         }
-        assert_eq!(reported_cost(b"data: {\"usage\":", true), None);
+        assert_eq!(
+            reported_cost(b"data: {\"usage\":", true, LiveProvider::Abliteration),
+            None
+        );
     }
     #[tokio::test]
     async fn exhausted_cost_reservation_fails_before_a_provider_request() {

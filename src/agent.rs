@@ -271,12 +271,12 @@ pub fn recover(
 
 #[derive(Clone)]
 enum Bridge {
-    Local(Broker),
+    Local(Box<Broker>),
     Live(Arc<live::LiveBroker>),
 }
 impl From<Broker> for Bridge {
     fn from(b: Broker) -> Self {
-        Self::Local(b)
+        Self::Local(Box::new(b))
     }
 }
 impl Bridge {
@@ -810,7 +810,7 @@ pub fn run(
             &settings.model_digest,
             settings.max_attempt_seconds,
         ))?;
-        Bridge::Local(if let Some(task) = website {
+        Bridge::from(if let Some(task) = website {
             broker.for_website_review(&task.evidence.snapshot)
         } else if let Some(task) = source {
             broker.for_source_review(&task.evidence.bundle)
@@ -1468,7 +1468,11 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut input = json!({"docker_socket":"/var/run/docker.sock", "image":format!("sha256:{}", "b".repeat(64)),
             "model_url":"", "model":"", "model_digest":"", "live_provider_key_file":"/private/provider.key"});
-        for provider in [LiveProvider::Abliteration, LiveProvider::Venice] {
+        for provider in [
+            LiveProvider::Abliteration,
+            LiveProvider::Venice,
+            LiveProvider::NearDeepSeek,
+        ] {
             input["model"] = json!(provider.model());
             input["model_url"] = json!(provider.api_url());
             std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();

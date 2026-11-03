@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: adaki2004/patchriot-core
-          ref: 599094e85f9450f89bee58008ad0f33e5e69dc9c
+          ref: 439574c9e5b2676190504dfb4e53c307fc4859fa
           path: patchriot-core
           token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
           persist-credentials: false
@@ -40,13 +40,14 @@ jobs:
       - name: Build Linux x86-64 relay
         run: |
           mkdir -p target/release-linux
+          docker build --platform linux/amd64 -f scripts/release-builder.Dockerfile -t patchriot-release-builder scripts
           docker run --rm --platform linux/amd64 \
             --cap-drop ALL --security-opt no-new-privileges \
             -v "$GITHUB_WORKSPACE:/src:ro" \
             -v "$GITHUB_WORKSPACE/patchriot-relay/target/release-linux:/build" \
             -e CARGO_TARGET_DIR=/build -e CARGO_PROFILE_RELEASE_STRIP=symbols \
             -e RUSTUP_TOOLCHAIN=1.94.1 -w /src/patchriot-relay \
-            rust@sha256:7c094ad1afb45a61e28dd007a2add9d8ac171fd3a268e5f8f74b8aebe6c723ae \
+            patchriot-release-builder \
             sh -c 'cargo build --locked --release && mkdir -p /build/release/rust-notices && cp /usr/local/rustup/toolchains/1.94.1-x86_64-unknown-linux-musl/share/doc/rust/COPYRIGHT-library.html /build/release/rust-notices/ && cp -R /usr/local/rustup/toolchains/1.94.1-x86_64-unknown-linux-musl/share/doc/rust/licenses /build/release/rust-notices/'
       - name: Package and check the download
         id: package
