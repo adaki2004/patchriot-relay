@@ -450,18 +450,7 @@ impl LiveBroker {
                 .map_err(|_| "target_dns_timeout")?
                 .map_err(|_| "target_dns_failed")?
                 .collect();
-        if addresses.is_empty()
-            || addresses.len() > 32
-            || addresses.iter().any(|a| !public_ip(a.ip()))
-        {
-            return Err("target_dns_not_public");
-        }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &addresses)
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
+        let client = target_client(host, &addresses)?
             .build()
             .map_err(|_| "target_client_unavailable")?;
         let method = reqwest::Method::from_bytes(probe.method.as_bytes())
@@ -716,6 +705,28 @@ impl LiveBroker {
     }
 }
 
+/// Called afresh for every probe. A public answer on an earlier request cannot
+/// authorize a later private address. CNAME resolution never expands URL scope.
+fn target_client(
+    host: &str,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::ClientBuilder, &'static str> {
+    if addresses.is_empty()
+        || addresses.len() > 32
+        || addresses
+            .iter()
+            .any(|a| !public_ip(a.ip()) || a.port() != 443)
+    {
+        return Err("target_dns_not_public");
+    }
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addresses)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15)))
+}
+
 /// Only the fixed startup phase may attach tool transcripts. A later terminal
 /// print from the model cannot masquerade as that phase. HTTP evidence is still
 /// recorded separately by the Rust broker; neither source attests operator honesty.
@@ -930,6 +941,9 @@ mod tests {
         for body in [
             json!({"method":"GET","url":"http://169.254.169.254/latest/meta-data"}),
             json!({"method":"GET","url":"https://elsewhere.example"}),
+            json!({"method":"GET","url":"https://sub.example.com"}),
+            json!({"method":"GET","url":"https://example.com.elsewhere.example"}),
+            json!({"method":"GET","url":"https://user@example.com"}),
             json!({"method":"POST","url":"https://example.com"}),
             json!({"method":"GET","url":"https://example.com","headers":{"Authorization":"private"}}),
             json!({"method":"GET","url":"https://example.com","headers":{"Host":"internal"}}),
@@ -940,6 +954,62 @@ mod tests {
         assert_eq!(count.calls, 0);
         assert!(count.evidence.is_empty());
         assert_eq!(count.reserved, 0);
+    }
+    #[test]
+    fn dns_answers_are_rechecked_and_mixed_private_answers_are_rejected() {
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        assert!(target_client("owned.example", &[public]).is_ok());
+        for changed in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "169.254.169.254:443",
+            "[::1]:443",
+            "[fd00::1]:443",
+            "1.1.1.1:80",
+        ] {
+            let changed = changed.parse().unwrap();
+            assert!(target_client("owned.example", &[changed]).is_err());
+            assert!(target_client("owned.example", &[public, changed]).is_err());
+        }
+        assert!(target_client("owned.example", &[]).is_err());
+    }
+    #[tokio::test]
+    async fn target_transport_records_redirects_without_contacting_the_destination() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = original.local_addr().unwrap();
+        let destination = format!("http://{}/must-not-run", blocked.local_addr().unwrap());
+        let location = destination.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = original.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        // Only this test substitutes local transport after exercising the same
+        // client builder. Production accepts public HTTPS and has no override.
+        let client = target_client("owned.example", &["1.1.1.1:443".parse().unwrap()])
+            .unwrap()
+            .resolve("owned.example", address)
+            .build()
+            .unwrap();
+        let result = client
+            .get(format!("http://owned.example:{}/", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(result.headers()["location"], destination);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), blocked.accept())
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
     }
     #[test]
     fn plaintext_credentials_never_enter_the_container_assignment() {
