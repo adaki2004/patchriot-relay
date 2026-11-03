@@ -498,6 +498,7 @@ impl LiveBroker {
                 .as_secs() as i64,
         };
         let mut received = Vec::new();
+        let mut body_truncated = false;
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
             Ok(mut response) => {
@@ -519,22 +520,26 @@ impl LiveBroker {
                             let available = (256 * 1024usize).saturating_sub(received.len());
                             received.extend_from_slice(&chunk[..available.min(chunk.len())]);
                             if chunk.len() > available {
+                                body_truncated = true;
                                 evidence.truncated = true;
                                 break;
                             }
                         }
                         Ok(None) => break,
                         Err(_) => {
+                            body_truncated = true;
                             evidence.error = Some("target_body_interrupted".into());
                             evidence.truncated = true;
                             break;
                         }
                     }
                 }
-                received = self
+                let (redacted, shortened) = self
                     .access
-                    .redact(&String::from_utf8_lossy(&received))
-                    .into_bytes();
+                    .redact_limited(&String::from_utf8_lossy(&received), 256 * 1024);
+                received = redacted.into_bytes();
+                body_truncated |= shortened;
+                evidence.truncated |= shortened;
                 evidence.body_sha256 = Some(hex::encode(Sha256::digest(&received)));
                 evidence.body_excerpt = String::from_utf8_lossy(&received)
                     .chars()
@@ -548,7 +553,7 @@ impl LiveBroker {
         count.evidence_bytes += serde_json::to_vec(&evidence)
             .map_err(|_| "evidence_encoding_failed")?
             .len();
-        let reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":received.len()==256*1024});
+        let reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":body_truncated});
         count.evidence.push(evidence);
         Ok(reply)
     }
@@ -647,8 +652,9 @@ impl LiveBroker {
         for run in &mut tool_runs {
             run.arguments
                 .iter_mut()
-                .for_each(|v| *v = self.access.redact(v));
-            let cleaned = self.access.redact(&run.output_excerpt);
+                .for_each(|v| *v = self.access.redact_limited(v, 4096).0);
+            let (cleaned, shortened) = self.access.redact_limited(&run.output_excerpt, 24 * 1024);
+            run.output_truncated |= shortened;
             if cleaned != run.output_excerpt {
                 run.output_sha256 = hex::encode(Sha256::digest(cleaned.as_bytes()));
                 run.output_excerpt = cleaned;

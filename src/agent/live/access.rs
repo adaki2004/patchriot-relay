@@ -16,6 +16,18 @@ pub(super) struct Access {
     sessions: bool,
 }
 impl Access {
+    pub fn redact_limited(&self, value: &str, limit: usize) -> (String, bool) {
+        let mut text = self.redact(value);
+        let shortened = text.len() > limit;
+        if shortened {
+            let mut end = limit;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        (text, shortened)
+    }
     pub fn apply(
         &self,
         mut request: reqwest::RequestBuilder,
@@ -234,6 +246,15 @@ mod tests {
             access.redact("synthetic-bearer-for-tests synthetic-cookie-value"),
             "REDACTED REDACTED"
         );
+        let mut short = HeaderMap::new();
+        short.insert(
+            SET_COOKIE,
+            HeaderValue::from_static("short=x; Path=/; Secure"),
+        );
+        access.remember(&url, &short, true);
+        let (bounded, shortened) = access.redact_limited(&"xé".repeat(3000), 2048);
+        assert!(shortened && bounded.len() <= 2048 && !bounded.contains('x'));
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
         let mut value = serde_json::json!({"summary":"synthetic-cookie-value","evidence":["synthetic-bearer-for-tests"]});
         access.redact_json(&mut value);
         assert!(!value.to_string().contains("synthetic-"));
