@@ -7,8 +7,8 @@ use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
 mod login;
 
-pub const MODEL: &str = "abliterated-model-large-v2";
-const API: &str = "https://api.abliteration.ai/v1";
+#[cfg(test)]
+pub const MODEL: &str = LiveProvider::MODELS[0];
 pub const MAX_FRAME: usize = 512 * 1024;
 pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
 pub fn is_chat_path(path: &str) -> bool {
@@ -81,11 +81,32 @@ pub struct Task {
     pub evidence: PentestEvidence,
 }
 impl Task {
+    pub fn model(&self) -> Option<&str> {
+        let position = match self.role {
+            ReviewRole::Investigator => 0,
+            ReviewRole::Reproducer => 1,
+            ReviewRole::Challenger => 2,
+        };
+        self.evidence
+            .context
+            .reviewers
+            .get(position)
+            .map(|r| r.declared_model.as_str())
+    }
     pub fn input(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         if self.evidence.context.scope.normalized()? != self.evidence.context.scope
             || self.evidence.context.scope.hash()? != self.scope_sha256
             || self.evidence.context.scope_sha256 != self.scope_sha256
-            || self.evidence.context.provider != "abliteration.ai"
+            || live_providers(
+                self.evidence
+                    .context
+                    .reviewers
+                    .iter()
+                    .map(|r| r.declared_model.as_str()),
+            )
+            .as_deref()
+                != Some(self.evidence.context.provider.as_str())
+            || self.evidence.context.reviewers.len() != 3
             || self.evidence.previous_reports.len() > 2
         {
             return Err("invalid live assignment".into());
@@ -124,6 +145,7 @@ fn enabled() -> bool {
 }
 
 pub struct LiveBroker {
+    provider: LiveProvider,
     client: reqwest::Client,
     key: zeroize::Zeroizing<String>,
     scope: LiveScope,
@@ -163,9 +185,10 @@ impl LiveBroker {
         scope: LiveScope,
         deadline: Instant,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        Self::new_with_credentials(key_file, scope, deadline, None)
+        Self::new_with_credentials(LiveProvider::Abliteration, key_file, scope, deadline, None)
     }
     pub fn new_with_credentials(
+        provider: LiveProvider,
         key_file: &Path,
         scope: LiveScope,
         deadline: Instant,
@@ -198,6 +221,7 @@ impl LiveBroker {
             .build()?;
         let access = access::Access::new(&scope, credentials)?;
         Ok(Arc::new(Self {
+            provider,
             client,
             key,
             scope,
@@ -208,6 +232,9 @@ impl LiveBroker {
             #[cfg(test)]
             test_target: None,
         }))
+    }
+    pub fn model_id(&self) -> &'static str {
+        self.provider.model()
     }
     pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
         let engine = request.path == ENGINE_CHAT;
@@ -224,7 +251,7 @@ impl LiveBroker {
             .as_ref()
             .and_then(Value::as_object)
             .ok_or("invalid_model_request")?;
-        if input.get("model") != Some(&json!(MODEL)) {
+        if input.get("model") != Some(&json!(self.provider.model())) {
             return Err("wrong_model");
         }
         let messages = input
@@ -247,8 +274,22 @@ impl LiveBroker {
         // Large v2 defaults to maximum reasoning. Select the intended effort
         // explicitly. Do not request a response schema here: the current provider
         // skips tool calls when a schema is present, even with a forced tool choice.
-        let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,
-            "reasoning_effort":"high"});
+        let mut body = json!({"model":self.provider.model(),"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,"reasoning_effort":"high"});
+        match self.provider {
+            LiveProvider::Abliteration => body["reasoning_effort"] = json!("high"),
+            LiveProvider::Venice => {
+                // No upstream browsing, extra system prompt, storage or model
+                // fallback. Target text cannot enable these provider features.
+                body["store"] = json!(false);
+                body["fallbacks"] = json!([]);
+                body["venice_parameters"] = json!({
+                    "include_venice_system_prompt":false,
+                    "enable_web_search":"off",
+                    "enable_web_scraping":false,
+                    "enable_x_search":false
+                });
+            }
+        }
         if let Some(tools) = input.get("tools") {
             if !tools.as_array().is_some_and(|v| {
                 v.len() <= if engine { 64 } else { 16 } && v.iter().all(|t| t["type"] == "function")
@@ -302,7 +343,7 @@ impl LiveBroker {
         }
         let mut response = self
             .client
-            .post(format!("{API}/chat/completions"))
+            .post(format!("{}/chat/completions", self.provider.api_url()))
             .bearer_auth(self.key.as_str())
             .json(&body)
             .send()
@@ -676,7 +717,7 @@ impl LiveBroker {
         let (status, body) = match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/v1/models") => (
                 200,
-                json!({"object":"list","data":[{"id":MODEL,"object":"model","context_length":200000}]}),
+                json!({"object":"list","data":[{"id":self.provider.model(),"object":"model","context_length":200000}]}),
             ),
             ("POST", "/patchriot/http") => {
                 match self.http(request.body.unwrap_or(Value::Null)).await {
@@ -752,8 +793,8 @@ impl LiveBroker {
                 } else {
                     WebsiteRunState::Failed
                 },
-                provider: "abliteration.ai".into(),
-                model: MODEL.into(),
+                provider: self.provider.name().into(),
+                model: self.provider.model().into(),
                 image_digest: settings.image.clone(),
                 duration_ms: report.duration_ms.min(u128::from(u64::MAX)) as u64,
                 inference_calls: count.calls,
@@ -899,6 +940,18 @@ mod tests {
         ] {
             assert!(parse_assessment(malformed).is_none());
         }
+    }
+    fn reviewers() -> Vec<patchriot_protocol::website_reviews::WebsiteReviewer> {
+        (0..3)
+            .map(|i| patchriot_protocol::website_reviews::WebsiteReviewer {
+                device_id: uuid::Uuid::new_v4(),
+                operator_id: uuid::Uuid::new_v4(),
+                operator_name: "Owned fixture operator".into(),
+                device_name: format!("Fixture {i}"),
+                declared_model: MODEL.into(),
+                compute_group: "fixture".into(),
+            })
+            .collect()
     }
     fn broker() -> Arc<LiveBroker> {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1113,7 +1166,7 @@ mod tests {
                     pentest_id: uuid::Uuid::new_v4(),
                     scope,
                     scope_sha256: hash,
-                    reviewers: vec![],
+                    reviewers: reviewers(),
                     provider: "abliteration.ai".into(),
                 },
                 previous_reports: vec![],
@@ -1153,7 +1206,7 @@ mod tests {
                     pentest_id: uuid::Uuid::new_v4(),
                     scope_sha256: scope.hash().unwrap(),
                     scope,
-                    reviewers: vec![],
+                    reviewers: reviewers(),
                     provider: "abliteration.ai".into(),
                 },
                 previous_reports: vec![prior("investigator"), prior("reproducer")],
@@ -1221,6 +1274,66 @@ mod tests {
         assert!(prepared.get("api_key").is_none());
         r.body.as_mut().unwrap()["model"] = json!("other");
         assert!(broker.chat(&r).is_err());
+    }
+    #[test]
+    fn venice_keeps_provider_features_and_model_choice_out_of_agent_control() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().provider = LiveProvider::Venice;
+        let mut request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(
+                json!({"model":LiveProvider::Venice.model(),"messages":[{"role":"user","content":"Owned example"}],
+                "store":true,"fallbacks":[{"model":"other"}],"venice_parameters":{"enable_web_search":"on","enable_web_scraping":true,"enable_x_search":true},
+                "base_url":"https://other.example","api_key":"must-not-forward","user":"customer-id","stream":true}),
+            ),
+        };
+        let prepared = broker.chat(&request).unwrap();
+        assert_eq!(prepared["model"], LiveProvider::Venice.model());
+        assert_eq!(prepared["store"], false);
+        assert_eq!(prepared["fallbacks"], json!([]));
+        assert_eq!(prepared["venice_parameters"]["enable_web_search"], "off");
+        for key in [
+            "enable_web_scraping",
+            "enable_x_search",
+            "include_venice_system_prompt",
+        ] {
+            assert_eq!(prepared["venice_parameters"][key], false);
+        }
+        assert_eq!(prepared["stream_options"]["include_usage"], true);
+        for key in ["api_key", "base_url", "user"] {
+            assert!(prepared.get(key).is_none());
+        }
+        request.body.as_mut().unwrap()["model"] = json!(LiveProvider::Abliteration.model());
+        assert_eq!(broker.chat(&request), Err("wrong_model"));
+    }
+    #[test]
+    fn mixed_provider_assignment_binds_each_role_and_rejects_a_false_disclosure() {
+        let scope = broker().scope.clone();
+        let mut selected = reviewers();
+        selected[0].declared_model = LiveProvider::Venice.model().into();
+        let mut task = Task {
+            role: ReviewRole::Investigator,
+            scope_sha256: scope.hash().unwrap(),
+            evidence: PentestEvidence {
+                context: PentestContext {
+                    pentest_id: uuid::Uuid::new_v4(),
+                    scope_sha256: scope.hash().unwrap(),
+                    scope,
+                    reviewers: selected,
+                    provider: "abliteration.ai, venice.ai".into(),
+                },
+                previous_reports: vec![],
+                credentials: None,
+            },
+        };
+        assert_eq!(task.model(), Some(LiveProvider::Venice.model()));
+        assert!(task.input().is_ok());
+        task.role = ReviewRole::Challenger;
+        assert_eq!(task.model(), Some(LiveProvider::Abliteration.model()));
+        task.evidence.context.provider = "abliteration.ai".into();
+        assert!(task.input().is_err());
     }
     #[tokio::test]
     async fn full_engine_requires_consent_and_keeps_the_reviewers_budget() {

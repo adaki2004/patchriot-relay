@@ -34,15 +34,17 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(record['output_sha256'], hashlib.sha256(record['output_excerpt'].encode()).hexdigest())
 
     def test_partial_report_survives_and_stops_before_the_reviewer(self):
+        models = []
         class FakeEngine:
-            def __init__(self, *_): pass
+            def __init__(self, _directory, _bridge, _deadline, model): models.append(model)
             def __enter__(self): return self
             def __exit__(self, *_): pass
             def assess(self, scope, targets, role):
                 return {'engine': 'ARTEX', 'commit': artex.VERSION, 'stop_reason': 'model_budget',
                         'coverage_complete': False, 'findings': [], 'commands': []}
         with tempfile.TemporaryDirectory() as temp, patch.object(artex, 'Engine', FakeEngine):
-            record = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(temp))
+            record = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(temp), model='abliteration-abliterated-model-large-v2')
+            self.assertEqual(models, ['abliteration-abliterated-model-large-v2'])
             self.assertEqual(record['failure'], 'incomplete')
             self.assertEqual(record['exit_code'], 0)
             self.assertEqual(record['arguments'], ['/opt/artex/artex', 'https://owned.example'])

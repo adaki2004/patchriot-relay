@@ -211,7 +211,7 @@ def main():
             # also shares the relay's total model and target-request allowances.
             event("phase", name="artex_engine")
             engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
-            result = artex.run(scope, role, engine_deadline)
+            result = artex.run(scope, role, engine_deadline, model=model)
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)

@@ -82,20 +82,20 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5", "6", "7", "8", "9", "10"].contains(
+            || !["2", "3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5", "6", "7", "8", "9", "10"].contains(
+                && !["3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–10; longer CPU budgets require adapter 3–10"
+                "website reviews require adapter 2–11; longer CPU budgets require adapter 3–11"
                     .into(),
             );
         }
@@ -103,15 +103,21 @@ impl Settings {
     }
     pub fn require_live_adapter(&self) -> Result<(), Box<dyn std::error::Error>> {
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
+        if patchriot_protocol::pentests::LiveProvider::from_model(&self.model)
+            == Some(patchriot_protocol::pentests::LiveProvider::Venice)
+            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "11"
+        {
+            return Err("Venice live tests require adapter 11".into());
+        }
         if self.live_provider_key_file.is_none()
             || image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("5" | "6" | "7" | "8" | "9" | "10")
+                Some("5" | "6" | "7" | "8" | "9" | "10" | "11")
             )
         {
             return Err(
-                "live tests require the inspected adapter 5–10 and a private provider key file"
+                "live tests require the inspected adapter 5–11 and a private provider key file"
                     .into(),
             );
         }
@@ -124,7 +130,10 @@ impl Settings {
         self.require_live_adapter()?;
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         Ok(
-            if image["Config"]["Labels"]["io.patchriot.agent-adapter"] == "10" {
+            if matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("10" | "11")
+            ) {
                 vec![
                     patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1,
                     patchriot_protocol::pentests::LiveToolProfile::ActiveWebV1,
@@ -152,7 +161,7 @@ impl Settings {
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -178,8 +187,8 @@ impl Settings {
             return Err("max_attempt_seconds must be 600..3600".into());
         }
         if settings.live_provider_key_file.is_some() {
-            if settings.model != live::MODEL
-                || settings.model_url != "https://api.abliteration.ai/v1"
+            if patchriot_protocol::pentests::LiveProvider::from_model(&settings.model)
+                .is_none_or(|provider| settings.model_url != provider.api_url())
             {
                 return Err("live model configuration must use the declared provider".into());
             }
@@ -313,7 +322,7 @@ impl Bridge {
     fn matches_declaration(&self, s: &str) -> bool {
         match self {
             Self::Local(b) => b.matches_declaration(s),
-            Self::Live(_) => s == live::MODEL,
+            Self::Live(b) => s == b.model_id(),
         }
     }
     async fn respond(&self, r: Request, tx: mpsc::Sender<Frame>) {
@@ -702,13 +711,13 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"].contains(
+        || !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5", "6", "7", "8", "9", "10"].contains(
+            && !["2", "3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -716,14 +725,14 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11")
             )
         || live
             .as_ref()
             .is_some_and(|task| !task.evidence.context.scope.tools.is_empty())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("7" | "8" | "9" | "10")
+                Some("7" | "8" | "9" | "10" | "11")
             )
         || live.as_ref().is_some_and(|task| {
             task.evidence
@@ -734,14 +743,17 @@ pub fn run(
                 .any(|tool| *tool != patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
         }) && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("8" | "9" | "10")
+            Some("8" | "9" | "10" | "11")
         )
         || live
             .as_ref()
             .is_some_and(|task| task.evidence.context.scope.session_login.is_some())
-            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "10"
+            && !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("10" | "11")
+            )
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5", "6", "7", "8", "9", "10"].contains(
+            && !["3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -756,7 +768,12 @@ pub fn run(
         .build()?;
     let live_broker = live
         .map(|task| {
+            if task.model() != Some(settings.model.as_str()) {
+                return Err("configured provider differs from the consented role".into());
+            }
             live::LiveBroker::new_with_credentials(
+                patchriot_protocol::pentests::LiveProvider::from_model(&settings.model)
+                    .ok_or("unsupported live provider")?,
                 settings
                     .live_provider_key_file
                     .as_deref()
@@ -1394,6 +1411,27 @@ mod tests {
             input["max_attempt_seconds"] = value;
             std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
             assert!(Settings::load(file.path()).is_err());
+        }
+    }
+    #[test]
+    fn hosted_model_configuration_requires_the_matching_fixed_provider() {
+        use patchriot_protocol::pentests::LiveProvider;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut input = json!({"docker_socket":"/var/run/docker.sock", "image":format!("sha256:{}", "b".repeat(64)),
+            "model_url":"", "model":"", "model_digest":"", "live_provider_key_file":"/private/provider.key"});
+        for provider in [LiveProvider::Abliteration, LiveProvider::Venice] {
+            input["model"] = json!(provider.model());
+            input["model_url"] = json!(provider.api_url());
+            std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
+            assert!(Settings::load(file.path()).is_ok());
+            for url in [
+                "https://unapproved.example/v1",
+                "https://api.venice.ai/api/v1/other",
+            ] {
+                input["model_url"] = json!(url);
+                std::fs::write(file.path(), serde_json::to_vec(&input).unwrap()).unwrap();
+                assert!(Settings::load(file.path()).is_err());
+            }
         }
     }
 }

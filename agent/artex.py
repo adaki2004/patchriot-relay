@@ -102,8 +102,9 @@ def stop_process(process):
 
 
 class Engine:
-    def __init__(self, directory, bridge, deadline):
+    def __init__(self, directory, bridge, deadline, model=MODEL):
         self.directory, self.bridge, self.deadline = directory, bridge, deadline
+        self.model = model
         self.pg = self.process = self.log = None
         self.client = Client()
 
@@ -158,7 +159,7 @@ class Engine:
                 'notify_enabled': False, 'llm_pool_enabled': False, 'task_concurrency_enabled': True,
                 'task_concurrency_limit': 1}, method='PUT')
             profile = self.client.call('/api/llm/profiles', {'name': 'scope-bound-model-bridge', 'format': 'openai',
-                'model': MODEL, 'base_url': self.bridge + '/patchriot/artex/v1', 'api_key': 'local-bridge-placeholder',
+                'model': self.model, 'base_url': self.bridge + '/patchriot/artex/v1', 'api_key': 'local-bridge-placeholder',
                 'streaming': False, 'max_tokens': 8192, 'context_window_k': 64, 'reasoning_effort': 'high'})
             self.client.call('/api/llm/profiles/active', {'id': profile['id']})
             self.profile_id = profile['id']
@@ -211,7 +212,7 @@ class Engine:
                 self.log.close()
 
 
-def run(scope, role, deadline, directory=Path('/work'), fetch=None):
+def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL):
     from web_tools import ScopeMirror, record
     from live_http import request
     started, timestamp = time.monotonic(), int(time.time())
@@ -222,7 +223,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None):
             raise TimeoutError('no engine time remaining')
         with ExitStack() as stack:
             mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or request, methods=scope['methods'])) for origin in scope['origins']]
-            engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline))
+            engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
             try:
                 result = engine.assess(scope, [mirror.url for mirror in mirrors], role)
                 code = 0

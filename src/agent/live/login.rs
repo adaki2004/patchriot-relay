@@ -254,6 +254,7 @@ mod tests {
             password: "fixture-password-only".into(),
         };
         let mut broker = LiveBroker::new_with_credentials(
+            LiveProvider::Abliteration,
             key.path(),
             scope,
             Instant::now() + Duration::from_secs(60),
