@@ -1,6 +1,9 @@
 """Live-mode task context for Hermes; executable network policy is in Rust."""
 import json
 
+# Two 4 MiB role reports plus bounded scope/team metadata; matches the protocol.
+MAX_INPUT = 2 * 4 * 1024 * 1024 + 256 * 1024
+
 
 def runs_discovery(role):
     """Only Scout runs the broad scanner bundle; follow-ups test its claims."""
@@ -10,9 +13,9 @@ def runs_discovery(role):
 
 
 def load(stream, directory):
-    line = stream.readline(3 * 1024 * 1024 + 1)
+    line = stream.readline(MAX_INPUT + 1)
     task = json.loads(line)
-    if len(line) > 3 * 1024 * 1024 or task.get("kind") != "live_http_v1" or task.get("role") not in ("investigator", "reproducer", "challenger"):
+    if len(line) > MAX_INPUT or task.get("kind") != "live_http_v1" or task.get("role") not in ("investigator", "reproducer", "challenger"):
         raise ValueError("invalid live assignment")
     (directory / "scope.json").write_text(json.dumps(task["evidence"]["context"]))
     (directory / "previous.json").write_text(json.dumps(task["evidence"]["previous_reports"]))

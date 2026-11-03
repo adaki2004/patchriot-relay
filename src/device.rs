@@ -919,7 +919,7 @@ fn agent_work(
                     patchriot_protocol::website_reviews::ReadWorkEvidence {
                         lease_id: assignment.lease_id,
                     },
-                    3 * 1024 * 1024,
+                    patchriot_protocol::pentests::MAX_EVIDENCE_BYTES as u64,
                 )?;
                 if saved.context.pentest_id != live.pentest_id {
                     return Err("wrong live scope".into());
@@ -1351,28 +1351,36 @@ mod tests {
             "kind":"pentest_agent_v1", "scope_sha256":scope.hash().unwrap(),
             "execution":{"state":"completed", "provider":"abliteration.ai",
                 "model":"abliterated-model-large-v2", "image_digest":"owned-fixture",
-                "duration_ms":100, "inference_calls":1, "http_requests":120,
+                "duration_ms":100, "inference_calls":1, "http_requests":500,
                 "cost_upper_microusd":1, "cleanup_confirmed":true},
             "assessment":null, "evidence":[], "raw_summary":""
         }))
         .unwrap();
         // Escaped characters and many records are realistic HTML/tool output.
         // Fill to the wire limit, not an arbitrary 'large enough' test size.
-        for id in 1..=120 {
+        for id in 1..=500 {
             result.evidence.push(
                 serde_json::from_value(serde_json::json!({
                     "id":id,"method":"GET","url":format!("https://example.com/{id}"),
                     "request_headers":{},"status":200,"headers":{},
-                    "body_excerpt":"\"\\".repeat(2100),"truncated":true,"error":null,"observed_at":1
+                    "body_excerpt":"","truncated":true,"error":null,"observed_at":1
                 }))
                 .unwrap(),
             );
+        }
+        let overhead = serde_json::to_vec(&result).unwrap().len();
+        let repeated = (MAX_RESULT_BYTES - overhead) / (4 * result.evidence.len());
+        for evidence in &mut result.evidence {
+            evidence.body_excerpt = "\"\\".repeat(repeated);
         }
         let size = serde_json::to_vec(&result).unwrap().len();
         assert!(size < MAX_RESULT_BYTES && MAX_RESULT_BYTES - size < 24_000);
         result.raw_summary = "x".repeat(MAX_RESULT_BYTES - size);
         assert!(result.valid(&scope));
         assert_eq!(serde_json::to_vec(&result).unwrap().len(), MAX_RESULT_BYTES);
+        let mut oversized = result.clone();
+        oversized.raw_summary.push('x');
+        assert!(!oversized.valid(&scope));
         let lease_id = Uuid::new_v4();
         let expected = CompleteWork {
             lease_id,

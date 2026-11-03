@@ -19,6 +19,10 @@ const MAX_SPEND: u64 = 10_000_000;
 const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
 const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
 const REVIEWER_RESERVE: u64 = 1_500_000;
+// Leave space for the next bounded HTTP record, tool transcripts and findings.
+// Refuse a new probe before sending it instead of dropping already cited evidence.
+const HTTP_EVIDENCE_BUDGET: usize = MAX_RESULT_BYTES - 1024 * 1024;
+const HTTP_RECORD_RESERVE: usize = 256 * 1024;
 pub type Progress = Mutex<LiveProgress>;
 
 fn assessment_format() -> Value {
@@ -88,7 +92,7 @@ impl Task {
         let mut bytes = serde_json::to_vec(
             &json!({"kind":"live_http_v1","role":self.role,"evidence":{"context":self.evidence.context,"previous_reports":self.evidence.previous_reports}}),
         )?;
-        if bytes.len() > 3 * 1024 * 1024 {
+        if bytes.len() + 1 > MAX_EVIDENCE_BYTES {
             return Err("live assignment exceeds limit".into());
         }
         bytes.push(b'\n');
@@ -436,7 +440,9 @@ impl LiveBroker {
         }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
-            if count.evidence.len() >= MAX_HTTP_REQUESTS || count.evidence_bytes > 600 * 1024 {
+            if count.evidence.len() >= MAX_HTTP_REQUESTS
+                || count.evidence_bytes + HTTP_RECORD_RESERVE > HTTP_EVIDENCE_BUDGET
+            {
                 return Err("target_request_budget_reached");
             }
         }
@@ -1039,6 +1045,60 @@ mod tests {
         let input: Value = serde_json::from_str(&encoded).unwrap();
         assert!(input["evidence"].get("credentials").is_none());
         assert!(encoded.contains("auth_check_path"));
+    }
+    #[test]
+    fn large_prior_reports_fit_the_container_input_without_losing_evidence() {
+        let scope: LiveScope = serde_json::from_value(json!({
+            "origins":["https://example.com"],"methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1"
+        }))
+        .unwrap();
+        let scope = scope.normalized().unwrap();
+        let prior = |role| {
+            serde_json::from_value(json!({
+                "role":role,"assessment":null,"evidence":[{"id":1,"method":"GET",
+                    "url":"https://example.com/","request_headers":{},"status":200,"headers":{},
+                    "body_excerpt":"x".repeat(MAX_RESULT_BYTES - 4096),"truncated":true,
+                    "error":null,"observed_at":1}]
+            }))
+            .unwrap()
+        };
+        let mut task = Task {
+            role: ReviewRole::Challenger,
+            scope_sha256: scope.hash().unwrap(),
+            evidence: PentestEvidence {
+                context: PentestContext {
+                    pentest_id: uuid::Uuid::new_v4(),
+                    scope_sha256: scope.hash().unwrap(),
+                    scope,
+                    reviewers: vec![],
+                    provider: "abliteration.ai".into(),
+                },
+                previous_reports: vec![prior("investigator"), prior("reproducer")],
+                credentials: None,
+            },
+        };
+        let bytes = task.input().unwrap();
+        assert!(bytes.len() > 2 * MAX_RESULT_BYTES - 16384 && bytes.len() <= MAX_EVIDENCE_BYTES);
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["evidence"]["previous_reports"],
+            serde_json::to_value(&task.evidence.previous_reports).unwrap()
+        );
+        task.evidence.previous_reports[0].evidence[0]
+            .body_excerpt
+            .push_str(&"x".repeat(300 * 1024));
+        assert!(task.input().is_err());
+    }
+    #[tokio::test]
+    async fn exhausted_evidence_budget_refuses_a_new_probe_before_network_io() {
+        let broker = broker();
+        broker.counters.lock().unwrap().evidence_bytes =
+            HTTP_EVIDENCE_BUDGET - HTTP_RECORD_RESERVE + 1;
+        let reply = broker
+            .http(json!({"method":"GET","url":"https://example.com/"}))
+            .await;
+        assert_eq!(reply.unwrap_err(), "target_request_budget_reached");
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
     }
     #[tokio::test]
     async fn active_scope_rejects_unapproved_bodies_and_header_overrides_before_io() {
