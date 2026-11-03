@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_REQUEST = 65536
@@ -171,6 +172,7 @@ def main():
         MAX_REQUEST = 512 * 1024
     model = sys.argv[1]
     budget = execution_budget(os.environ.get("PATCHRIOT_AGENT_MAX_SECONDS", "600"))
+    started = time.monotonic()
     os.environ["HERMES_API_TIMEOUT"] = str(budget - 60)
     source = len(sys.argv) == 3 and sys.argv[2] == "--source"
     if live:
@@ -197,6 +199,12 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     os.environ["PATCHRIOT_BRIDGE_URL"] = f"http://127.0.0.1:{server.server_port}"
+    if live:
+        import web_tools
+        event("phase", name="scoped_tools")
+        web_tools.run(json.loads(Path("/work/scope.json").read_text())["scope"],
+                      json.loads(Path("/work/previous.json").read_text()),
+                      emit=lambda result: event("live_tool", run=result))
     from run_agent import AIAgent
     observed = []
 
@@ -212,7 +220,7 @@ def main():
         request_overrides={} if live else {"reasoning_effort": "none"},
         quiet_mode=True, skip_context_files=True, skip_memory=True,
         skip_background_review=True, checkpoints_enabled=False,
-        run_budget_seconds=budget - 30, cwd="/work",
+        run_budget_seconds=max(1, budget - 30 - int(time.monotonic() - started)), cwd="/work",
         tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
         tool_complete_callback=complete,
     )
@@ -227,7 +235,7 @@ def main():
             "Report only observed output. Do not edit files, install anything or access the network."
         )
         if live:
-            prompt = live_review.prompt(role)
+            prompt = live_review.prompt(role) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         regression = False
         for args in observed:

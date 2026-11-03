@@ -72,20 +72,20 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5"].contains(
+            || !["2", "3", "4", "5", "6"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5"].contains(
+                && !["3", "4", "5", "6"].contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–5; longer CPU budgets require adapter 3–5"
+                "website reviews require adapter 2–6; longer CPU budgets require adapter 3–6"
                     .into(),
             );
         }
@@ -95,10 +95,14 @@ impl Settings {
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         if self.live_provider_key_file.is_none()
             || image["Id"] != self.image
-            || image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "5"
+            || !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("5" | "6")
+            )
         {
             return Err(
-                "live tests require the inspected adapter 5 and a private provider key file".into(),
+                "live tests require the inspected adapter 5 or 6 and a private provider key file"
+                    .into(),
             );
         }
         Ok(())
@@ -108,7 +112,7 @@ impl Settings {
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5")
+                Some("4" | "5" | "6")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -153,6 +157,7 @@ pub struct Assignment<'a> {
     /// Stop execution early enough to clean up and submit a timeout report while
     /// the lease is still valid. Preflight time counts against this deadline.
     pub execution_deadline: Instant,
+    pub progress: Option<&'a live::Progress>,
 }
 
 pub struct Check {
@@ -305,6 +310,7 @@ async fn supervise(
     cancelled: &impl Fn() -> bool,
     timeout: Duration,
     input: Option<Vec<u8>>,
+    progress: Option<&live::Progress>,
 ) -> io::Result<AgentRun> {
     let broker = broker.into();
     if cancelled() {
@@ -374,6 +380,8 @@ async fn supervise(
     let mut err_open = true;
     let mut exited = false;
     let mut final_seen = false;
+    let mut live_phase = patchriot_protocol::pentests::LivePhase::Starting;
+    let mut completed_tools = 0u8;
     let mut report = AgentRun {
         outcome: "completed",
         failure_reason: None,
@@ -399,6 +407,9 @@ async fn supervise(
                 if cancelled() {
                     report.outcome = "cancelled";
                     break;
+                }
+                if let (Bridge::Live(broker), Some(progress)) = (&broker, progress) {
+                    broker.update_progress(progress, live_phase, completed_tools);
                 }
             }
             n = stderr.read(&mut err), if err_open => {
@@ -463,9 +474,21 @@ async fn supervise(
                             task.0 = Some(tokio::spawn(async move { broker.respond(request, tx).await; }));
                         }
                         Ok(Wire::Event { event, data })
-                            if ["phase", "tool_start", "tool_complete", "result"].contains(&event.as_str()) && !final_seen => {
+                            if (["phase", "tool_start", "tool_complete", "result"].contains(&event.as_str())
+                                || matches!(&broker, Bridge::Live(_)) && event == "live_tool") && !final_seen => {
                             if event == "result" {
                                 final_seen = true;
+                                live_phase = patchriot_protocol::pentests::LivePhase::Finishing;
+                            }
+                            if event == "phase" && data["name"] == "scoped_tools" && report.inference_calls == 0 {
+                                live_phase = patchriot_protocol::pentests::LivePhase::ScopedTools;
+                            }
+                            if event == "phase" && data["name"] == "agent_ready" {
+                                live_phase = patchriot_protocol::pentests::LivePhase::Investigating;
+                            }
+                            if event == "live_tool" && report.inference_calls == 0
+                                && matches!(&broker, Bridge::Live(b) if b.valid_tool_record(&data["run"])) {
+                                completed_tools = completed_tools.saturating_add(1).min(12);
                             }
                             if event == "tool_start" {
                                 eprintln!("agent started a tool");
@@ -629,13 +652,13 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3", "4", "5"].contains(
+        || !["1", "2", "3", "4", "5", "6"].contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5"].contains(
+            && !["2", "3", "4", "5", "6"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -643,10 +666,10 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5")
+                Some("4" | "5" | "6")
             )
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5"].contains(
+            && !["3", "4", "5", "6"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -829,6 +852,7 @@ pub fn run(
                 .unwrap_or(Duration::from_secs(settings.max_attempt_seconds))
                 .min(Duration::from_secs(settings.max_attempt_seconds)),
             input,
+            assignment.as_ref().and_then(|a| a.progress),
         ))?;
         if report.outcome != "completed" {
             let _ = docker.control(&["container", "kill", &owned.name]);
@@ -1071,6 +1095,7 @@ mod tests {
             &|| false,
             Duration::ZERO,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1083,6 +1108,7 @@ mod tests {
             &|| false,
             Duration::from_millis(40),
             Some(vec![b'x'; 1024 * 1024]),
+            None,
         )
         .await
         .unwrap();
@@ -1103,6 +1129,7 @@ mod tests {
             crate::inference::tests::broker(),
             &|| cancelled.load(Ordering::Relaxed),
             timeout,
+            None,
             None,
         )
         .await

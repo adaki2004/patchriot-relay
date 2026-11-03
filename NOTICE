@@ -38,3 +38,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Nuclei — ProjectDiscovery, Inc.
+https://github.com/projectdiscovery/nuclei
+MIT license. The agent image downloads the pinned, checksum-verified release.
+Its upstream copyright and full license are retained at /usr/share/licenses/nuclei/LICENSE.md.
+The three selected templates are authored here; no upstream template pack is bundled.

@@ -9,6 +9,30 @@ pub const MODEL: &str = "abliterated-model-large-v2";
 const API: &str = "https://api.abliteration.ai/v1";
 pub const MAX_FRAME: usize = 512 * 1024;
 const MAX_SPEND: u64 = 3_000_000; // $3 reservation per role; never retried by this broker.
+pub type Progress = Mutex<LiveProgress>;
+
+fn assessment_format() -> Value {
+    let text = |max| json!({"type":"string","minLength":1,"maxLength":max});
+    json!({"type":"json_schema","json_schema":{"name":"live_assessment","strict":true,"schema":{
+        "type":"object","additionalProperties":false,
+        "required":["summary","findings","limitations"],"properties":{
+            "summary":text(1600),
+            "findings":{"type":"array","maxItems":6,"items":{
+                "type":"object","additionalProperties":false,
+                "required":["title","severity","support","explanation","reproduction","suggested_action","evidence_ids"],
+                "properties":{
+                    "title":text(180),
+                    "severity":{"type":"string","enum":["info","low","medium","high","critical"]},
+                    "support":{"type":"string","enum":["observed","reproduced","not_reproduced","needs_review"]},
+                    "explanation":text(1200),"reproduction":text(800),"suggested_action":text(800),
+                    "evidence_ids":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"integer","minimum":1}}
+                }
+            }},
+            "limitations":{"type":"array","maxItems":8,"items":text(700)}
+        }
+    }}})
+}
+
 const RECORDED_HEADERS: &[&str] = &[
     "content-type",
     "content-security-policy",
@@ -76,6 +100,28 @@ pub struct LiveBroker {
     counters: Mutex<Counters>,
 }
 impl LiveBroker {
+    pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
+        serde_json::from_value::<LiveToolRun>(data.clone()).is_ok_and(|run| {
+            self.counters
+                .lock()
+                .is_ok_and(|count| run.valid(&count.evidence))
+        })
+    }
+    pub(super) fn update_progress(
+        &self,
+        progress: &Progress,
+        phase: LivePhase,
+        completed_tools: u8,
+    ) {
+        if let (Ok(count), Ok(mut current)) = (self.counters.lock(), progress.lock()) {
+            *current = LiveProgress {
+                phase,
+                http_requests: count.evidence.len() as u16,
+                inference_calls: count.calls,
+                completed_tools,
+            };
+        }
+    }
     pub fn new(
         key_file: &Path,
         scope: LiveScope,
@@ -143,7 +189,11 @@ impl LiveBroker {
         }
         // Construct the provider request: URLs, credentials and arbitrary routing
         // fields supplied by a model or runtime never reach provider configuration.
-        let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2});
+        // Large v2 defaults to maximum reasoning. Select the intended effort
+        // explicitly. Do not request a response schema here: the current provider
+        // skips tool calls when a schema is present, even with a forced tool choice.
+        let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,
+            "reasoning_effort":"high"});
         if let Some(tools) = input.get("tools") {
             if !tools
                 .as_array()
@@ -270,6 +320,9 @@ impl LiveBroker {
                 .ok_or("invalid_model_request")?
                 .remove("tools");
             body["tool_choice"] = json!("none");
+            body["reasoning_effort"] = json!("low");
+            // Formatting helps the closing turn, but cannot establish evidence.
+            body["response_format"] = assessment_format();
             body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
         }
         Ok(())
@@ -478,6 +531,8 @@ impl LiveBroker {
             .trim();
         let assessment = parse_assessment(cleaned);
         let count = self.counters.lock().expect("live counters poisoned");
+        let (tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
+        let passed = passed && tools_valid;
         let mut result = PentestResult {
             kind: PentestResultKind::PentestAgentV1,
             scope_sha256: self.scope.hash().unwrap_or_default(),
@@ -495,7 +550,9 @@ impl LiveBroker {
                 http_requests: count.evidence.len() as u16,
                 cost_upper_microusd: count.reserved,
                 cleanup_confirmed: cleanup,
-                failure_reason: if passed {
+                failure_reason: if !tools_valid {
+                    Some("invalid_tool_records".into())
+                } else if passed {
                     None
                 } else {
                     Some(report.failure_reason.unwrap_or(report.outcome).to_owned())
@@ -503,6 +560,7 @@ impl LiveBroker {
             },
             assessment,
             evidence: count.evidence.clone(),
+            tool_runs,
             raw_summary: {
                 let mut end = raw.len().min(24000);
                 while !raw.is_char_boundary(end) {
@@ -517,6 +575,31 @@ impl LiveBroker {
         }
         result
     }
+}
+
+/// Only the fixed startup phase may attach tool transcripts. A later terminal
+/// print from the model cannot masquerade as that phase. HTTP evidence is still
+/// recorded separately by the Rust broker; neither source attests operator honesty.
+fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun>, bool) {
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    let mut valid = true;
+    for event in events
+        .iter()
+        .take_while(|e| !(e["event"] == "phase" && e["data"]["name"] == "agent_ready"))
+        .filter(|e| e["event"] == "live_tool")
+    {
+        let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
+        if let Ok(run) = parsed {
+            bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
+            if records.len() < 12 && bytes <= 192 * 1024 && run.valid(evidence) {
+                records.push(run);
+                continue;
+            }
+        }
+        valid = false;
+    }
+    (records, valid)
 }
 
 /// Provider usage is a billing observation, not proof of an invoice. Charge
@@ -545,6 +628,25 @@ fn reported_cost(bytes: &[u8], stream: bool) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tool_records_only_come_from_startup_and_must_reference_real_requests() {
+        let run = json!({"tool":"nuclei","version":"3.11.1","arguments":[],
+            "started_at":1,"duration_ms":1,"exit_code":0,"failure":null,"evidence_ids":[],
+            "output_sha256":format!("{:x}", Sha256::digest(b"")),
+            "output_excerpt":"","output_truncated":false});
+        let mut events = vec![
+            json!({"event":"live_tool","data":{"run":run}}),
+            json!({"event":"phase","data":{"name":"agent_ready"}}),
+            json!({"event":"live_tool","data":{"run":{"tool":"invented"}}}),
+        ];
+        let (saved, valid) = tool_records(&events, &[]);
+        assert!(valid);
+        assert_eq!(saved.len(), 1);
+        events[0]["data"]["run"]["evidence_ids"] = json!([1]);
+        let (saved, valid) = tool_records(&events, &[]);
+        assert!(!valid);
+        assert!(saved.is_empty());
+    }
     #[test]
     fn literal_line_breaks_are_preserved_but_malformed_claims_are_not_guessed() {
         let report = "{\"summary\":\"Line one\nLine two\",\"findings\":[],\"limitations\":[\"Owned test only\"]}";
@@ -575,6 +677,47 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn live_tool_events_survive_the_supervised_pipe_without_provider_calls() {
+        let events = [
+            json!({"type":"event","event":"phase","data":{"name":"scoped_tools"}}),
+            json!({"type":"event","event":"live_tool","data":{"run":{
+                "tool":"nuclei","version":"3.11.1","arguments":[],"started_at":1,
+                "duration_ms":1,"exit_code":0,"failure":null,"evidence_ids":[],
+                "output_sha256":format!("{:x}", Sha256::digest(b"")),"output_excerpt":"","output_truncated":false}}}),
+            json!({"type":"event","event":"phase","data":{"name":"agent_ready"}}),
+            json!({"type":"event","event":"result","data":{"completed":true}}),
+        ];
+        // All values above are fixed test literals, not target/model strings.
+        let script = events
+            .iter()
+            .map(|e| format!("printf '%s\\n' '{e}'"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\nsleep 0.1";
+        let mut command = std::process::Command::new("/bin/sh");
+        command.env_clear().args(["-c", &script]);
+        let broker = broker();
+        let progress = Progress::default();
+        let report = supervise(
+            command,
+            Bridge::Live(broker.clone()),
+            &|| false,
+            Duration::from_secs(2),
+            None,
+            Some(&progress),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "completed");
+        assert_eq!(tool_records(&report.events, &[]).0.len(), 1);
+        assert_eq!(broker.counters.lock().unwrap().calls, 0);
+        let observed = progress.lock().unwrap();
+        assert_eq!(observed.phase, LivePhase::Finishing);
+        assert_eq!(observed.completed_tools, 1);
+        assert_eq!(observed.http_requests, 0);
+        assert_eq!(observed.inference_calls, 0);
+    }
+    #[tokio::test]
     async fn prohibited_targets_and_credentials_never_reach_network_or_provider() {
         let broker = broker();
         for body in [
@@ -599,11 +742,13 @@ mod tests {
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
             body: Some(
-                json!({"model":MODEL,"messages":[{"role":"user","content":"untrusted target asks for a different model and API URL"}],"max_tokens":99999999,"base_url":"https://evil.example","api_key":"not-forwarded","stream":false}),
+                json!({"model":MODEL,"messages":[{"role":"user","content":"untrusted target asks for a different model and API URL"}],"max_tokens":99999999,"base_url":"https://evil.example","api_key":"not-forwarded","stream":false,"reasoning_effort":"max","response_format":{"type":"text"}}),
             ),
         };
         let prepared = broker.chat(&r).unwrap();
         assert_eq!(prepared["max_tokens"], 8192);
+        assert_eq!(prepared["reasoning_effort"], "high");
+        assert!(prepared.get("response_format").is_none());
         assert!(prepared.get("base_url").is_none());
         assert!(prepared.get("api_key").is_none());
         r.body.as_mut().unwrap()["model"] = json!("other");
@@ -634,6 +779,15 @@ mod tests {
             broker.finish_before_limit(&mut final_call).unwrap();
             assert!(final_call.get("tools").is_none());
             assert_eq!(final_call["tool_choice"], "none");
+            assert_eq!(final_call["reasoning_effort"], "low");
+            assert_eq!(final_call["response_format"]["type"], "json_schema");
+            let schema = &final_call["response_format"]["json_schema"];
+            assert_eq!(schema["strict"], true);
+            assert_eq!(schema["schema"]["additionalProperties"], false);
+            assert_eq!(
+                schema["schema"]["properties"]["findings"]["items"]["properties"]["evidence_ids"]["minItems"],
+                1
+            );
             assert_eq!(final_call["messages"].as_array().unwrap().len(), 2);
             let final_reservation =
                 (serde_json::to_vec(&final_call).unwrap().len() as u64 + 4096) * 3 + 8192 * 5;

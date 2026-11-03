@@ -1,0 +1,23 @@
+id: patchriot-cors-origin-observation
+info:
+  name: Untrusted origin accepted with credentials flag
+  author: patchriot
+  severity: info
+  description: This unauthenticated check does not prove private data can be read. Compare baseline and null Origin controls; an authenticated impact test needs separate approval.
+  reference:
+    - https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/11-Client-side_Testing/07-Testing_Cross_Origin_Resource_Sharing
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+    headers:
+      Origin: https://patchriot.invalid
+    redirects: false
+    matchers-condition: and
+    matchers:
+      - type: regex
+        part: header
+        regex:
+          - '(?im)^access-control-allow-origin:\s*https://patchriot\.invalid\s*$'
+          - '(?im)^access-control-allow-credentials:\s*true\s*$'
+        condition: and

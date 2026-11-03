@@ -1,0 +1,21 @@
+id: patchriot-directory-index-observation
+info:
+  name: Directory listing markers
+  author: patchriot
+  severity: info
+  description: Listing markers are an observation. Public downloads may intentionally list files; sensitive content and impact need a separate check.
+  reference:
+    - https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/03-Test_File_Extensions_Handling_for_Sensitive_Information
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+    redirects: false
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words: ["<title>Index of", "Parent Directory"]
+        condition: and

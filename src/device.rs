@@ -592,6 +592,7 @@ fn renew(
     directory: &Path,
     client: &reqwest::blocking::Client,
     lease_id: Uuid,
+    progress: Option<patchriot_protocol::pentests::LiveProgress>,
 ) -> Result<(Instant, WorkRenewed), Error> {
     let (config, key) = {
         let _lock = state_lock(directory)?;
@@ -618,6 +619,7 @@ fn renew(
         RenewWork {
             lease_id,
             sequence: config.renewal_sequence,
+            progress,
         },
     )?;
     if reply.lease_id != lease_id
@@ -716,9 +718,18 @@ fn agent_work(
     settings: &crate::agent::Settings,
     assignment: &WorkAssignment,
 ) -> Result<(), Error> {
+    let progress = assignment
+        .pentest
+        .as_ref()
+        .map(|_| crate::agent::live::Progress::default());
+    let snapshot = || {
+        progress
+            .as_ref()
+            .and_then(|p| p.lock().ok().map(|p| p.clone()))
+    };
     // Renew before spawning even when a cached poll reply contains an assignment.
     // The server must confirm that it is still this device's active lease.
-    let (started, renewed) = renew(directory, client, assignment.lease_id)?;
+    let (started, renewed) = renew(directory, client, assignment.lease_id, snapshot())?;
     let window = LeaseWindow::new(started, renewed.valid_for_seconds);
     let execution_deadline =
         agent_execution_deadline(started, &renewed, settings.max_attempt_seconds())?;
@@ -773,7 +784,7 @@ fn agent_work(
                     heartbeat_at = Instant::now() + Duration::from_secs(10);
                 }
                 if Instant::now() >= renew_at {
-                    match renew(directory, client, assignment.lease_id) {
+                    match renew(directory, client, assignment.lease_id, snapshot()) {
                         Ok((started, reply)) => {
                             window.extend_at(started, reply.valid_for_seconds, Instant::now())
                         }
@@ -868,6 +879,7 @@ fn agent_work(
                     lease_id: assignment.lease_id,
                     declared_model,
                     execution_deadline,
+                    progress: progress.as_ref(),
                 }),
                 website.as_ref(),
                 source.as_ref(),

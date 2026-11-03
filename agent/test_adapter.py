@@ -14,6 +14,38 @@ from unittest.mock import patch
 import adapter
 import inspect_site
 import inspect_source
+import live_review
+
+
+class LiveOverviewTests(unittest.TestCase):
+    def test_large_prior_transcripts_stay_in_files_and_citations_keep_their_role(self):
+        scope = {"origins": ["https://owned.example"], "objective": "Owned fixture", "methods": ["GET", "HEAD", "OPTIONS"]}
+        prior = [{"role": "investigator", "assessment": {
+            "summary": "Earlier summary " * 200,
+            "findings": [{"title": "Untrusted <script>text</script>", "severity": "low",
+                          "support": "observed", "evidence_ids": [100]}]},
+            "evidence": [{"id": 100, "body_excerpt": "private response " * 10000}]}]
+        tool = {"tool": "nuclei", "exit_code": 0, "failure": None, "evidence_ids": [1, 2],
+                "output_truncated": False, "output_excerpt": "large transcript " * 10000}
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            originals = {"scope.json": json.dumps({"scope": scope}),
+                         "previous.json": json.dumps(prior),
+                         "tool-results.json": json.dumps({"tool_runs": [tool]})}
+            for name, content in originals.items():
+                (directory / name).write_text(content)
+            result = live_review.overview(directory)
+            self.assertEqual(result["scope"], scope)
+            self.assertLess(len(json.dumps(result)), 2000)
+            self.assertTrue(result["previous_reports"][0]["summary_shortened"])
+            finding = result["previous_reports"][0]["findings"][0]
+            self.assertEqual(finding["title"], prior[0]["assessment"]["findings"][0]["title"])
+            self.assertEqual(finding["prior_role_evidence_ids"], [100])
+            self.assertEqual(result["current_tools"][0]["current_role_evidence_ids"], [1, 2])
+            self.assertNotIn("private response", json.dumps(result))
+            self.assertNotIn("large transcript", json.dumps(result))
+            for name, content in originals.items():
+                self.assertEqual((directory / name).read_text(), content)
 
 
 class BridgeTests(unittest.TestCase):
