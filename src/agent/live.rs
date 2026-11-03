@@ -13,7 +13,12 @@ pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
 pub fn is_chat_path(path: &str) -> bool {
     path == "/v1/chat/completions" || path == ENGINE_CHAT
 }
-const MAX_SPEND: u64 = 3_000_000; // $3 reservation per role; never retried by this broker.
+// Generous pilot ceilings. Stop investigation early enough to save a report;
+// increasing time/calls must not let the engine spend the reviewer's reserve.
+const MAX_SPEND: u64 = 6_000_000;
+const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
+const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
+const REVIEWER_RESERVE: u64 = 1_500_000;
 pub type Progress = Mutex<LiveProgress>;
 
 fn assessment_format() -> Value {
@@ -262,7 +267,7 @@ impl LiveBroker {
             if engine && self.engine_budget_reached(&count, reservation) {
                 return Err("engine_budget_reached");
             }
-            if count.calls >= 48 || count.reserved + reservation > MAX_SPEND {
+            if count.calls >= MAX_LIVE_INFERENCE_CALLS || count.reserved + reservation > MAX_SPEND {
                 return Err("provider_budget_reached");
             }
             count.calls += 1;
@@ -336,8 +341,8 @@ impl LiveBroker {
         Ok(())
     }
     fn engine_budget_reached(&self, count: &Counters, reservation: u64) -> bool {
-        count.calls >= 24
-            || count.reserved.saturating_add(reservation) > MAX_SPEND - 750_000
+        count.calls >= ENGINE_CALL_LIMIT
+            || count.reserved.saturating_add(reservation) > MAX_SPEND - REVIEWER_RESERVE
             || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(240)
     }
     fn finish_before_limit(&self, body: &mut Value) -> Result<(), &'static str> {
@@ -348,7 +353,7 @@ impl LiveBroker {
             + 4096)
             * 3
             + 8192 * 5;
-        if count.calls >= 36
+        if count.calls >= FINAL_REPORT_CALL
             || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180)
             || MAX_SPEND.saturating_sub(count.reserved) < next.saturating_mul(2) + 150_000
         {
@@ -859,7 +864,7 @@ mod tests {
     async fn rejected_engine_retries_do_not_consume_the_reviewers_call_allowance() {
         let mut broker = broker();
         Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
-        broker.counters.lock().unwrap().calls = 24;
+        broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT;
         // Exercise the real supervised pipe and real 429 responses. The engine
         // has spent its allowance; these retries must never contact a provider
         // or prevent the subsequent final report from arriving.
@@ -898,13 +903,13 @@ mod tests {
         );
         {
             let count = broker.counters.lock().unwrap();
-            assert_eq!(count.calls, 24);
+            assert_eq!(count.calls, ENGINE_CALL_LIMIT);
             assert_eq!(count.reserved, 0);
         }
         // The spend and provider-call cap are still enforced by model(), as
         // covered by the exhausted-budget regression below.
         assert_eq!(Bridge::Live(broker.clone()).max_requests(), 600);
-        broker.counters.lock().unwrap().calls = 48;
+        broker.counters.lock().unwrap().calls = MAX_LIVE_INFERENCE_CALLS;
         let (tx, _rx) = mpsc::channel(4);
         let request = Request {
             id: 61,
@@ -1027,14 +1032,14 @@ mod tests {
         assert!(!broker.engine_budget_reached(&Counters::default(), 100));
         assert!(broker.engine_budget_reached(
             &Counters {
-                calls: 24,
+                calls: ENGINE_CALL_LIMIT,
                 ..Default::default()
             },
             100
         ));
         assert!(broker.engine_budget_reached(
             &Counters {
-                reserved: MAX_SPEND - 750_000,
+                reserved: MAX_SPEND - REVIEWER_RESERVE,
                 ..Default::default()
             },
             100
@@ -1070,7 +1075,7 @@ mod tests {
         let mut prepared = normal.clone();
         broker.finish_before_limit(&mut prepared).unwrap();
         assert_eq!(normal, prepared);
-        for (calls, reserved) in [(0, MAX_SPEND - 200_000), (36, 0)] {
+        for (calls, reserved) in [(0, MAX_SPEND - 200_000), (FINAL_REPORT_CALL, 0)] {
             {
                 let mut count = broker.counters.lock().unwrap();
                 count.calls = calls;

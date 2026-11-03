@@ -277,7 +277,7 @@ impl Bridge {
             Self::Local(_) => Some(4),
             // The live broker caps actual provider calls and spend. ARTEX may
             // retry its locally rejected requests while shutting down; charging
-            // those attempts to the 48-call allowance killed the final report.
+            // those attempts to the provider-call allowance killed the final report.
             // Transport still has a separate 600-request and execution deadline.
             Self::Live(_) => None,
         }
