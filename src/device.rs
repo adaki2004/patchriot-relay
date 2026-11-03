@@ -22,6 +22,60 @@ type Error = Box<dyn std::error::Error>;
 // Includes one pending structured result. Never store the website snapshot here.
 const MAX_STATE: u64 = 128 * 1024;
 
+// Read data rather than sourcing this file as a shell script. Only OS name and
+// version leave the machine; hostname, kernel details and IDs are not collected.
+fn os_release(text: &str) -> Option<(String, Option<String>)> {
+    if text.len() > 16 * 1024 {
+        return None;
+    }
+    let field = |key: &str| {
+        text.lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(name, value)| {
+                if name != key {
+                    return None;
+                }
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                    .unwrap_or(value);
+                (!value.trim().is_empty()
+                    && value.len() <= 80
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || " ._-/()+".contains(c)))
+                .then(|| value.to_owned())
+            })
+    };
+    Some((field("NAME")?, field("VERSION_ID")))
+}
+
+fn reported_system() -> AgentSystem {
+    let release = if cfg!(target_os = "linux") {
+        ["/etc/os-release", "/usr/lib/os-release"]
+            .into_iter()
+            .find_map(|path| {
+                let mut text = String::new();
+                File::open(path)
+                    .ok()?
+                    .take(16 * 1024 + 1)
+                    .read_to_string(&mut text)
+                    .ok()?;
+                os_release(&text)
+            })
+    } else {
+        None
+    };
+    let (os_name, os_version) = release.unwrap_or_else(|| (std::env::consts::OS.into(), None));
+    AgentSystem {
+        os_name,
+        os_version,
+        architecture: std::env::consts::ARCH.into(),
+        relay_version: env!("CARGO_PKG_VERSION").into(),
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -409,6 +463,7 @@ fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<S
         &key,
         &format!("/v1/devices/{id}/heartbeat"),
         Heartbeat {
+            system: Some(reported_system()),
             sequence: config.sequence,
             paused: config.paused,
             running: u16::from(config.active_assignment.as_ref().is_some_and(|a| {
@@ -1127,6 +1182,30 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reports_os_release_without_sourcing_commands_or_machine_details() {
+        assert_eq!(
+            super::os_release(
+                "NAME=\"Kali GNU/Linux\"\nVERSION_ID=\"2026.3\"\nHOSTNAME=private-host\n"
+            ),
+            Some(("Kali GNU/Linux".into(), Some("2026.3".into())))
+        );
+        assert_eq!(
+            super::os_release("NAME='Debian GNU/Linux'\n"),
+            Some(("Debian GNU/Linux".into(), None))
+        );
+        assert_eq!(super::os_release("NAME=$(id)\n"), None);
+        assert_eq!(
+            super::os_release("NAME=\"Linux\"\nVERSION_ID=\"$(id)\"\n"),
+            Some(("Linux".into(), None))
+        );
+        assert_eq!(
+            super::os_release(&format!("NAME=Linux\n{}", "x".repeat(16 * 1024))),
+            None
+        );
+        assert_eq!(super::os_release("NAME=\"broken\n"), None);
+        super::reported_system().validate().unwrap();
+    }
     use super::*;
 
     #[test]
