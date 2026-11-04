@@ -146,6 +146,7 @@ pub(super) async fn complete(
                             VerifiedCompletionAttestation::Model(_)
                         ) =>
                 {
+                    super::routing::check_repetition(&completion)?;
                     return Ok(completion);
                 }
                 Ok(_) => return Err("near_model_signature_required"),
