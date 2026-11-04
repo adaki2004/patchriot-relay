@@ -1246,6 +1246,8 @@ mod tests {
             scope_sha256: hash.clone(),
             evidence: PentestEvidence {
                 context: PentestContext {
+                    review_policy: Default::default(),
+                    third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope,
                     scope_sha256: hash,
@@ -1286,6 +1288,8 @@ mod tests {
             scope_sha256: scope.hash().unwrap(),
             evidence: PentestEvidence {
                 context: PentestContext {
+                    review_policy: Default::default(),
+                    third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope_sha256: scope.hash().unwrap(),
                     scope,
@@ -1433,6 +1437,8 @@ mod tests {
             scope_sha256: scope.hash().unwrap(),
             evidence: PentestEvidence {
                 context: PentestContext {
+                    review_policy: Default::default(),
+                    third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope_sha256: scope.hash().unwrap(),
                     scope,
