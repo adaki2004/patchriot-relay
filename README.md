@@ -95,12 +95,12 @@ Run these as the Unix user that owns the device state. `doctor` is read-only apa
 | --- | --- |
 | `doctor --state-dir STATE --agent-config CONFIG` | Explain connection, pending-work and installed-image readiness |
 | `skills --state-dir STATE --agent-config CONFIG` | List capabilities of the installed adapter; model weights are not verified |
-| `self-heal --state-dir STATE --agent-config CONFIG` | Clean only this device's leftover containers; preserve pairing, results and paid-work markers |
+| `self-heal --state-dir STATE --agent-config CONFIG` | Retry a saved result's delivery, then clean only this device's leftover containers; preserve pairing and paid-work markers |
 | `update-agent --state-dir STATE --agent-config CONFIG --candidate-config CANDIDATE` | Inspect a locally installed, immutable image and save settings for this device |
 | `install-skill --state-dir STATE --agent-config CONFIG --candidate-config CANDIDATE --skill NAME` | Require that the candidate image supplies the named supported capability, then save it |
 | `update-model --state-dir STATE --candidate-config CANDIDATE --new-state-dir NEW_STATE --runtime-version VERSION` | Create a new, paused identity for fresh pairing, approval and requester consent |
 
-Prefix each command with `patchriot-relay`. For a change, wait for work to finish, run `pause`, then stop the service. Maintenance refuses a running connection or saved unfinished work. Prepare the candidate JSON using the configuration below; build or obtain its trusted image separately. No command downloads a skill or runs its installer on the host. Supported live skill names currently come from `skills`, such as `authenticated_http_v1` and `active_web_v1`.
+Prefix each command with `patchriot-relay`. For a change, wait for work to finish, run `pause`, then stop the service. Maintenance refuses a running connection or saved unfinished work. Self-heal may resend an existing result; it never reruns the assessment, and a lost reply leaves the result queued. Prepare the candidate JSON using the configuration below; build or obtain its trusted image separately. No command downloads a skill or runs its installer on the host. Supported live skill names currently come from `skills`, such as `authenticated_http_v1` and `active_web_v1`.
 
 Updates write `STATE/agent-settings.json` and retain a private previous copy. Shared configuration files are untouched. Restart the service using the returned `--agent-config` path, check it with `doctor`, then `resume`. An adapter update keeps its model declaration; changing the model or declared Hermes version needs a newly paired identity. Existing requests keep their original team and consent.
 

@@ -185,8 +185,17 @@ pub(crate) fn execute(args: &[String]) -> Result<u8, Error> {
     }
     // Take locks in the same order as connect. Re-read state under both locks.
     let _daemon = stopped(directory)?;
-    let _state = state_lock(directory)?;
-    let config = read_config(directory)?;
+    let mut state_guard = state_lock(directory)?;
+    let mut config = read_config(directory)?;
+    if action == "self-heal" && config.paused && config.pending_result.is_some() {
+        // Retry only delivery of the saved receipt. Never poll for an assignment
+        // or rerun inference. A failed connection leaves the outbox untouched.
+        drop(state_guard);
+        send_result(directory, &client()?)?;
+        state_guard = state_lock(directory)?;
+        config = read_config(directory)?;
+    }
+    let _state = state_guard;
     idle(&config)?;
     read_key(directory)?;
     if action == "self-heal" {
@@ -336,5 +345,31 @@ mod tests {
         assert_eq!(fs::read(directory.join("device.key")).unwrap(), old_key);
         assert_eq!(fs::read(directory.join("relay.json")).unwrap(), old_config);
         assert!(new_model_state(&next, &config, &settings, "0.22.5").is_err());
+    }
+
+    #[test]
+    fn self_heal_keeps_an_outbox_when_delivery_is_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = fixture(root.path());
+        let mut config = read_config(&directory).unwrap();
+        config.paused = true;
+        config.device_id = Some(Uuid::nil());
+        config.pending_result = Some(CompleteWork {
+            lease_id: Uuid::nil(),
+            result: WorkResult::Fixture(patchriot_protocol::FixtureResult { runs: Vec::new() }),
+        });
+        write_config(&directory, &config).unwrap();
+        let before = fs::read(directory.join("relay.json")).unwrap();
+        assert!(
+            execute(&[
+                "self-heal".into(),
+                "--state-dir".into(),
+                directory.to_str().unwrap().into(),
+                "--agent-config".into(),
+                "never-read.json".into()
+            ])
+            .is_err()
+        );
+        assert_eq!(before, fs::read(directory.join("relay.json")).unwrap());
     }
 }
