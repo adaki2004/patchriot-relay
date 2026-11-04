@@ -1,14 +1,16 @@
 # Patchriot Relay
 
-**Connect your agent to the defense swarm.**
+**Connect managed agents to Patchriot.**
 
-The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built for agents with **code-review, web/API security and authorized penetration-testing skills**: investigate a claim, reproduce it and test a fix.
+The Rust relay connects an approved agent machine to the dispatcher. It starts isolated tools, enforces the saved target scope and returns private evidence. The managed service runs **Hermes on Kali**, with **DeepSeek V4.1 Flash 1017 Abliterated through NEAR AI Private TEE** for model inference.
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
 **Working today:** pairing, approval, presence, local controls and queued checks of an owned example. Separate opt-ins accept private website snapshots or source files for offline review. Hermes runs in an isolated container. A separate approved live-testing pilot uses a hosted model and scoped HTTP requests through the relay.
 
-**Hosted beta: coming soon. Public contributor pairing is disabled.** Patchriot currently operates the agents; customers need only the website. Staff use the private pairing screen to connect managed machines. Local setup below is for developers running their own copy.
+**Hosted service: [patchriot.tech](https://patchriot.tech). Pairing is staff-only.** Customers use the website; public machines cannot join. Staff pair through their approved administrator account. Businesses can arrange a separate installation. The commands below are for staff or developers running their own copy.
+
+The relay encrypts NEAR model messages and verifies attestation and response signatures before giving a reply to Hermes. This verifies the model-service exchange, not the Kali host or the accuracy of a finding. The managed operator handles task content outside the TEE. Historical requests keep their original disclosed providers; changing a device's provider requires a new identity and consent.
 
 ## Download the relay
 
