@@ -1,20 +1,47 @@
-# Patchriot Relay
+# Patchriot relay
 
-**Connect managed agents to Patchriot.**
+**Connect an approved agent. Keep its work within scope.**
 
-The Rust relay connects an approved agent machine to the dispatcher. It starts isolated tools, enforces the saved target scope and returns private evidence. The managed service runs **Hermes on Kali**, with **DeepSeek V4.1 Flash 1017 Abliterated through NEAR AI Private TEE** for model inference.
+The relay connects a managed Kali machine to Patchriot’s dispatcher, starts Hermes in an isolated container and returns its evidence. It is the connection and supervision layer; Hermes is the agent, and the selected model supplies its inference.
 
-> **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
+[Patchriot ↗](https://patchriot.tech) · [Core](https://github.com/adaki2004/patchriot-core) · [Agent overview](https://patchriot.tech/#/docs/agents)
 
-**Working today:** pairing, approval, presence, local controls and queued checks of an owned example. Separate opt-ins accept private website snapshots or source files for offline review. Hermes runs in an isolated container. A separate approved live-testing pilot uses a hosted model and scoped HTTP requests through the relay.
+```mermaid
+flowchart LR
+    D[Dispatcher: approved assignment] --> R[Relay]
+    R --> H[Isolated Hermes + testing tools]
+    H -->|Scoped requests| W[Verified web app]
+    H <-->|Through relay| N[NEAR AI Private TEE]
+    H -->|Recorded evidence| R
+    R --> D
+```
 
-**Hosted service: [patchriot.tech](https://patchriot.tech). Pairing is staff-only.** Customers use the website; public machines cannot join. Staff pair through their approved administrator account. Businesses can arrange a separate installation. The commands below are for staff or developers running their own copy.
+## What runs where
 
-The relay encrypts NEAR model messages and verifies attestation and response signatures before giving a reply to Hermes. This verifies the model-service exchange, not the Kali host or the accuracy of a finding. The managed operator handles task content outside the TEE. Historical requests keep their original disclosed providers; changing a device's provider requires a new identity and consent.
+| Layer | Job |
+| --- | --- |
+| **Relay / managed Kali** | Device identity, assignments, time and spending limits, target checks, cancellation and cleanup |
+| **Isolated Hermes container** | Investigates the approved target with the permitted tools |
+| **NEAR AI Private TEE** | Processes encrypted model requests; the relay verifies attestation and signed responses |
 
-## Download the relay
+Only the model step runs inside NEAR’s TEE. The agent host and its approved operator still handle assigned content. A consented Venice backup is reported explicitly and has no verified TEE. Containers receive neither host secrets nor unrestricted network access.
 
-Review the source yourself, or ask your agent to inspect it and install it only if that review passes. Use a separate VPS without production credentials. After a merge to `main`, the release workflow builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). The first hosted release is pending. Prototype releases use `v0.0.1-dev.<commit>`. Once available, download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, then:
+Scout investigates, Recon checks its leads and a third reviewer challenges serious or uncertain findings. Reports list the tools actually run. A matching answer is not proof of a vulnerability or of independent reviewers.
+
+> **DON’T TRUST! VERIFY!** Read this source and its dependencies—or ask your own security agent to review them. Inspect the container, network and permission settings before pairing a machine or sharing private work.
+
+## Joining the managed service
+
+Pairing is for approved staff. Initialize a device, pair it through the administrator’s account, then approve its capabilities separately. Public contributors cannot enroll themselves in this beta. A company installation can use its own approved machines and private mesh.
+
+## Install and operate
+
+Expand the relevant section for releases, pairing, health checks or running a supervised service. These commands set up an agent machine; customers only need the hosted website.
+
+<details>
+<summary>Download the relay</summary>
+
+Review the source yourself, or ask your agent to inspect it and install it only if that review passes. Use a separate VPS without production credentials. After a merge to `main`, the release workflow builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). Prototype releases use `v0.0.1-dev.<commit>`. Download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, or build from source if no matching release is available:
 
 ```sh
 sha256sum --ignore-missing --check SHA256SUMS &&
@@ -27,7 +54,10 @@ The archive includes agent/sandbox setup files, service examples and license not
 
 **Releases do not update running agents automatically.** Stop the relay before replacing its binary, preserve its state directory and configuration, then restart it under the same Unix account. You do not need to pair it again.
 
-## Try the owned example
+</details>
+
+<details>
+<summary>Try the owned example</summary>
 
 Place `patchriot-core` beside this repository for its shared protocol crate. Use **Rust 1.94.1** on Linux or macOS.
 
@@ -37,7 +67,10 @@ cargo run --locked -- demo
 
 The demo runs an original access-control bug, a patch and a clean control in separate processes. It reports success only when the original permits cross-user access and both corrected versions block it while preserving legitimate access. This is a known regression example, not an AI-discovered finding.
 
-## Pair your machine
+</details>
+
+<details>
+<summary>Pair your machine</summary>
 
 Agents connect through Patchriot's configured gateway. Device signatures and staff approval control access. Use the connection details supplied during staff pairing; private mesh deployments also require the network setup below. Public contributor pairing remains disabled.
 
@@ -83,7 +116,10 @@ Use the **same Unix account** to initialize, pair and run each relay, including 
 
 For a Hermes installation, add `--runtime hermes --runtime-version VERSION --model MODEL` to `init`, using the version you inspected and the installed model name. Each agent needs its own state directory. These details are **operator declarations**, not verified model weights or a security qualification. A connection reports presence until you explicitly opt in to work.
 
-## Control your contribution
+</details>
+
+<details>
+<summary>Control your contribution</summary>
 
 For a Linux host that should stay online, install the [systemd template](deploy/patchriot-relay@.service) and run `systemctl enable --now patchriot-relay@scout`. Create the `patchriot` OS account, give it access to the local Docker socket, and pair as that same user first. Each instance needs its own private `/var/lib/patchriot-relay/NAME` directory and `agent-settings.json`. The service starts after boot and restarts after a crash; `systemctl stop` remains an intentional stop. Three instances on one host still share one machine's capacity. Adding identities does not add compute.
 
@@ -129,7 +165,10 @@ For slow or incomplete runs, the relay logs the model's declared finish reason (
 
 </details>
 
-## What the safety limits mean
+</details>
+
+<details>
+<summary>Tool, time and spending limits</summary>
 
 The hosted service deletes private report content twelve hours after the requester first exports a finished report. The relay clears its pending result after accepted delivery; a repeated acknowledgement cannot restore a deleted server report. This cannot erase copies an operator saved outside the relay or data already sent to a model provider. Keep assigned material out of host logs, shared folders and backups; cleanup and operator conduct remain separate responsibilities.
 
@@ -210,7 +249,10 @@ The pilot presents its terminal and process-management tools directly, without a
 
 </details>
 
-## Opt in to private website reviews
+</details>
+
+<details>
+<summary>Opt in to private website reviews</summary>
 
 First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review accepts adapter versions 2–7. The current build is version 7; longer CPU budgets require version 3 or later.
 
@@ -231,7 +273,10 @@ Each role gets at most four model calls, 512 output tokens per call and the earl
 
 </details>
 
-## Opt in to live website tests
+</details>
+
+<details>
+<summary id="opt-in-to-live-website-tests">Opt in to live website tests</summary>
 
 This is a separate, manually approved pilot. Pair a device declaring Hermes and `abliterated-model-large-v2`, receive private-work approval and build **adapter 6**. Keep the provider key in a separate mode-`0600` file owned by the relay’s Unix account. The relay checks that file before advertising live capacity, on each work poll and before execution. An invalid key file stops admission before an assignment is accepted. It never enters the task container, browser or dispatcher.
 
@@ -287,7 +332,10 @@ Live activity is sent with signed lease renewals: current stage, recorded reques
 
 Live roles run once. A private start marker prevents a relay restart from repeating paid inference for the same lease; saved result delivery may retry. Keep device state when upgrading. Cancellation or revoked permission stops the lease and container, but cannot undo requests already sent. Findings cite locally recorded HTTP IDs; the next role makes its own checks. Records are operator-reported, not independent attestation, and three identities on one machine are not three independent reviewers.
 
-## Check the controls
+</details>
+
+<details>
+<summary>Check the controls</summary>
 
 GitHub checks run when a ready PR targets `main` and when that PR changes. Draft PRs and ordinary branch pushes do not run checks; newer PR commits cancel superseded runs. Run the commands below locally while developing.
 
@@ -304,7 +352,10 @@ The last two commands intentionally fail. Tests cover signals, descendants, envi
 
 For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pinned protocol commit; private core access needs a `READ_TOKEN` Actions secret with read-only access to core. An existing `PATCHRIOT_READ_TOKEN` secret also works and takes precedence. Keep token values out of source.
 
-## Opt in to private source reviews
+</details>
+
+<details>
+<summary>Opt in to private source reviews</summary>
 
 Build the current **adapter 11** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
 
@@ -318,7 +369,10 @@ The dispatcher sends at most 12 text files, 16 KiB each and 48 KiB total. They a
 
 The three roles inspect and challenge claims against the same saved text. The role named “reproducer” checks quotations and explains what would still need a real test; it does not execute a reproduction. Reports can retain short quotations after the original files expire. Review your local retention and backup settings because operators can see plaintext.
 
-## Keep a relay running
+</details>
+
+<details>
+<summary>Keep a relay running</summary>
 
 Use systemd on a Linux VPS so the relay can restart after a crash and start at boot. Start with an inspected binary, a working local model and a tested agent configuration. The account running the relay can control Docker; trust it as a host administrator. The agent container itself never receives that socket.
 
@@ -365,7 +419,10 @@ The agent unit allows loopback connections by default. For a private model-serve
 
 </details>
 
-## What's next
+</details>
+
+<details>
+<summary>What's next</summary>
 
 Improve review evidence with stronger models and independent operators. GPU trials and confidential execution follow the CPU pilot. No stake or on-chain identity is required.
 
@@ -407,3 +464,5 @@ A temporary NEAR connection failure, rate limit or unavailable verification serv
 Venice lists this model as private, with uncached prices of $0.33/M input and $1.32/M output on 4 November 2026. These are provider declarations, not a Patchriot TEE verification. This route uses HTTPS and does not claim NEAR attestation or identical model weights. Recheck the [model catalogue](https://docs.venice.ai/api-reference/endpoint/models/list) and [privacy terms](https://docs.venice.ai/overview/privacy) before enabling it.
 
 A long repeating response can stop Hermes before it writes a report. The relay checks verified NEAR output before delivery and uses the consented backup for `provider_repetition`. It does not retry website tools. A repeating backup response stops the call; the spending and time limits still apply.
+
+</details>
