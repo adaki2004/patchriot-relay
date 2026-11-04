@@ -59,7 +59,7 @@ fn temporary_storage(engine: bool) -> [(&'static str, &'static str); 3] {
     mounts
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     docker_socket: PathBuf,
@@ -76,6 +76,36 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub(crate) fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    /// Inspects installed files only. Labels describe capabilities; they do not
+    /// prove model weights, operator trust or successful penetration testing.
+    pub(crate) fn installed_capabilities(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
+        if image["Id"] != self.image
+            || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
+            || image["Config"]["User"] != "65534:65534"
+        {
+            return Err(
+                "installed image must use the pinned Patchriot entrypoint and unprivileged user"
+                    .into(),
+            );
+        }
+        self.require_website_adapter()?;
+        let tools = if self.live_provider_key_file.is_some() {
+            self.live_tools()?
+        } else {
+            Vec::new()
+        };
+        Ok(
+            json!({"image":self.image,"model":self.model,"adapter":image["Config"]["Labels"]["io.patchriot.agent-adapter"],
+            "website_review":true,"source_review":self.require_source_adapter().is_ok(),"live_tools":tools,
+            "model_weights_verified":false,"probe_executed":false}),
+        )
+    }
+
     pub fn max_attempt_seconds(&self) -> u64 {
         self.max_attempt_seconds
     }

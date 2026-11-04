@@ -36,6 +36,16 @@ patchriot-relay demo
 patchriot-relay fixture <case> [--timeout-ms N] [--max-output-bytes N] [--cancel-after-ms N]
 patchriot-relay sandbox-check --socket PATH --image sha256:IMAGE_ID
 patchriot-relay agent-check --config PATH
+patchriot-relay doctor --state-dir PATH [--agent-config PATH]
+patchriot-relay self-heal --state-dir PATH --agent-config PATH
+patchriot-relay skills --state-dir PATH --agent-config PATH
+patchriot-relay update-agent --state-dir PATH --agent-config PATH --candidate-config PATH
+patchriot-relay install-skill --state-dir PATH --agent-config PATH --candidate-config PATH --skill NAME
+patchriot-relay update-model --state-dir PATH --candidate-config PATH --new-state-dir PATH --runtime-version VERSION
+
+Maintenance: stop the service and pause before changing it. Use locally installed,
+pinned images. A new model gets a new device identity and requires approval/consent.
+No maintenance command downloads or runs an arbitrary skill installer.
 
 Cases: original, patched, clean, slow, noisy, split_output, malformed, nonzero, descendant, environment
 Fixture defaults: 3000 ms, 8192 combined stdout/stderr bytes. Maximums: 60000 ms, 1048576 bytes.
@@ -71,6 +81,18 @@ fn execute() -> Result<u8, Box<dyn std::error::Error>> {
     }
     if args[0] == "agent-check" {
         return agent::execute(&args);
+    }
+    if [
+        "doctor",
+        "self-heal",
+        "skills",
+        "update-agent",
+        "update-model",
+        "install-skill",
+    ]
+    .contains(&args[0].as_str())
+    {
+        return device::maintenance::execute(&args);
     }
     // The subprocess can run only these compiled-in fixtures, never a shell command.
     if args.len() == 2 && args[0] == "__fixture" {

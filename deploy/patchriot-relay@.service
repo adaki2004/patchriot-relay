@@ -1,0 +1,20 @@
+[Unit]
+Description=Patchriot relay (%i)
+Wants=network-online.target
+After=network-online.target docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=patchriot
+Group=patchriot
+SupplementaryGroups=docker
+UMask=0077
+ExecStart=/usr/local/bin/patchriot-relay connect --state-dir /var/lib/patchriot-relay/%i --agents --agent-config /var/lib/patchriot-relay/%i/agent-settings.json --live-tests
+Restart=always
+RestartSec=30
+TimeoutStopSec=60
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
