@@ -259,6 +259,7 @@ mod tests {
             scope,
             Instant::now() + Duration::from_secs(60),
             Some(&credentials),
+            None,
         )
         .unwrap();
         Arc::get_mut(&mut broker).unwrap().test_target = Some(address);

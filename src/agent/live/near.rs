@@ -44,7 +44,11 @@ where
                     attempt + 1
                 );
                 if !error.retryable() || attempt == 2 {
-                    return Err("near_attestation_unavailable");
+                    return Err(if error.retryable() {
+                        "near_attestation_unavailable"
+                    } else {
+                        "near_attestation_invalid"
+                    });
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -148,7 +152,13 @@ pub(super) async fn complete(
                 Err(e) if e.retryable() && attempt < 2 => {
                     tokio::time::sleep(Duration::from_secs(2)).await
                 }
-                Err(_) => return Err("near_signature_unavailable"),
+                Err(e) => {
+                    return Err(if e.retryable() {
+                        "near_signature_unavailable"
+                    } else {
+                        "near_signature_invalid"
+                    });
+                }
             }
         }
         Err("near_signature_unavailable")
@@ -309,7 +319,7 @@ mod tests {
                 std::future::ready(Err(error.clone()))
             })
             .await;
-            assert_eq!(result, Err("near_attestation_unavailable"));
+            assert_eq!(result, Err("near_attestation_invalid"));
             assert_eq!(calls, 1);
         }
     }

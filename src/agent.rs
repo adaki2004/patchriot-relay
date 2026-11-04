@@ -69,6 +69,8 @@ pub struct Settings {
     model_digest: String,
     #[serde(default)]
     live_provider_key_file: Option<PathBuf>,
+    #[serde(default)]
+    venice_fallback_key_file: Option<PathBuf>,
     #[serde(default = "default_agent_attempt_seconds")]
     max_attempt_seconds: u64,
 }
@@ -109,6 +111,9 @@ impl Settings {
                 .as_deref()
                 .ok_or("live tests require a private provider key file")?,
         )?;
+        if let Some(path) = &self.venice_fallback_key_file {
+            live::read_provider_key(path)?;
+        }
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         if patchriot_protocol::pentests::LiveProvider::from_model(&self.model)
             == Some(patchriot_protocol::pentests::LiveProvider::Venice)
@@ -201,6 +206,13 @@ impl Settings {
             }
         } else {
             crate::inference::origin(&settings.model_url)?;
+        }
+        if settings.venice_fallback_key_file.is_some()
+            && (settings.live_provider_key_file.is_none()
+                || settings.model
+                    != patchriot_protocol::pentests::LiveProvider::NearDeepSeek.model())
+        {
+            return Err("Venice fallback requires the NEAR primary route".into());
         }
         Ok(settings)
     }
@@ -820,6 +832,11 @@ pub fn run(
                     })
                     .min(Instant::now() + Duration::from_secs(settings.max_attempt_seconds)),
                 task.evidence.credentials.as_ref(),
+                if task.evidence.context.allows_venice_fallback {
+                    settings.venice_fallback_key_file.as_deref()
+                } else {
+                    None
+                },
             )
         })
         .transpose()?;
@@ -1156,6 +1173,7 @@ mod tests {
     pub(super) fn settings() -> Settings {
         Settings {
             live_provider_key_file: None,
+            venice_fallback_key_file: None,
             docker_socket: "/var/run/docker.sock".into(),
             image: format!("sha256:{}", "b".repeat(64)),
             model_url: "http://127.0.0.1:11434".into(),
