@@ -57,6 +57,31 @@ pub(super) fn client(key: &str) -> Result<InferenceClient, &'static str> {
     .map_err(|_| "near_configuration_invalid")
 }
 
+async fn completion_body(mut response: InferenceResponse) -> Result<Value, &'static str> {
+    // The SDK's low-level send returns HTTP errors too. Do not interpret an
+    // error body as a model reply or log it: it can quote private request text.
+    if !response.status.is_success() {
+        let status = response.status.as_u16();
+        eprintln!("NEAR completion rejected: http_status={status}");
+        return Err(match status {
+            401 | 403 => "provider_authentication_failed",
+            413 => "provider_context_limit",
+            429 => "provider_rate_limited",
+            500..=599 => "provider_unavailable",
+            _ => "provider_rejected_request",
+        });
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.body.next().await {
+        let chunk = chunk.map_err(|_| "provider_stream_interrupted")?;
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err("provider_response_limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "provider_invalid_json")
+}
+
 pub(super) async fn complete(
     client: &InferenceClient,
     mut body: Value,
@@ -76,24 +101,15 @@ pub(super) async fn complete(
         let request = client
             .chat_request(body)
             .map_err(|_| "invalid_model_request")?;
-        let mut response = client
+        let response = client
             .send(request)
             .await
             .map_err(|_| "provider_unavailable")?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.body.next().await {
-            let chunk = chunk.map_err(|_| "provider_stream_interrupted")?;
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err("provider_response_limit");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let completion: Value =
-            serde_json::from_slice(&bytes).map_err(|_| "unexpected_provider_response")?;
+        let completion = completion_body(response).await?;
         let id = completion["id"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 256)
-            .ok_or("unexpected_provider_response")?;
+            .ok_or("provider_missing_completion_id")?;
         if completion["model"] != model {
             return Err("wrong_provider_model");
         }
@@ -133,7 +149,7 @@ pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>
     let choice = &completion["choices"][0];
     let mut delta = choice["message"]
         .as_object()
-        .ok_or("unexpected_provider_response")?
+        .ok_or("provider_missing_message")?
         .clone();
     if let Some(Value::Array(calls)) = delta.get_mut("tool_calls") {
         for (index, call) in calls.iter_mut().enumerate() {
@@ -147,6 +163,52 @@ pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn http_errors_stop_without_reading_private_error_bodies() {
+        for (status, reason) in [
+            (400, "provider_rejected_request"),
+            (401, "provider_authentication_failed"),
+            (403, "provider_authentication_failed"),
+            (413, "provider_context_limit"),
+            (429, "provider_rate_limited"),
+            (503, "provider_unavailable"),
+        ] {
+            let response = InferenceResponse {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                headers: Default::default(),
+                body: Box::pin(futures_util::stream::poll_fn(|_| {
+                    panic!("a rejected completion body must not be consumed")
+                })),
+            };
+            assert_eq!(completion_body(response).await, Err(reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_body_bounds_and_decodes_successful_responses_only() {
+        for (bytes, expected) in [
+            (
+                b"private invalid reply".to_vec(),
+                Err("provider_invalid_json"),
+            ),
+            (
+                vec![b' '; 2 * 1024 * 1024 + 1],
+                Err("provider_response_limit"),
+            ),
+            (
+                br#"{"id":"synthetic"}"#.to_vec(),
+                Ok(json!({"id":"synthetic"})),
+            ),
+        ] {
+            let response = InferenceResponse {
+                status: reqwest::StatusCode::OK,
+                headers: Default::default(),
+                body: Box::pin(futures_util::stream::iter([Ok(bytes.into())])),
+            };
+            assert_eq!(completion_body(response).await, expected);
+        }
+    }
+
     #[tokio::test]
     async fn preflight_retries_transient_evidence_reads_and_stops_at_three() {
         let mut calls = 0;
