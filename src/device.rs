@@ -227,7 +227,9 @@ fn client() -> Result<reqwest::blocking::Client, Error> {
     Ok(reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(3))
+        // TLS through the operator's gateway may take several seconds. Leave
+        // room for that handshake without extending the whole request or lease.
+        .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(10))
         .user_agent(concat!("patchriot-relay/", env!("CARGO_PKG_VERSION")))
         .build()?)
