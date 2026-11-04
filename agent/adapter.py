@@ -139,6 +139,7 @@ class Bridge(BaseHTTPRequestHandler):
                 request_id += 1
                 request = {"id": request_id, "method": self.command, "path": self.path, "body": body}
                 send({"type": "request", "request": request})
+                disconnected = False
                 while True:
                     line = sys.stdin.buffer.readline(MAX_REQUEST + 1)
                     if not line or len(line) > MAX_REQUEST or not line.endswith(b"\n"):
@@ -146,18 +147,30 @@ class Bridge(BaseHTTPRequestHandler):
                     frame = json.loads(line)
                     if frame["id"] != request_id:
                         raise RuntimeError("unexpected model response")
-                    if frame["type"] == "start":
-                        self.send_response(frame["status"])
-                        self.send_header("Content-Type", frame["content_type"])
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                    elif frame["type"] == "chunk":
-                        self.wfile.write(bytes.fromhex(frame["hex"]))
-                        self.wfile.flush()
-                    elif frame["type"] == "end":
-                        return
-                    else:
-                        raise RuntimeError("model request failed")
+                    try:
+                        if frame["type"] == "start":
+                            status, content_type = frame["status"], frame["content_type"]
+                            if not disconnected:
+                                self.send_response(status)
+                                self.send_header("Content-Type", content_type)
+                                self.send_header("Connection", "close")
+                                self.end_headers()
+                        elif frame["type"] == "chunk":
+                            chunk = bytes.fromhex(frame["hex"])
+                            if not disconnected:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                        elif frame["type"] == "end":
+                            return
+                        else:
+                            raise RuntimeError("model request failed")
+                    except (BrokenPipeError, ConnectionError):
+                        # The caller can time out before the relay. Drain this
+                        # response through End while keeping the transaction
+                        # lock, so the next caller cannot receive its frames.
+                        # Do not resend the model request. The relay's deadline
+                        # and output limits still bound the work and this pipe.
+                        disconnected = True
         except (ValueError, KeyError, RuntimeError, BrokenPipeError, ConnectionError):
             self.close_connection = True
 

@@ -69,6 +69,8 @@ pub struct Settings {
     model_digest: String,
     #[serde(default)]
     live_provider_key_file: Option<PathBuf>,
+    #[serde(default)]
+    venice_fallback_key_file: Option<PathBuf>,
     #[serde(default = "default_agent_attempt_seconds")]
     max_attempt_seconds: u64,
 }
@@ -109,6 +111,9 @@ impl Settings {
                 .as_deref()
                 .ok_or("live tests require a private provider key file")?,
         )?;
+        if let Some(path) = &self.venice_fallback_key_file {
+            live::read_provider_key(path)?;
+        }
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         if patchriot_protocol::pentests::LiveProvider::from_model(&self.model)
             == Some(patchriot_protocol::pentests::LiveProvider::Venice)
@@ -201,6 +206,13 @@ impl Settings {
             }
         } else {
             crate::inference::origin(&settings.model_url)?;
+        }
+        if settings.venice_fallback_key_file.is_some()
+            && (settings.live_provider_key_file.is_none()
+                || settings.model
+                    != patchriot_protocol::pentests::LiveProvider::NearDeepSeek.model())
+        {
+            return Err("Venice fallback requires the NEAR primary route".into());
         }
         Ok(settings)
     }
@@ -499,6 +511,7 @@ async fn supervise(
                 while let Some(end) = pending.iter().position(|&b| b == b'\n') {
                     if end > broker.max_frame() {
                         report.outcome = "invalid_protocol";
+                        report.failure_reason = Some("agent_frame_limit");
                         break 'running;
                     }
                     let wire = serde_json::from_slice::<Wire>(&pending[..end]);
@@ -508,6 +521,15 @@ async fn supervise(
                             report.requests += 1;
                             if active.is_some() || request.id <= last_id || report.requests > broker.max_requests() || final_seen {
                                 report.outcome = "invalid_protocol";
+                                report.failure_reason = Some(if final_seen {
+                                    "agent_request_after_result"
+                                } else if active.is_some() {
+                                    "agent_overlapping_request"
+                                } else if request.id <= last_id {
+                                    "agent_request_replayed"
+                                } else {
+                                    "agent_request_limit"
+                                });
                                 break 'running;
                             }
                             last_id = request.id;
@@ -561,14 +583,21 @@ async fn supervise(
                             }
                             report.events.push(json!({"event":event,"data":data}));
                         }
-                        _ => {
+                        Ok(_) => {
                             report.outcome = "invalid_protocol";
+                            report.failure_reason = Some("agent_event_invalid");
+                            break 'running;
+                        }
+                        Err(_) => {
+                            report.outcome = "invalid_protocol";
+                            report.failure_reason = Some("agent_frame_invalid");
                             break 'running;
                         }
                     }
                 }
                 if pending.len() > broker.max_frame() {
                     report.outcome = "invalid_protocol";
+                    report.failure_reason = Some("agent_frame_limit");
                     break;
                 }
             }
@@ -616,9 +645,18 @@ async fn supervise(
         report.outcome = "agent_failed";
     }
     report.duration_ms = started.elapsed().as_millis();
+    // Log only fixed reason codes and counts. Frames may contain credentials,
+    // target responses or private model messages and must not enter the log.
     eprintln!(
-        "agent stopped: outcome={} exit_code={:?} inference_attempts={} final_event={} duration_ms={}",
-        report.outcome, report.exit_code, report.inference_calls, final_seen, report.duration_ms,
+        "agent stopped: outcome={} reason={:?} exit_code={:?} requests={} output_bytes={} inference_attempts={} final_event={} duration_ms={}",
+        report.outcome,
+        report.failure_reason,
+        report.exit_code,
+        report.requests,
+        report.output_bytes,
+        report.inference_calls,
+        final_seen,
+        report.duration_ms,
     );
     Ok(report)
 }
@@ -794,6 +832,11 @@ pub fn run(
                     })
                     .min(Instant::now() + Duration::from_secs(settings.max_attempt_seconds)),
                 task.evidence.credentials.as_ref(),
+                if task.evidence.context.allows_venice_fallback {
+                    settings.venice_fallback_key_file.as_deref()
+                } else {
+                    None
+                },
             )
         })
         .transpose()?;
@@ -1130,6 +1173,7 @@ mod tests {
     pub(super) fn settings() -> Settings {
         Settings {
             live_provider_key_file: None,
+            venice_fallback_key_file: None,
             docker_socket: "/var/run/docker.sock".into(),
             image: format!("sha256:{}", "b".repeat(64)),
             model_url: "http://127.0.0.1:11434".into(),
@@ -1257,16 +1301,14 @@ mod tests {
                 "agent_failed"
             );
         }
-        assert_eq!(
-            run(
-                &format!("{RESULT}; {RESULT}"),
-                &cancelled,
-                Duration::from_secs(2)
-            )
-            .await
-            .outcome,
-            "invalid_protocol"
-        );
+        let duplicate = run(
+            &format!("{RESULT}; {RESULT}"),
+            &cancelled,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(duplicate.outcome, "invalid_protocol");
+        assert_eq!(duplicate.failure_reason, Some("agent_event_invalid"));
     }
 
     #[tokio::test]
@@ -1285,6 +1327,18 @@ mod tests {
             );
         }
         assert_eq!(run(r#"printf '%s\n' '{"type":"request","request":{"id":1,"method":"POST","path":"/v1/chat/completions","body":{"model":"other"}}}'"#,&cancelled,Duration::from_secs(1)).await.outcome,"invalid_model_request");
+        let malformed = run("printf 'not-json\\n'", &cancelled, Duration::from_secs(1)).await;
+        assert_eq!(malformed.failure_reason, Some("agent_frame_invalid"));
+        let after_result = run(
+            &format!("{RESULT}; {request}"),
+            &cancelled,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            after_result.failure_reason,
+            Some("agent_request_after_result")
+        );
     }
 
     #[tokio::test]
@@ -1311,6 +1365,7 @@ mod tests {
         assert!(report.output_bytes <= 1_048_576 + 8192);
         let report=run("while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done",&cancelled,Duration::from_secs(5)).await;
         assert_eq!(report.outcome, "invalid_protocol");
+        assert_eq!(report.failure_reason, Some("agent_frame_limit"));
         assert!(report.output_bytes <= MAX_REQUEST + 8192);
     }
 

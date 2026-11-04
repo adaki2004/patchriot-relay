@@ -114,6 +114,43 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(len(wire), 1)
 
+    def test_disconnected_http_caller_does_not_poison_the_next_bridge_request(self):
+        class Disconnected(io.BytesIO):
+            def write(self, _data):
+                raise BrokenPipeError('synthetic closed HTTP connection')
+
+        def handler(stage=None):
+            instance = object.__new__(adapter.Bridge)
+            instance.command, instance.path, instance.headers = 'GET', '/api/version', {}
+            instance.rfile, instance.wfile = io.BytesIO(), Disconnected() if stage == 'body' else io.BytesIO()
+            instance.send_response = lambda _status: None
+            instance.send_header = lambda *_args: None
+            def headers():
+                if stage == 'headers':
+                    raise BrokenPipeError('synthetic closed HTTP connection')
+            instance.end_headers = headers
+            return instance
+
+        frames = [frame for identifier in (1, 2) for frame in (
+            {'type': 'start', 'id': identifier, 'status': 200, 'content_type': 'application/json'},
+            {'type': 'chunk', 'id': identifier, 'hex': str(identifier).encode().hex()},
+            {'type': 'chunk', 'id': identifier, 'hex': b' remainder'.hex()},
+            {'type': 'end', 'id': identifier},
+        )]
+        for stage in ('headers', 'body'):
+            with self.subTest(disconnect_at=stage):
+                incoming = io.TextIOWrapper(io.BytesIO(b''.join(json.dumps(f).encode() + b'\n' for f in frames)))
+                wire = io.StringIO()
+                adapter.request_id = 0
+                with patch.object(adapter, 'wire_out', wire), patch.object(sys, 'stdin', incoming):
+                    handler(stage).exchange()
+                    next_request = handler()
+                    next_request.exchange()
+                self.assertEqual(next_request.wfile.getvalue(), b'2 remainder')
+                self.assertEqual(incoming.buffer.read(), b'')
+                # No paid-model replay or duplicated request is introduced.
+                self.assertEqual([json.loads(line)['request']['id'] for line in wire.getvalue().splitlines()], [1, 2])
+
     def test_oversized_http_body_never_enters_the_pipe(self):
         result, wire = self.exchange([], "POST", "/v1/chat/completions", headers={"Content-Length": str(adapter.MAX_REQUEST + 1)})
         self.assertEqual(result[0], 400)

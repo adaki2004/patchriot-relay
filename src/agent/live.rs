@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
 mod login;
 mod near;
+mod routing;
 
 #[cfg(test)]
 pub const MODEL: &str = LiveProvider::MODELS[0];
@@ -128,6 +129,8 @@ struct Counters {
     calls: u16,
     evidence: Vec<HttpEvidence>,
     evidence_bytes: usize,
+    primary_attempts: u16,
+    fallback: Option<VeniceFallbackReceipt>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,6 +180,7 @@ pub struct LiveBroker {
     client: reqwest::Client,
     near: Option<nearai_inference_sdk::InferenceClient>,
     key: zeroize::Zeroizing<String>,
+    fallback_key: Option<zeroize::Zeroizing<String>>,
     scope: LiveScope,
     deadline: Instant,
     counters: Mutex<Counters>,
@@ -214,7 +218,14 @@ impl LiveBroker {
         scope: LiveScope,
         deadline: Instant,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        Self::new_with_credentials(LiveProvider::Abliteration, key_file, scope, deadline, None)
+        Self::new_with_credentials(
+            LiveProvider::Abliteration,
+            key_file,
+            scope,
+            deadline,
+            None,
+            None,
+        )
     }
     pub fn new_with_credentials(
         provider: LiveProvider,
@@ -222,8 +233,13 @@ impl LiveBroker {
         scope: LiveScope,
         deadline: Instant,
         credentials: Option<&TestCredentials>,
+        fallback_key_file: Option<&Path>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let key = read_provider_key(key_file)?;
+        if fallback_key_file.is_some() && provider != LiveProvider::NearDeepSeek {
+            return Err("Venice fallback requires NEAR primary inference".into());
+        }
+        let fallback_key = fallback_key_file.map(read_provider_key).transpose()?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -241,6 +257,7 @@ impl LiveBroker {
             client,
             near,
             key,
+            fallback_key,
             scope,
             deadline,
             counters: Mutex::new(Counters::default()),
@@ -308,6 +325,7 @@ impl LiveBroker {
             }
             LiveProvider::NearDeepSeek => {
                 body["store"] = json!(false);
+                near::preserve_tool_text(&mut body);
                 // No provider search, fallback, model aliases or extra routing
                 // options from the agent. NEAR's SDK owns encrypted transport.
             }
@@ -341,6 +359,9 @@ impl LiveBroker {
         let engine = request.path == ENGINE_CHAT;
         if !engine {
             self.finish_before_limit(&mut body)?;
+        }
+        if self.fallback_key.is_some() {
+            return self.routed_model(body, engine, request.id, output).await;
         }
         let bytes = serde_json::to_vec(&body).map_err(|_| "invalid_model_request")?;
         if bytes.len() > MAX_FRAME {
@@ -876,6 +897,7 @@ impl LiveBroker {
                 } else {
                     Some(report.failure_reason.unwrap_or(report.outcome).to_owned())
                 },
+                fallback: count.fallback.clone(),
             },
             assessment: assessment.and_then(|a| {
                 let mut value = serde_json::to_value(a).ok()?;
@@ -1036,7 +1058,7 @@ mod tests {
             })
             .collect()
     }
-    fn broker() -> Arc<LiveBroker> {
+    pub(super) fn broker() -> Arc<LiveBroker> {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "fixture-provider-credential-not-real").unwrap();
         LiveBroker::new(
@@ -1246,6 +1268,9 @@ mod tests {
             scope_sha256: hash.clone(),
             evidence: PentestEvidence {
                 context: PentestContext {
+                    allows_venice_fallback: false,
+                    review_policy: Default::default(),
+                    third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope,
                     scope_sha256: hash,
@@ -1286,6 +1311,9 @@ mod tests {
             scope_sha256: scope.hash().unwrap(),
             evidence: PentestEvidence {
                 context: PentestContext {
+                    allows_venice_fallback: false,
+                    review_policy: Default::default(),
+                    third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope_sha256: scope.hash().unwrap(),
                     scope,
@@ -1424,6 +1452,46 @@ mod tests {
         );
     }
     #[test]
+    fn only_near_labels_array_tool_text_before_sending_either_agent_route() {
+        for provider in [
+            LiveProvider::NearDeepSeek,
+            LiveProvider::Abliteration,
+            LiveProvider::Venice,
+        ] {
+            for path in ["/v1/chat/completions", ENGINE_CHAT] {
+                let mut broker = broker();
+                let owned = Arc::get_mut(&mut broker).unwrap();
+                owned.provider = provider;
+                owned.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+                let request = Request {
+                    id: 1,
+                    method: "POST".into(),
+                    path: path.into(),
+                    body: Some(json!({"model":provider.model(),"messages":[
+                        {"role":"user","content":"Inspect the owned example"},
+                        {"role":"assistant","content":null,"tool_calls":[{"id":"lookup","type":"function","function":{"name":"list_findings","arguments":"{}"}}]},
+                        {"role":"tool","tool_call_id":"lookup","content":"[]"}
+                    ]})),
+                };
+                let prepared = broker.chat(&request).unwrap();
+                assert_eq!(
+                    prepared["messages"][2]["content"],
+                    if provider == LiveProvider::NearDeepSeek {
+                        "Tool result (JSON):\n[]"
+                    } else {
+                        "[]"
+                    }
+                );
+                assert_eq!(prepared["messages"][2]["tool_call_id"], "lookup");
+                assert_eq!(
+                    request.body.as_ref().unwrap()["messages"][2]["content"],
+                    "[]"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mixed_provider_assignment_binds_each_role_and_rejects_a_false_disclosure() {
         let scope = broker().scope.clone();
         let mut selected = reviewers();
@@ -1433,6 +1501,9 @@ mod tests {
             scope_sha256: scope.hash().unwrap(),
             evidence: PentestEvidence {
                 context: PentestContext {
+                    allows_venice_fallback: false,
+                    review_policy: Default::default(),
+                    third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope_sha256: scope.hash().unwrap(),
                     scope,

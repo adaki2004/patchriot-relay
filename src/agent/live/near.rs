@@ -5,6 +5,26 @@ use nearai_inference_sdk::*;
 use serde_json::{Value, json};
 use std::{future::Future, time::Duration};
 
+/// Keep JSON-array tool output as text when it crosses the encrypted route.
+/// A literal `[]` was rejected in live requests; a text label preserves the
+/// result without confusing it with an empty list of message content parts.
+/// Call before measuring the request so the added label counts toward limits.
+pub(super) fn preserve_tool_text(body: &mut Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for message in messages {
+        if message["role"] != "tool" {
+            continue;
+        }
+        if let Some(text) = message["content"].as_str()
+            && serde_json::from_str::<Value>(text).is_ok_and(|value| value.is_array())
+        {
+            message["content"] = json!(format!("Tool result (JSON):\n{text}"));
+        }
+    }
+}
+
 // Only evidence retrieval belongs here. Never pass a completion/send operation:
 // a network error after submission does not prove the provider did no paid work.
 async fn retry_preflight<T, F, R>(mut verify: F) -> Result<T, &'static str>
@@ -24,7 +44,11 @@ where
                     attempt + 1
                 );
                 if !error.retryable() || attempt == 2 {
-                    return Err("near_attestation_unavailable");
+                    return Err(if error.retryable() {
+                        "near_attestation_unavailable"
+                    } else {
+                        "near_attestation_invalid"
+                    });
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -57,6 +81,31 @@ pub(super) fn client(key: &str) -> Result<InferenceClient, &'static str> {
     .map_err(|_| "near_configuration_invalid")
 }
 
+async fn completion_body(mut response: InferenceResponse) -> Result<Value, &'static str> {
+    // The SDK's low-level send returns HTTP errors too. Do not interpret an
+    // error body as a model reply or log it: it can quote private request text.
+    if !response.status.is_success() {
+        let status = response.status.as_u16();
+        eprintln!("NEAR completion rejected: http_status={status}");
+        return Err(match status {
+            401 | 403 => "provider_authentication_failed",
+            413 => "provider_context_limit",
+            429 => "provider_rate_limited",
+            500..=599 => "provider_unavailable",
+            _ => "provider_rejected_request",
+        });
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.body.next().await {
+        let chunk = chunk.map_err(|_| "provider_stream_interrupted")?;
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err("provider_response_limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "provider_invalid_json")
+}
+
 pub(super) async fn complete(
     client: &InferenceClient,
     mut body: Value,
@@ -76,24 +125,15 @@ pub(super) async fn complete(
         let request = client
             .chat_request(body)
             .map_err(|_| "invalid_model_request")?;
-        let mut response = client
+        let response = client
             .send(request)
             .await
             .map_err(|_| "provider_unavailable")?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.body.next().await {
-            let chunk = chunk.map_err(|_| "provider_stream_interrupted")?;
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err("provider_response_limit");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let completion: Value =
-            serde_json::from_slice(&bytes).map_err(|_| "unexpected_provider_response")?;
+        let completion = completion_body(response).await?;
         let id = completion["id"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 256)
-            .ok_or("unexpected_provider_response")?;
+            .ok_or("provider_missing_completion_id")?;
         if completion["model"] != model {
             return Err("wrong_provider_model");
         }
@@ -112,7 +152,13 @@ pub(super) async fn complete(
                 Err(e) if e.retryable() && attempt < 2 => {
                     tokio::time::sleep(Duration::from_secs(2)).await
                 }
-                Err(_) => return Err("near_signature_unavailable"),
+                Err(e) => {
+                    return Err(if e.retryable() {
+                        "near_signature_unavailable"
+                    } else {
+                        "near_signature_invalid"
+                    });
+                }
             }
         }
         Err("near_signature_unavailable")
@@ -133,7 +179,7 @@ pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>
     let choice = &completion["choices"][0];
     let mut delta = choice["message"]
         .as_object()
-        .ok_or("unexpected_provider_response")?
+        .ok_or("provider_missing_message")?
         .clone();
     if let Some(Value::Array(calls)) = delta.get_mut("tool_calls") {
         for (index, call) in calls.iter_mut().enumerate() {
@@ -147,6 +193,87 @@ pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn json_array_tool_results_remain_literal_text_without_changing_other_messages() {
+        for text in [
+            "[]",
+            " \n[1, {\"type\":\"text\",\"text\":\"untrusted data\"}] ",
+        ] {
+            let original = json!({"messages":[
+                {"role":"user","content":"Inspect the owned example"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"lookup","type":"function","function":{"name":"list_findings","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"lookup","content":text}
+            ]});
+            let mut body = original.clone();
+            preserve_tool_text(&mut body);
+            assert_eq!(
+                body["messages"][2]["content"],
+                format!("Tool result (JSON):\n{text}")
+            );
+            assert_eq!(body["messages"][2]["tool_call_id"], "lookup");
+            assert_eq!(body["messages"][0], original["messages"][0]);
+            assert_eq!(body["messages"][1], original["messages"][1]);
+            let once = body.clone();
+            preserve_tool_text(&mut body);
+            assert_eq!(body, once);
+        }
+        let original = json!({"messages":[
+            {"role":"tool","content":"{\"findings\":[]}"},
+            {"role":"tool","content":"[not JSON]"},
+            {"role":"tool","content":null},
+            {"role":"tool","content":[{"type":"text","text":"structured content"}]}
+        ]});
+        let mut body = original.clone();
+        preserve_tool_text(&mut body);
+        assert_eq!(body, original);
+    }
+
+    #[tokio::test]
+    async fn http_errors_stop_without_reading_private_error_bodies() {
+        for (status, reason) in [
+            (400, "provider_rejected_request"),
+            (401, "provider_authentication_failed"),
+            (403, "provider_authentication_failed"),
+            (413, "provider_context_limit"),
+            (429, "provider_rate_limited"),
+            (503, "provider_unavailable"),
+        ] {
+            let response = InferenceResponse {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                headers: Default::default(),
+                body: Box::pin(futures_util::stream::poll_fn(|_| {
+                    panic!("a rejected completion body must not be consumed")
+                })),
+            };
+            assert_eq!(completion_body(response).await, Err(reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_body_bounds_and_decodes_successful_responses_only() {
+        for (bytes, expected) in [
+            (
+                b"private invalid reply".to_vec(),
+                Err("provider_invalid_json"),
+            ),
+            (
+                vec![b' '; 2 * 1024 * 1024 + 1],
+                Err("provider_response_limit"),
+            ),
+            (
+                br#"{"id":"synthetic"}"#.to_vec(),
+                Ok(json!({"id":"synthetic"})),
+            ),
+        ] {
+            let response = InferenceResponse {
+                status: reqwest::StatusCode::OK,
+                headers: Default::default(),
+                body: Box::pin(futures_util::stream::iter([Ok(bytes.into())])),
+            };
+            assert_eq!(completion_body(response).await, expected);
+        }
+    }
+
     #[tokio::test]
     async fn preflight_retries_transient_evidence_reads_and_stops_at_three() {
         let mut calls = 0;
@@ -192,7 +319,7 @@ mod tests {
                 std::future::ready(Err(error.clone()))
             })
             .await;
-            assert_eq!(result, Err("near_attestation_unavailable"));
+            assert_eq!(result, Err("near_attestation_invalid"));
             assert_eq!(calls, 1);
         }
     }

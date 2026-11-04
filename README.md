@@ -1,14 +1,16 @@
 # Patchriot Relay
 
-**Connect your agent to the defense swarm.**
+**Connect managed agents to Patchriot.**
 
-The Rust relay connects a patcher's PC or VPS to Patchriot. The product is built for agents with **code-review, web/API security and authorized penetration-testing skills**: investigate a claim, reproduce it and test a fix.
+The Rust relay connects an approved agent machine to the dispatcher. It starts isolated tools, enforces the saved target scope and returns private evidence. The managed service runs **Hermes on Kali**, with **DeepSeek V4.1 Flash 1017 Abliterated through NEAR AI Private TEE** for model inference.
 
 > **DON'T TRUST! VERIFY!** Review the source and permissions yourself, or have your own security agent audit them. Run the tests and authorized penetration checks on your deployment before connecting valuable systems. Pairing and agent signatures do not prove safe behavior.
 
 **Working today:** pairing, approval, presence, local controls and queued checks of an owned example. Separate opt-ins accept private website snapshots or source files for offline review. Hermes runs in an isolated container. A separate approved live-testing pilot uses a hosted model and scoped HTTP requests through the relay.
 
-**Hosted beta: coming soon. Public contributor pairing is disabled.** Patchriot currently operates the agents; customers need only the website. Staff use the private pairing screen to connect managed machines. Local setup below is for developers running their own copy.
+**Hosted service: [patchriot.tech](https://patchriot.tech). Pairing is staff-only.** Customers use the website; public machines cannot join. Staff pair through their approved administrator account. Businesses can arrange a separate installation. The commands below are for staff or developers running their own copy.
+
+The relay encrypts NEAR model messages and verifies attestation and response signatures before giving a reply to Hermes. This verifies the model-service exchange, not the Kali host or the accuracy of a finding. The managed operator handles task content outside the TEE. Historical requests keep their original disclosed providers; changing a device's provider requires a new identity and consent.
 
 ## Download the relay
 
@@ -239,7 +241,7 @@ The trusted relay needs DNS/HTTPS access to the fixed provider and approved publ
 
 </details>
 
-**Three roles:** Scout maps the application; Recon repeats probes and tests the initial claims; Verifier challenges the evidence and suggests fixes. They run sequentially. With adapter 9, Scout runs the discovery scanners and ARTEX once; Recon and Verifier make fresh, targeted controls and investigate gaps. They reuse the saved discovery records without claiming to have run those tools themselves. Update dispatcher before installing this image; older relays remain supported.
+**Two required roles, a third when needed:** Scout maps the application; Recon reproduces its claims with fresh requests and controls. The dispatcher assigns the reserved Verifier for serious findings, disagreement, unchecked claims or incomplete evidence. Roles run sequentially; older requests keep three required stages. Scout alone runs the discovery scanners and adapted ARTEX engine. Later roles inspect that record and make targeted checks instead of repeating the scan. Update dispatcher and gateway before enabling this policy in checkout; it does not require changing an existing adapter 11 image.
 
 Each role starts with a compact scope and prior-findings overview; full transcripts remain available in separate files. Every finding must cite relevant requests recorded during that role. Earlier claims it could not check belong in the limitations. The relay pins the provider's reasoning setting. When time or allowance runs low, it closes tools and requests a bounded JSON report with reduced reasoning. Malformed or unsupported reports remain incomplete.
 
@@ -258,7 +260,7 @@ The selected engine gets a 512 MiB temporary `/work` directory for disposable Po
 
 **What the agent does:** Hermes gets the approved objective, scope, previous reports and the testing method in `agent/live-review-skill.txt`. Its terminal can analyze files and request live evidence through `live_http.py`. The relay enforces HTTPS origins, public DNS/IPs, the saved scope methods, no automatic redirects and at most two requests per second. Test-account access and POST require the explicit scope options described below. No real purchases, fund transfers or load testing are permitted. Responses are bounded; truncated content is marked.
 
-Each role permits up to 500 HTTP observations, 200 provider calls and a $10 conservative inference allowance. Completed responses with token usage use the provider’s uncached rates; missing usage keeps the full reservation. The runner asks for a final report before exhausting its allowance or execution time and closes tools for that response. These are spending estimates, not provider invoices. The [published rates](https://docs.abliteration.ai/pricing) must be rechecked before deployment. Each response allows up to 8,192 output tokens; model reasoning and evidence can still be incomplete. The call ceiling is a backstop, not a target: finish once enough evidence is collected. At the hosted one-hour limit, three sequential roles can use up to a $30 combined allowance and 185 minutes including cleanup. This calibration setting must be reviewed before offering the $10 paid product.
+Each role permits up to 500 HTTP observations, 200 provider calls and a $10 conservative inference allowance. Completed responses with token usage use the provider’s uncached rates; missing usage keeps the full reservation. The runner asks for a final report before exhausting its allowance or execution time and closes tools for that response. These are spending estimates, not provider invoices. Recheck the chosen provider's rates before deployment. Each response allows up to 8,192 output tokens; model reasoning and evidence can still be incomplete. The call ceiling is a backstop, not a target: finish once enough evidence is collected. Two roles can use up to $20 of combined allowance; escalation or a legacy three-role review can use $30 and 185 minutes including cleanup. These calibration ceilings must be reviewed before offering the $10 paid product.
 
 Live activity is sent with signed lease renewals: current stage, recorded request count, model calls and finished tool runs. The private dashboard shows the last server receipt time; these counts do not measure security coverage. Deploy the updated dispatcher before this relay.
 
@@ -367,6 +369,18 @@ The configured routes both list $3 per million input tokens and $5 per million o
 
 This Venice model is marked **anonymized**, not private. Its upstream provider receives content; no upstream zero-retention, TEE or E2EE guarantee is established. See [Venice privacy](https://docs.venice.ai/overview/privacy). Requesters see the provider before consent and in the report. A provider-managed model declaration remains unverified.
 
-**NEAR AI:** pair a new device with `model: "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"`, `model_url: "https://cloud-api.near.ai/v1"` and a private `live_provider_key_file` containing the NEAR key. Deploy matching core and dispatcher versions first. The Rust SDK encrypts the model exchange and requires current gateway, CPU/GPU attestation and a model-service signature. Responses are buffered and verified before Hermes or the discovery engine can consume tool calls. Temporary failures while fetching attestation or signatures can retry up to three times. Invalid evidence or policy failures stop immediately. Paid completions are never replayed; verification failure never enables a fallback to unverified output. Provider keys remain outside the container.
+**NEAR AI:** pair a new device with `model: "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"`, `model_url: "https://cloud-api.near.ai/v1"` and a private `live_provider_key_file` containing the NEAR key. Deploy matching core and dispatcher versions first. The Rust SDK encrypts the model exchange and requires current gateway, CPU/GPU attestation and a model-service signature. Responses are buffered and verified before Hermes or the discovery engine can consume tool calls. Temporary failures while fetching attestation or signatures can retry up to three times. Invalid evidence or policy failures stop immediately. A paid NEAR completion is never replayed to NEAR. Invalid signatures or attestation stop the role; the separately consented recovery route below handles temporary outages without accepting unverified NEAR output. Provider keys remain outside the container.
 
 The [Private TEE DeepSeek route](https://near.ai/models/deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated) lists $0.30 per million input tokens and $1.20 per million output tokens on 3 November 2026. The relay uses those uncached rates for its cost ceiling; recheck prices before deployment. A small evidence exercise verified compatibility, not a general cybersecurity ranking. Attestation covers the model service, not the Kali host or the accuracy of a finding. Operators still see the plaintext task. Linux releases include the native crypto verifier; the pinned builder links OpenSSL statically.
+
+### Optional Venice recovery
+
+For new live tests, NEAR can recover through Venice’s `deepseek-v4-1-flash-1017-uncensored`. Add `venice_fallback_key_file` to the NEAR agent JSON, pointing to a mode-0600 file owned by the relay user. The key stays on the host. Keep the primary model, device identity and NEAR key unchanged.
+
+Update core, dispatcher/gateway and relays together. Only then set `PATCHRIOT_VENICE_FALLBACK_ENABLED=true` on the dispatcher. New checkout consent names Venice; old requests remain NEAR-only. A local key alone cannot authorize sending a requester’s work to another provider.
+
+A temporary NEAR connection failure, rate limit or unavailable verification service permits one Venice attempt before any model response reaches the agent. The role then stays on Venice; the next role starts with NEAR again. Bad credentials, malformed input, invalid signatures, scope denials and exhausted budgets do not trigger recovery. There is no alternating retry loop and no replay of target tools.
+
+**One agent request uses one call allowance, even when it needs both providers.** Both attempts reserve money under the existing $10-per-role limit; an uncertain failed charge is not refunded in the estimate. Time limits and the final-report reserve still apply. The report, exports and retained work receipt record the fallback model, reason and attempt counts.
+
+Venice lists this model as private, with uncached prices of $0.33/M input and $1.32/M output on 4 November 2026. These are provider declarations, not a Patchriot TEE verification. This route uses HTTPS and does not claim NEAR attestation or identical model weights. Recheck the [model catalogue](https://docs.venice.ai/api-reference/endpoint/models/list) and [privacy terms](https://docs.venice.ai/overview/privacy) before enabling it.
