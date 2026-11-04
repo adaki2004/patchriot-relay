@@ -3,6 +3,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import socket
 from pathlib import Path
 import tempfile
 import threading
@@ -125,6 +126,19 @@ class ImageSmoke(unittest.TestCase):
             deadline = time.monotonic() + 30
             with ScopeMirror(SCOPE['origins'][0], deadline, fixture) as mirror:
                 with artex.Engine(Path('/work/artex-state'), f'http://127.0.0.1:{server.server_port}', deadline) as engine:
+                    # Check the shipped process boundary, not the engine's own
+                    # tool approvals or target blacklist. No external target is
+                    # contacted: the isolated namespace has only loopback.
+                    self.assertNotEqual(os.getuid(), 0)
+                    self.assertEqual({name for _, name in socket.if_nameindex()}, {'lo'})
+                    status = Path('/proc/self/status').read_text()
+                    self.assertRegex(status, r'(?m)^CapEff:\s+0+$')
+                    self.assertRegex(status, r'(?m)^NoNewPrivs:\s+1$')
+                    self.assertFalse(os.access('/opt/artex/artex', os.W_OK))
+                    with socket.socket() as proxy:
+                        proxy.settimeout(1)
+                        self.assertNotEqual(proxy.connect_ex(('127.0.0.1', 8788)), 0,
+                                            'The upstream recording proxy must stay disabled')
                     outcome = engine.assess(SCOPE, [mirror.url], 'investigator')
                     # Exercise shipped auth handlers without a connection flood,
                     # shell payload or an external target.
