@@ -181,6 +181,7 @@ impl Settings {
                     patchriot_protocol::pentests::LiveToolProfile::ActiveWebV1,
                     patchriot_protocol::pentests::LiveToolProfile::AuthenticatedHttpV1,
                     patchriot_protocol::pentests::LiveToolProfile::SessionLoginV1,
+                    patchriot_protocol::pentests::LiveToolProfile::FormDiscoveryV1,
                 ]
             } else if matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
