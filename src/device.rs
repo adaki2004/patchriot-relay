@@ -99,6 +99,8 @@ struct Config {
     renewal_sequence: u64,
 }
 
+pub(crate) mod maintenance;
+
 fn require_state_owner(metadata: &fs::Metadata) -> Result<(), Error> {
     if metadata.uid() != rustix::process::geteuid().as_raw() {
         return Err("state belongs to another Unix user; run the relay as the account that owns its state directory and files".into());
@@ -225,7 +227,9 @@ fn client() -> Result<reqwest::blocking::Client, Error> {
     Ok(reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(3))
+        // TLS through the operator's gateway may take several seconds. Leave
+        // room for that handshake without extending the whole request or lease.
+        .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(10))
         .user_agent(concat!("patchriot-relay/", env!("CARGO_PKG_VERSION")))
         .build()?)
@@ -1097,10 +1101,25 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             if agents && read_config(&directory)?.introduction.runtime != RuntimeKind::Hermes {
                 return Err("--agents requires a paired Hermes runtime declaration".into());
             }
+            // Lock before reading agent settings so maintenance cannot race a
+            // connection that has already cached the old image/model.
+            let daemon_lock = private_open(&directory.join("daemon.lock"), true)?;
+            daemon_lock
+                .try_lock()
+                .map_err(|_| "another relay is already using this state directory")?;
             let settings = options
                 .get("--agent-config")
                 .map(|path| crate::agent::Settings::load(Path::new(path)))
                 .transpose()?;
+            if let Some(settings) = &settings
+                && read_config(&directory)?
+                    .introduction
+                    .declared_model
+                    .as_deref()
+                    != Some(settings.model_name())
+            {
+                return Err("agent model differs from the paired declaration; use update-model and obtain fresh approval".into());
+            }
             if live_tests {
                 settings
                     .as_ref()
@@ -1119,10 +1138,6 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
                     .ok_or("source reviews require an agent configuration")?
                     .require_source_adapter()?;
             }
-            let daemon_lock = private_open(&directory.join("daemon.lock"), true)?;
-            daemon_lock
-                .try_lock()
-                .map_err(|_| "another relay is already using this state directory")?;
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))?;

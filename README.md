@@ -85,6 +85,25 @@ For a Hermes installation, add `--runtime hermes --runtime-version VERSION --mod
 
 ## Control your contribution
 
+For a Linux host that should stay online, install the [systemd template](deploy/patchriot-relay@.service) and run `systemctl enable --now patchriot-relay@scout`. Create the `patchriot` OS account, give it access to the local Docker socket, and pair as that same user first. Each instance needs its own private `/var/lib/patchriot-relay/NAME` directory and `agent-settings.json`. The service starts after boot and restarts after a crash; `systemctl stop` remains an intentional stop. Three instances on one host still share one machine's capacity. Adding identities does not add compute.
+
+### Inspect and maintain a relay
+
+Run these as the Unix user that owns the device state. `doctor` is read-only apart from lock files; it checks identity-file permissions, the gateway's HTTPS health, connection state and the configured image/provider files. It sends no customer data or model request. A passing health check does not prove remote approval.
+
+| Command | Effect |
+| --- | --- |
+| `doctor --state-dir STATE --agent-config CONFIG` | Explain connection, pending-work and installed-image readiness |
+| `skills --state-dir STATE --agent-config CONFIG` | List capabilities of the installed adapter; model weights are not verified |
+| `self-heal --state-dir STATE --agent-config CONFIG` | Retry a saved result's delivery, then clean only this device's leftover containers; preserve pairing and paid-work markers |
+| `update-agent --state-dir STATE --agent-config CONFIG --candidate-config CANDIDATE` | Inspect a locally installed, immutable image and save settings for this device |
+| `install-skill --state-dir STATE --agent-config CONFIG --candidate-config CANDIDATE --skill NAME` | Require that the candidate image supplies the named supported capability, then save it |
+| `update-model --state-dir STATE --candidate-config CANDIDATE --new-state-dir NEW_STATE --runtime-version VERSION` | Create a new, paused identity for fresh pairing, approval and requester consent |
+
+Prefix each command with `patchriot-relay`. For a change, wait for work to finish, run `pause`, then stop the service. Maintenance refuses a running connection or saved unfinished work. Self-heal may resend an existing result; it never reruns the assessment, and a lost reply leaves the result queued. Prepare the candidate JSON using the configuration below; build or obtain its trusted image separately. No command downloads a skill or runs its installer on the host. Supported live skill names currently come from `skills`, such as `authenticated_http_v1` and `active_web_v1`.
+
+Updates write `STATE/agent-settings.json` and retain a private previous copy. Shared configuration files are untouched. Restart the service using the returned `--agent-config` path, check it with `doctor`, then `resume`. An adapter update keeps its model declaration; changing the model or declared Hermes version needs a newly paired identity. Existing requests keep their original team and consent.
+
 | Command after `cargo run --locked --` | Effect |
 | --- | --- |
 | `status --state-dir .local/relay-one` | Show local pairing and pause state |
@@ -127,6 +146,8 @@ The example runner and agent modes have separate limits:
 **8 KiB means test output, not prompt size or model context.** The example runner removes inherited environment variables, uses a temporary working directory and stops its process group on timeout or cancellation. That alone is not a sandbox for arbitrary code; it accepts only the built-in tests.
 
 Agent mode requires the container setup below and stops if it cannot use it. A webpage can still try to mislead the model. Permissions and isolation restrict what the agent can do even when its answer is wrong; output limits do not prevent prompt injection.
+
+**Untrusted input stays data.** Uploaded source, repository instructions, login responses and prior findings cannot grant a new origin, tool or credential. Source review reads fixed data files with no model tools and never runs repository hooks or package installers. Live HTTP calls pass through Rust checks for scope, DNS, redirects, methods and headers; test credentials are added outside the agent and redacted from evidence. The container has no host mounts, direct network or provider keys. These controls remain in force if a model follows a malicious instruction; they do not guarantee that its written finding is correct.
 
 Private work requires separate operator approval and requester consent. Assigned operators can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
 
@@ -384,3 +405,5 @@ A temporary NEAR connection failure, rate limit or unavailable verification serv
 **One agent request uses one call allowance, even when it needs both providers.** Both attempts reserve money under the existing $10-per-role limit; an uncertain failed charge is not refunded in the estimate. Time limits and the final-report reserve still apply. The report, exports and retained work receipt record the fallback model, reason and attempt counts.
 
 Venice lists this model as private, with uncached prices of $0.33/M input and $1.32/M output on 4 November 2026. These are provider declarations, not a Patchriot TEE verification. This route uses HTTPS and does not claim NEAR attestation or identical model weights. Recheck the [model catalogue](https://docs.venice.ai/api-reference/endpoint/models/list) and [privacy terms](https://docs.venice.ai/overview/privacy) before enabling it.
+
+A long repeating response can stop Hermes before it writes a report. The relay checks verified NEAR output before delivery and uses the consented backup for `provider_repetition`. It does not retry website tools. A repeating backup response stops the call; the spending and time limits still apply.

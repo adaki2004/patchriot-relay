@@ -9,6 +9,82 @@ enum Route {
     Venice,
 }
 
+/// Check the complete, still-buffered response before Hermes receives it. Its
+/// stream guard stops long repetition loops; detecting that here lets the
+/// consented backup recover the same call without rerunning any target tools.
+/// Short repeats and distinct table/code rows are deliberately left alone.
+pub(super) fn check_repetition(completion: &Value) -> Result<(), &'static str> {
+    let message = &completion["choices"][0]["message"];
+    for field in ["content", "reasoning_content", "reasoning"] {
+        let Some(text) = message[field].as_str() else {
+            continue;
+        };
+        if repetition_dominates(text) {
+            return Err("provider_repetition");
+        }
+    }
+    Ok(())
+}
+
+fn repetition_dominates(text: &str) -> bool {
+    use std::collections::{HashMap, HashSet};
+    // The deployed Hermes guard starts at 16,000 characters and examines a
+    // 64,000-character tail. Bound work independently of provider output size.
+    let mut chars: Vec<_> = text.chars().rev().take(64_000).collect();
+    if chars.len() < 16_000 {
+        return false;
+    }
+    chars.reverse();
+    let tail: String = chars.iter().collect();
+    let lines: Vec<_> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lines.len() >= 5 && lines.iter().collect::<HashSet<_>>().len() * 2 > lines.len() {
+        return false;
+    }
+    let n = chars.len();
+    let needed = n.div_ceil(120).max(5);
+    let mut windows = HashMap::new();
+    for window in chars.windows(60) {
+        let count = windows.entry(window).or_insert(0_usize);
+        *count += 1;
+        if *count >= needed {
+            return true;
+        }
+    }
+    // Long repeated paragraphs need their whole period counted, not just a
+    // short repeated window. Sample a fixed number of candidate anchors.
+    let step = (n - 60).div_ceil(31).max(1);
+    for start in (0..=n - 60).step_by(step) {
+        let mut matches = 0;
+        for end in start + 1..=n - 60 {
+            if chars[start..start + 60] != chars[end..end + 60] {
+                continue;
+            }
+            matches += 1;
+            let period = end - start;
+            let mut left = start;
+            let mut right = start + 60;
+            while left > 0 && chars[left - 1] == chars[left - 1 + period] {
+                left -= 1;
+            }
+            while right + period < n && chars[right] == chars[right + period] {
+                right += 1;
+            }
+            let covered = right + period - left;
+            if covered >= period * 5 && covered * 2 >= n {
+                return true;
+            }
+            if matches == 8 {
+                break;
+            }
+        }
+    }
+    false
+}
+
 fn fallback_body(mut body: Value) -> Value {
     body["model"] = json!(VENICE_FALLBACK_MODEL);
     body["stream"] = json!(false);
@@ -85,6 +161,7 @@ impl LiveBroker {
         if !completion["choices"][0]["message"].is_object() {
             return Err("provider_missing_message");
         }
+        check_repetition(&completion)?;
         Ok(completion)
     }
 
@@ -291,6 +368,49 @@ mod tests {
     }
     fn reply() -> Value {
         json!({"model":VENICE_FALLBACK_MODEL,"choices":[{"message":{"role":"assistant","content":"fixture"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100}})
+    }
+    #[test]
+    fn repetition_guard_covers_reasoning_and_preserves_short_or_distinct_output() {
+        let looped = "Reconsidering the same finding without any new evidence. ".repeat(400);
+        assert!(repetition_dominates(&looped));
+        assert!(!repetition_dominates(&"Repeated citation. ".repeat(30)));
+        let rows = (0..700)
+            .map(|i| format!("Finding row {i}: the same column headings with distinct evidence.\n"))
+            .collect::<String>();
+        assert!(!repetition_dominates(&rows));
+        let paragraph = (0..100)
+            .map(|i| format!("Distinct section {i}: {}\n", i * 13))
+            .collect::<String>();
+        assert!(repetition_dominates(&paragraph.repeat(12)));
+        let mut completion = reply();
+        completion["choices"][0]["message"]["reasoning_content"] = json!(looped);
+        assert_eq!(check_repetition(&completion), Err("provider_repetition"));
+        assert!(check_repetition(&reply()).is_ok());
+    }
+    #[tokio::test]
+    async fn a_repetitive_primary_reply_recovers_before_the_agent_sees_it() {
+        let broker = broker();
+        let mut routes = Vec::new();
+        let completion = broker
+            .route_completion(request(), false, |route, _| {
+                routes.push(route);
+                let mut result = reply();
+                if route == Route::Near {
+                    result["choices"][0]["message"]["content"] = json!(
+                        "I should check the same thing again without new evidence. ".repeat(400)
+                    );
+                }
+                std::future::ready(check_repetition(&result).map(|()| result))
+            })
+            .await
+            .unwrap();
+        assert_eq!(completion, reply());
+        assert_eq!(routes, vec![Route::Near, Route::Venice]);
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(count.calls, 1);
+        let receipt = count.fallback.as_ref().unwrap();
+        assert_eq!(receipt.reason, "provider_repetition");
+        assert!(receipt.valid(1));
     }
     #[tokio::test]
     async fn recovery_is_one_logical_call_and_sticks_to_venice_for_this_role() {
