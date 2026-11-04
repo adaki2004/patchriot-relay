@@ -499,6 +499,7 @@ async fn supervise(
                 while let Some(end) = pending.iter().position(|&b| b == b'\n') {
                     if end > broker.max_frame() {
                         report.outcome = "invalid_protocol";
+                        report.failure_reason = Some("agent_frame_limit");
                         break 'running;
                     }
                     let wire = serde_json::from_slice::<Wire>(&pending[..end]);
@@ -508,6 +509,15 @@ async fn supervise(
                             report.requests += 1;
                             if active.is_some() || request.id <= last_id || report.requests > broker.max_requests() || final_seen {
                                 report.outcome = "invalid_protocol";
+                                report.failure_reason = Some(if final_seen {
+                                    "agent_request_after_result"
+                                } else if active.is_some() {
+                                    "agent_overlapping_request"
+                                } else if request.id <= last_id {
+                                    "agent_request_replayed"
+                                } else {
+                                    "agent_request_limit"
+                                });
                                 break 'running;
                             }
                             last_id = request.id;
@@ -561,14 +571,21 @@ async fn supervise(
                             }
                             report.events.push(json!({"event":event,"data":data}));
                         }
-                        _ => {
+                        Ok(_) => {
                             report.outcome = "invalid_protocol";
+                            report.failure_reason = Some("agent_event_invalid");
+                            break 'running;
+                        }
+                        Err(_) => {
+                            report.outcome = "invalid_protocol";
+                            report.failure_reason = Some("agent_frame_invalid");
                             break 'running;
                         }
                     }
                 }
                 if pending.len() > broker.max_frame() {
                     report.outcome = "invalid_protocol";
+                    report.failure_reason = Some("agent_frame_limit");
                     break;
                 }
             }
@@ -616,9 +633,18 @@ async fn supervise(
         report.outcome = "agent_failed";
     }
     report.duration_ms = started.elapsed().as_millis();
+    // Log only fixed reason codes and counts. Frames may contain credentials,
+    // target responses or private model messages and must not enter the log.
     eprintln!(
-        "agent stopped: outcome={} exit_code={:?} inference_attempts={} final_event={} duration_ms={}",
-        report.outcome, report.exit_code, report.inference_calls, final_seen, report.duration_ms,
+        "agent stopped: outcome={} reason={:?} exit_code={:?} requests={} output_bytes={} inference_attempts={} final_event={} duration_ms={}",
+        report.outcome,
+        report.failure_reason,
+        report.exit_code,
+        report.requests,
+        report.output_bytes,
+        report.inference_calls,
+        final_seen,
+        report.duration_ms,
     );
     Ok(report)
 }
@@ -1257,16 +1283,14 @@ mod tests {
                 "agent_failed"
             );
         }
-        assert_eq!(
-            run(
-                &format!("{RESULT}; {RESULT}"),
-                &cancelled,
-                Duration::from_secs(2)
-            )
-            .await
-            .outcome,
-            "invalid_protocol"
-        );
+        let duplicate = run(
+            &format!("{RESULT}; {RESULT}"),
+            &cancelled,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(duplicate.outcome, "invalid_protocol");
+        assert_eq!(duplicate.failure_reason, Some("agent_event_invalid"));
     }
 
     #[tokio::test]
@@ -1285,6 +1309,18 @@ mod tests {
             );
         }
         assert_eq!(run(r#"printf '%s\n' '{"type":"request","request":{"id":1,"method":"POST","path":"/v1/chat/completions","body":{"model":"other"}}}'"#,&cancelled,Duration::from_secs(1)).await.outcome,"invalid_model_request");
+        let malformed = run("printf 'not-json\\n'", &cancelled, Duration::from_secs(1)).await;
+        assert_eq!(malformed.failure_reason, Some("agent_frame_invalid"));
+        let after_result = run(
+            &format!("{RESULT}; {request}"),
+            &cancelled,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            after_result.failure_reason,
+            Some("agent_request_after_result")
+        );
     }
 
     #[tokio::test]
@@ -1311,6 +1347,7 @@ mod tests {
         assert!(report.output_bytes <= 1_048_576 + 8192);
         let report=run("while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done",&cancelled,Duration::from_secs(5)).await;
         assert_eq!(report.outcome, "invalid_protocol");
+        assert_eq!(report.failure_reason, Some("agent_frame_limit"));
         assert!(report.output_bytes <= MAX_REQUEST + 8192);
     }
 
