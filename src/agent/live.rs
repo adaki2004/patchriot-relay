@@ -308,6 +308,7 @@ impl LiveBroker {
             }
             LiveProvider::NearDeepSeek => {
                 body["store"] = json!(false);
+                near::preserve_tool_text(&mut body);
                 // No provider search, fallback, model aliases or extra routing
                 // options from the agent. NEAR's SDK owns encrypted transport.
             }
@@ -1427,6 +1428,46 @@ mod tests {
                 .contains("unfinished checks")
         );
     }
+    #[test]
+    fn only_near_labels_array_tool_text_before_sending_either_agent_route() {
+        for provider in [
+            LiveProvider::NearDeepSeek,
+            LiveProvider::Abliteration,
+            LiveProvider::Venice,
+        ] {
+            for path in ["/v1/chat/completions", ENGINE_CHAT] {
+                let mut broker = broker();
+                let owned = Arc::get_mut(&mut broker).unwrap();
+                owned.provider = provider;
+                owned.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+                let request = Request {
+                    id: 1,
+                    method: "POST".into(),
+                    path: path.into(),
+                    body: Some(json!({"model":provider.model(),"messages":[
+                        {"role":"user","content":"Inspect the owned example"},
+                        {"role":"assistant","content":null,"tool_calls":[{"id":"lookup","type":"function","function":{"name":"list_findings","arguments":"{}"}}]},
+                        {"role":"tool","tool_call_id":"lookup","content":"[]"}
+                    ]})),
+                };
+                let prepared = broker.chat(&request).unwrap();
+                assert_eq!(
+                    prepared["messages"][2]["content"],
+                    if provider == LiveProvider::NearDeepSeek {
+                        "Tool result (JSON):\n[]"
+                    } else {
+                        "[]"
+                    }
+                );
+                assert_eq!(prepared["messages"][2]["tool_call_id"], "lookup");
+                assert_eq!(
+                    request.body.as_ref().unwrap()["messages"][2]["content"],
+                    "[]"
+                );
+            }
+        }
+    }
+
     #[test]
     fn mixed_provider_assignment_binds_each_role_and_rejects_a_false_disclosure() {
         let scope = broker().scope.clone();

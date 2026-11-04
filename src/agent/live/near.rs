@@ -5,6 +5,26 @@ use nearai_inference_sdk::*;
 use serde_json::{Value, json};
 use std::{future::Future, time::Duration};
 
+/// Keep JSON-array tool output as text when it crosses the encrypted route.
+/// A literal `[]` was rejected in live requests; a text label preserves the
+/// result without confusing it with an empty list of message content parts.
+/// Call before measuring the request so the added label counts toward limits.
+pub(super) fn preserve_tool_text(body: &mut Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for message in messages {
+        if message["role"] != "tool" {
+            continue;
+        }
+        if let Some(text) = message["content"].as_str()
+            && serde_json::from_str::<Value>(text).is_ok_and(|value| value.is_array())
+        {
+            message["content"] = json!(format!("Tool result (JSON):\n{text}"));
+        }
+    }
+}
+
 // Only evidence retrieval belongs here. Never pass a completion/send operation:
 // a network error after submission does not prove the provider did no paid work.
 async fn retry_preflight<T, F, R>(mut verify: F) -> Result<T, &'static str>
@@ -163,6 +183,41 @@ pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn json_array_tool_results_remain_literal_text_without_changing_other_messages() {
+        for text in [
+            "[]",
+            " \n[1, {\"type\":\"text\",\"text\":\"untrusted data\"}] ",
+        ] {
+            let original = json!({"messages":[
+                {"role":"user","content":"Inspect the owned example"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"lookup","type":"function","function":{"name":"list_findings","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"lookup","content":text}
+            ]});
+            let mut body = original.clone();
+            preserve_tool_text(&mut body);
+            assert_eq!(
+                body["messages"][2]["content"],
+                format!("Tool result (JSON):\n{text}")
+            );
+            assert_eq!(body["messages"][2]["tool_call_id"], "lookup");
+            assert_eq!(body["messages"][0], original["messages"][0]);
+            assert_eq!(body["messages"][1], original["messages"][1]);
+            let once = body.clone();
+            preserve_tool_text(&mut body);
+            assert_eq!(body, once);
+        }
+        let original = json!({"messages":[
+            {"role":"tool","content":"{\"findings\":[]}"},
+            {"role":"tool","content":"[not JSON]"},
+            {"role":"tool","content":null},
+            {"role":"tool","content":[{"type":"text","text":"structured content"}]}
+        ]});
+        let mut body = original.clone();
+        preserve_tool_text(&mut body);
+        assert_eq!(body, original);
+    }
+
     #[tokio::test]
     async fn http_errors_stop_without_reading_private_error_bodies() {
         for (status, reason) in [
