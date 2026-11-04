@@ -276,20 +276,28 @@ def scanner(origin, deadline, fetch=request, execute=capture):
                       run["exit_code"], failure)
 
 
-def controls(origin, deadline, previous, fetch=request):
+def controls(origin, deadline, previous, fetch=request, auth_check_path=None):
     started, observed = time.monotonic(), int(time.time())
-    probes = [(origin + "/", {}), (origin + "/", {"Origin": "null"}),
-              (origin + "/patchriot-control-" + os.urandom(8).hex(), {})]
+    probes = [(origin + "/", {}, False), (origin + "/", {"Origin": "null"}, False),
+              (origin + "/patchriot-control-" + os.urandom(8).hex(), {}, False)]
+    if auth_check_path and allowed(origin, origin + auth_check_path):
+        probes.extend([(origin + auth_check_path, {}, False), (origin + auth_check_path, {}, True)])
     for prior in previous:
         cited = {n for f in (prior.get("assessment") or {}).get("findings", []) for n in f.get("evidence_ids", [])}
         for e in prior.get("evidence", []):
             if e.get("id") in cited and e.get("method") == "GET" and allowed(origin, e.get("url", "")):
-                probes.append((e["url"], e.get("request_headers", {})))
+                probes.append((e["url"], e.get("request_headers", {}), e.get("authenticated", False)))
+    # Several roles may cite the same request. Repeat it once per follow-up,
+    # preserving anonymous/authenticated comparisons and distinct headers.
+    unique = {}
+    for url, headers, authenticated in probes:
+        unique.setdefault((url, json.dumps(headers, sort_keys=True), authenticated), (url, headers, authenticated))
+    probes = list(unique.values())
     refs, results = [], []
-    for url, headers in probes[:12]:
+    for url, headers, authenticated in probes[:12]:
         if time.monotonic() >= deadline:
             break
-        reply = fetch_checked(fetch, "GET", url, headers)
+        reply = fetch_checked(fetch, "GET", url, headers, authenticated=authenticated)
         e = reply.get("evidence", {})
         if e.get("id"):
             refs.append(e["id"])
@@ -304,21 +312,26 @@ def fetch_checked_request(method, url, **kwargs):
     return fetch_checked(request, method, url, **kwargs)
 
 
-def run(scope, previous, directory=Path("/work"), emit=lambda _: None):
+def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator"):
+    from live_review import runs_discovery
     deadline = time.monotonic() + 180
-    import baseline
-    initial = baseline.run(scope, deadline, fetch_checked_request, record)
-    records = [initial]
-    emit(initial)
+    discovery = runs_discovery(role)
+    records = []
+    if discovery:
+        import baseline
+        initial = baseline.run(scope, deadline, fetch_checked_request, record)
+        records.append(initial)
+        emit(initial)
     for origin in scope["origins"]:
-        checks = [lambda: crawl(origin, deadline), lambda: scanner(origin, deadline), lambda: controls(origin, deadline, previous)]
+        checks = [lambda: crawl(origin, deadline), lambda: scanner(origin, deadline)] if discovery else []
+        checks.append(lambda: controls(origin, deadline, previous, auth_check_path=scope.get("auth_check_path") if scope.get("authentication") else None))
         for check in checks:
             if time.monotonic() >= deadline:
                 break
             result = check()
             records.append(result)
             emit(result)
-    result = {"profile": PROFILE, "tool_runs": records,
+    result = {"profile": PROFILE, "role": role, "tool_runs": records,
               "limitations": ["Only three curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
                               "The scanner receives selected headers and decoded text through the broker; use recorded target requests as the source of evidence.",
                               "Scanner host/IP and curl snippets describe a loopback mirror, not the target's IP, TLS or exact upstream headers.",

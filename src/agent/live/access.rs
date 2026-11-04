@@ -1,6 +1,6 @@
 //! The model gets a scoped HTTP helper, never credentials or session cookies.
 use base64::{Engine, engine::general_purpose::STANDARD};
-use patchriot_protocol::pentests::{LiveScope, TestCredentials};
+use patchriot_protocol::pentests::{LiveScope, SessionLogin, TestCredentials};
 use reqwest::{
     cookie::{CookieStore, Jar},
     header::{HeaderMap, HeaderValue, SET_COOKIE},
@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 
 pub(super) struct Access {
     authorization: Option<Zeroizing<String>>,
+    login_account: Option<(Zeroizing<String>, Zeroizing<String>)>,
     secrets: Mutex<Vec<Zeroizing<String>>>,
     cookies: Jar,
     cookie_bytes: Mutex<usize>,
@@ -52,15 +53,19 @@ impl Access {
             return Err("invalid_test_credentials");
         }
         let mut secrets = Vec::new();
-        let authorization = credentials.map(|c| match c {
+        let authorization = credentials.and_then(|c| match c {
             TestCredentials::Basic { username, password } => {
                 secrets.push(Zeroizing::new(password.clone()));
                 let joined = Zeroizing::new(format!("{username}:{password}"));
-                format!("Basic {}", STANDARD.encode(joined.as_bytes()))
+                Some(format!("Basic {}", STANDARD.encode(joined.as_bytes())))
             }
             TestCredentials::Bearer { token } => {
                 secrets.push(Zeroizing::new(token.clone()));
-                format!("Bearer {token}")
+                Some(format!("Bearer {token}"))
+            }
+            TestCredentials::Session { password, .. } => {
+                secrets.push(Zeroizing::new(password.clone()));
+                None
             }
         });
         if let Some(header) = &authorization {
@@ -69,11 +74,41 @@ impl Access {
         }
         Ok(Self {
             authorization: authorization.map(Zeroizing::new),
+            login_account: match credentials {
+                Some(TestCredentials::Session { username, password }) => Some((
+                    Zeroizing::new(username.clone()),
+                    Zeroizing::new(password.clone()),
+                )),
+                _ => None,
+            },
             secrets: Mutex::new(secrets),
             cookies: Jar::default(),
             cookie_bytes: Mutex::new(0),
             sessions: scope.methods.iter().any(|m| m == "POST") || credentials.is_some(),
         })
+    }
+    pub fn login_fields(
+        &self,
+        login: &SessionLogin,
+    ) -> Result<std::collections::BTreeMap<String, String>, &'static str> {
+        let (username, password) = self
+            .login_account
+            .as_ref()
+            .ok_or("invalid_test_credentials")?;
+        Ok([
+            (login.username_field.clone(), username.to_string()),
+            (login.password_field.clone(), password.to_string()),
+        ]
+        .into())
+    }
+    pub fn remember_secret(&self, value: String) {
+        self.secrets
+            .lock()
+            .expect("redaction state poisoned")
+            .push(Zeroizing::new(value));
+    }
+    pub fn authenticated(&self, url: &url::Url, enabled: bool) -> bool {
+        self.authorization(enabled).is_some() || self.cookies(url, enabled).is_some()
     }
     pub fn authorization(&self, enabled: bool) -> Option<&str> {
         if enabled {
@@ -213,6 +248,7 @@ mod tests {
             tools: vec![],
             authentication: Some(patchriot_protocol::pentests::TestAuthKind::Bearer),
             auth_check_path: Some("/private".into()),
+            session_login: None,
         };
         let credentials = TestCredentials::Bearer {
             token: "synthetic-bearer-for-tests".into(),

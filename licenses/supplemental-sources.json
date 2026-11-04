@@ -1,0 +1,240 @@
+[
+  {
+    "package": "alloc-stdlib",
+    "version": "0.3.0",
+    "declared_license": "BSD-3-Clause",
+    "source_commit": "0a81fd6928ea3b33c8cd484aa4575d50ffb98012",
+    "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+    "texts": [
+      {
+        "license": "BSD-3-Clause",
+        "url": "https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/0a81fd6928ea3b33c8cd484aa4575d50ffb98012/LICENSE",
+        "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+      }
+    ]
+  },
+  {
+    "package": "brotli",
+    "version": "9.1.1",
+    "declared_license": "BSD-3-Clause AND MIT",
+    "source_commit": "a3cb9311ac6874a379c56b62b61885cc09a5c0d1",
+    "repository": "https://github.com/dropbox/rust-brotli",
+    "texts": [
+      {
+        "license": "BSD-3-Clause",
+        "url": "https://raw.githubusercontent.com/dropbox/rust-brotli/a3cb9311ac6874a379c56b62b61885cc09a5c0d1/LICENSE.BSD-3-Clause",
+        "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+      }
+    ]
+  },
+  {
+    "package": "cms",
+    "version": "0.2.3",
+    "declared_license": "Apache-2.0 OR MIT",
+    "source_commit": "5821a21553509dbd03eae593b0a1fad4e2083d4e",
+    "repository": "https://github.com/RustCrypto/formats/tree/master/cms",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/RustCrypto/formats/5821a21553509dbd03eae593b0a1fad4e2083d4e/base16ct/LICENSE-APACHE",
+        "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5"
+      }
+    ]
+  },
+  {
+    "package": "encoding_rs",
+    "version": "0.8.44",
+    "declared_license": "(Apache-2.0 OR MIT) AND BSD-3-Clause",
+    "source_commit": "8e8556af3cf976392b993a9dbe07456a5ef58469",
+    "repository": "https://github.com/hsivonen/encoding_rs",
+    "texts": [
+      {
+        "license": "BSD-3-Clause",
+        "url": "https://raw.githubusercontent.com/hsivonen/encoding_rs/8e8556af3cf976392b993a9dbe07456a5ef58469/LICENSE-WHATWG",
+        "sha256": "838118388fe5c2e7f1dbbaeed13e1c7f3ebf88be91319c7c1d77c18e987d1a50"
+      }
+    ]
+  },
+  {
+    "package": "impl-trait-for-tuples",
+    "version": "0.2.3",
+    "declared_license": "Apache-2.0/MIT",
+    "source_commit": "457d40c9993b7a6607f213bdf84d856c3871e88c",
+    "repository": "https://github.com/bkchr/impl-trait-for-tuples",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    ]
+  },
+  {
+    "package": "ohttp",
+    "version": "0.7.2",
+    "declared_license": "MIT OR Apache-2.0",
+    "source_commit": "af304a6d34fd93facbf7094bcd5c132c94b27e03",
+    "repository": "https://github.com/martinthomson/ohttp",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/martinthomson/ohttp/af304a6d34fd93facbf7094bcd5c132c94b27e03/LICENSE-APACHE",
+        "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      }
+    ]
+  },
+  {
+    "package": "parity-scale-codec-derive",
+    "version": "3.7.5",
+    "declared_license": "Apache-2.0",
+    "source_commit": "085b1ba8ba2fd4fcd3922afed07a034c1cb885d0",
+    "repository": "https://github.com/paritytech/parity-scale-codec",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/paritytech/parity-scale-codec/085b1ba8ba2fd4fcd3922afed07a034c1cb885d0/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "scale-info-derive",
+    "version": "2.11.6",
+    "declared_license": "Apache-2.0",
+    "source_commit": "885a9201e829f1a40224cf008de493f04932307b",
+    "repository": "https://github.com/paritytech/scale-info",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/paritytech/scale-info/885a9201e829f1a40224cf008de493f04932307b/LICENSE",
+        "sha256": "c95bae1d1ce0235ecccd3560b772ec1efb97f348a79f0fbe0a634f0c2ccefe2c"
+      }
+    ]
+  },
+  {
+    "package": "selectors",
+    "version": "0.38.0",
+    "declared_license": "MPL-2.0",
+    "source_commit": "572ecba2d1600e7c3d490586692a209faf703baa",
+    "repository": "https://github.com/servo/stylo",
+    "texts": [
+      {
+        "license": "MPL-2.0",
+        "url": "https://www.mozilla.org/media/MPL/2.0/index.txt",
+        "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-bundle",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-crypto",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-merkle",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-rekor",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-trust-root",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-tsa",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-types",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  },
+  {
+    "package": "sigstore-verify",
+    "version": "0.11.0",
+    "declared_license": "Apache-2.0",
+    "source_commit": "ef17cacdbd357befea4c1c768ef02ed9bf52672c",
+    "repository": "https://github.com/prefix-dev/sigstore-rust",
+    "texts": [
+      {
+        "license": "Apache-2.0",
+        "url": "https://raw.githubusercontent.com/prefix-dev/sigstore-rust/ef17cacdbd357befea4c1c768ef02ed9bf52672c/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      }
+    ]
+  }
+]

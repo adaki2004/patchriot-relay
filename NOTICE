@@ -11,6 +11,12 @@ Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their o
 
 Linux release binaries statically link musl 1.2.5; its complete copyright notice is preserved in licenses/musl-COPYRIGHT (https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT?h=v1.2.5). Release archives also include Rust standard-library notices from the pinned toolchain and the dependency license texts.
 
+OpenSSL 3 — https://www.openssl.org/
+The OpenSSL Project Authors.
+The NEAR attestation verifier uses OpenSSL. Linux releases statically link it; its Apache-2.0 license is preserved in licenses/openssl-LICENSE.txt. This attribution does not imply endorsement.
+
+Some published Rust crates omit their license files. licenses/supplemental.json supplies notices for exact versions; licenses/supplemental-sources.json records their source URLs and hashes. For crates declaring Apache-2.0 as an alternative, that license is selected where another text is absent. The package check still rejects missing mandatory notices. The unmodified MPL-2.0 selectors source is available from its pinned repository commit and the matching crate archive recorded in Cargo.lock; its source license remains MPL-2.0.
+
 Preserve the applicable copyright and complete license notices when third-party code is actually imported. External runtimes and model weights require their own license review.
 
 External agent runtime

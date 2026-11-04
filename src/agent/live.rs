@@ -5,9 +5,11 @@ use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunSta
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
+mod login;
+mod near;
 
-pub const MODEL: &str = "abliterated-model-large-v2";
-const API: &str = "https://api.abliteration.ai/v1";
+#[cfg(test)]
+pub const MODEL: &str = LiveProvider::MODELS[0];
 pub const MAX_FRAME: usize = 512 * 1024;
 pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
 pub fn is_chat_path(path: &str) -> bool {
@@ -19,6 +21,10 @@ const MAX_SPEND: u64 = 10_000_000;
 const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
 const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
 const REVIEWER_RESERVE: u64 = 1_500_000;
+// Leave space for the next bounded HTTP record, tool transcripts and findings.
+// Refuse a new probe before sending it instead of dropping already cited evidence.
+const HTTP_EVIDENCE_BUDGET: usize = MAX_RESULT_BYTES - 1024 * 1024;
+const HTTP_RECORD_RESERVE: usize = 256 * 1024;
 pub type Progress = Mutex<LiveProgress>;
 
 fn assessment_format() -> Value {
@@ -76,11 +82,32 @@ pub struct Task {
     pub evidence: PentestEvidence,
 }
 impl Task {
+    pub fn model(&self) -> Option<&str> {
+        let position = match self.role {
+            ReviewRole::Investigator => 0,
+            ReviewRole::Reproducer => 1,
+            ReviewRole::Challenger => 2,
+        };
+        self.evidence
+            .context
+            .reviewers
+            .get(position)
+            .map(|r| r.declared_model.as_str())
+    }
     pub fn input(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         if self.evidence.context.scope.normalized()? != self.evidence.context.scope
             || self.evidence.context.scope.hash()? != self.scope_sha256
             || self.evidence.context.scope_sha256 != self.scope_sha256
-            || self.evidence.context.provider != "abliteration.ai"
+            || live_providers(
+                self.evidence
+                    .context
+                    .reviewers
+                    .iter()
+                    .map(|r| r.declared_model.as_str()),
+            )
+            .as_deref()
+                != Some(self.evidence.context.provider.as_str())
+            || self.evidence.context.reviewers.len() != 3
             || self.evidence.previous_reports.len() > 2
         {
             return Err("invalid live assignment".into());
@@ -88,7 +115,7 @@ impl Task {
         let mut bytes = serde_json::to_vec(
             &json!({"kind":"live_http_v1","role":self.role,"evidence":{"context":self.evidence.context,"previous_reports":self.evidence.previous_reports}}),
         )?;
-        if bytes.len() > 3 * 1024 * 1024 {
+        if bytes.len() + 1 > MAX_EVIDENCE_BYTES {
             return Err("live assignment exceeds limit".into());
         }
         bytes.push(b'\n');
@@ -102,13 +129,61 @@ struct Counters {
     evidence: Vec<HttpEvidence>,
     evidence_bytes: usize,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Probe {
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default = "enabled")]
+    authenticated: bool,
+}
+fn enabled() -> bool {
+    true
+}
+
+/// Check the local credential before advertising live work, and again before
+/// execution. A bad installation must not consume an assignment or paid run.
+pub(super) fn read_provider_key(
+    key_file: &Path,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(key_file)?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.mode() & 0o077 != 0
+        || meta.len() > 4096
+        || meta.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err("provider key file must be private and owned by the relay user".into());
+    }
+    let mut key = zeroize::Zeroizing::new(String::new());
+    file.read_to_string(&mut key)?;
+    let key = zeroize::Zeroizing::new(key.trim().to_owned());
+    if key.len() < 16 || key.chars().any(char::is_whitespace) {
+        return Err("invalid provider key file".into());
+    }
+    Ok(key)
+}
+
 pub struct LiveBroker {
+    provider: LiveProvider,
     client: reqwest::Client,
+    near: Option<nearai_inference_sdk::InferenceClient>,
     key: zeroize::Zeroizing<String>,
     scope: LiveScope,
     deadline: Instant,
     counters: Mutex<Counters>,
     access: access::Access,
+    login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
+    #[cfg(test)]
+    test_target: Option<SocketAddr>,
 }
 impl LiveBroker {
     pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
@@ -139,33 +214,16 @@ impl LiveBroker {
         scope: LiveScope,
         deadline: Instant,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        Self::new_with_credentials(key_file, scope, deadline, None)
+        Self::new_with_credentials(LiveProvider::Abliteration, key_file, scope, deadline, None)
     }
     pub fn new_with_credentials(
+        provider: LiveProvider,
         key_file: &Path,
         scope: LiveScope,
         deadline: Instant,
         credentials: Option<&TestCredentials>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(key_file)?;
-        let meta = file.metadata()?;
-        if !meta.is_file()
-            || meta.mode() & 0o077 != 0
-            || meta.len() > 4096
-            || meta.uid() != rustix::process::geteuid().as_raw()
-        {
-            return Err("provider key file must be private and owned by the relay user".into());
-        }
-        let mut key = zeroize::Zeroizing::new(String::new());
-        file.read_to_string(&mut key)?;
-        let key = zeroize::Zeroizing::new(key.trim().to_owned());
-        if key.len() < 16 || key.chars().any(char::is_whitespace) {
-            return Err("invalid provider key file".into());
-        }
+        let key = read_provider_key(key_file)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -173,14 +231,27 @@ impl LiveBroker {
             .timeout(Duration::from_secs(180))
             .build()?;
         let access = access::Access::new(&scope, credentials)?;
+        let near = if provider == LiveProvider::NearDeepSeek {
+            Some(near::client(&key)?)
+        } else {
+            None
+        };
         Ok(Arc::new(Self {
+            provider,
             client,
+            near,
             key,
             scope,
             deadline,
             counters: Mutex::new(Counters::default()),
             access,
+            login_state: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_target: None,
         }))
+    }
+    pub fn model_id(&self) -> &'static str {
+        self.provider.model()
     }
     pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
         let engine = request.path == ENGINE_CHAT;
@@ -197,7 +268,7 @@ impl LiveBroker {
             .as_ref()
             .and_then(Value::as_object)
             .ok_or("invalid_model_request")?;
-        if input.get("model") != Some(&json!(MODEL)) {
+        if input.get("model") != Some(&json!(self.provider.model())) {
             return Err("wrong_model");
         }
         let messages = input
@@ -220,8 +291,27 @@ impl LiveBroker {
         // Large v2 defaults to maximum reasoning. Select the intended effort
         // explicitly. Do not request a response schema here: the current provider
         // skips tool calls when a schema is present, even with a forced tool choice.
-        let mut body = json!({"model":MODEL,"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,
-            "reasoning_effort":"high"});
+        let mut body = json!({"model":self.provider.model(),"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,"reasoning_effort":"high"});
+        match self.provider {
+            LiveProvider::Abliteration => body["reasoning_effort"] = json!("high"),
+            LiveProvider::Venice => {
+                // No upstream browsing, extra system prompt, storage or model
+                // fallback. Target text cannot enable these provider features.
+                body["store"] = json!(false);
+                body["fallbacks"] = json!([]);
+                body["venice_parameters"] = json!({
+                    "include_venice_system_prompt":false,
+                    "enable_web_search":"off",
+                    "enable_web_scraping":false,
+                    "enable_x_search":false
+                });
+            }
+            LiveProvider::NearDeepSeek => {
+                body["store"] = json!(false);
+                // No provider search, fallback, model aliases or extra routing
+                // options from the agent. NEAR's SDK owns encrypted transport.
+            }
+        }
         if let Some(tools) = input.get("tools") {
             if !tools.as_array().is_some_and(|v| {
                 v.len() <= if engine { 64 } else { 16 } && v.iter().all(|t| t["type"] == "function")
@@ -258,7 +348,8 @@ impl LiveBroker {
         }
         // UTF-8 bytes conservatively bound text token usage. Reserve the entire
         // output allowance at published uncached prices, even if a call fails.
-        let reservation = (bytes.len() as u64 + 4096) * 3 + 8192 * 5;
+        let reservation = token_cost(self.provider, bytes.len() as u64 + 4096, 8192)
+            .ok_or("provider_budget_reached")?;
         {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
             // ARTEX has its own response format and planner. Stop it cleanly
@@ -273,9 +364,47 @@ impl LiveBroker {
             count.calls += 1;
             count.reserved += reservation;
         }
+        if let Some(client) = &self.near {
+            let stream = body["stream"] == true;
+            let completion = near::complete(client, body).await?;
+            let bytes = near::response_bytes(&completion, stream)?;
+            output
+                .send(Frame::Start {
+                    id: request.id,
+                    status: 200,
+                    content_type: if stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                })
+                .await
+                .map_err(|_| "agent_disconnected")?;
+            for chunk in bytes.chunks(4096) {
+                output
+                    .send(Frame::Chunk {
+                        id: request.id,
+                        hex: hex::encode(chunk),
+                    })
+                    .await
+                    .map_err(|_| "agent_disconnected")?;
+            }
+            if let Some(cost) = reported_cost(&bytes, stream, self.provider) {
+                let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+                count.reserved = count
+                    .reserved
+                    .saturating_sub(reservation)
+                    .saturating_add(cost);
+            }
+            output
+                .send(Frame::End { id: request.id })
+                .await
+                .map_err(|_| "agent_disconnected")?;
+            return Ok(());
+        }
         let mut response = self
             .client
-            .post(format!("{API}/chat/completions"))
+            .post(format!("{}/chat/completions", self.provider.api_url()))
             .bearer_auth(self.key.as_str())
             .json(&body)
             .send()
@@ -327,7 +456,7 @@ impl LiveBroker {
                     .map_err(|_| "agent_disconnected")?;
             }
         }
-        if let Some(cost) = reported_cost(&usage_bytes, body["stream"] == true) {
+        if let Some(cost) = reported_cost(&usage_bytes, body["stream"] == true, self.provider) {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
             count.reserved = count
                 .reserved
@@ -347,12 +476,15 @@ impl LiveBroker {
     }
     fn finish_before_limit(&self, body: &mut Value) -> Result<(), &'static str> {
         let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
-        let next = (serde_json::to_vec(body)
-            .map_err(|_| "invalid_model_request")?
-            .len() as u64
-            + 4096)
-            * 3
-            + 8192 * 5;
+        let next = token_cost(
+            self.provider,
+            serde_json::to_vec(body)
+                .map_err(|_| "invalid_model_request")?
+                .len() as u64
+                + 4096,
+            8192,
+        )
+        .ok_or("provider_budget_reached")?;
         if count.calls >= FINAL_REPORT_CALL
             || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180)
             || MAX_SPEND.saturating_sub(count.reserved) < next.saturating_mul(2) + 150_000
@@ -363,30 +495,33 @@ impl LiveBroker {
             body["tool_choice"] = json!("none");
             body["reasoning_effort"] = json!("low");
             // Formatting helps the closing turn, but cannot establish evidence.
-            body["response_format"] = assessment_format();
+            // DeepSeek's current NEAR route advertises tools, not structured
+            // output. Its final JSON still passes the same local validation.
+            if self.provider != LiveProvider::NearDeepSeek {
+                body["response_format"] = assessment_format();
+            }
             body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
         }
         Ok(())
     }
 
     async fn http(&self, body: Value) -> Result<Value, &'static str> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Probe {
-            method: String,
-            url: String,
-            #[serde(default)]
-            headers: BTreeMap<String, String>,
-            #[serde(default)]
-            data: Option<String>,
-            #[serde(default = "enabled")]
-            authenticated: bool,
-        }
-        fn enabled() -> bool {
-            true
-        }
         let probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
-        let url = self.scope.permits(&probe.method, &probe.url)?;
+        self.probe_url(&probe, false)?;
+        if probe.authenticated {
+            self.ensure_session().await?;
+        }
+        self.exchange(probe, false).await
+    }
+
+    fn probe_url(&self, probe: &Probe, login: bool) -> Result<url::Url, &'static str> {
+        let url = if login && self.scope.permits_login(&probe.method, &probe.url) {
+            public_url(&probe.url)?
+        } else if login {
+            return Err("outside_approved_scope");
+        } else {
+            self.scope.permits(&probe.method, &probe.url)?
+        };
         if let Some(data) = &probe.data {
             let content = probe
                 .headers
@@ -434,51 +569,47 @@ impl LiveBroker {
         {
             return Err("unsupported_probe_headers");
         }
+        Ok(url)
+    }
+
+    async fn exchange(&self, probe: Probe, login: bool) -> Result<Value, &'static str> {
+        let url = self.probe_url(&probe, login)?;
+        if Instant::now() >= self.deadline {
+            return Err("role_deadline_reached");
+        }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
-            if count.evidence.len() >= MAX_HTTP_REQUESTS || count.evidence_bytes > 600 * 1024 {
+            if count.evidence.len() >= MAX_HTTP_REQUESTS
+                || count.evidence_bytes + HTTP_RECORD_RESERVE > HTTP_EVIDENCE_BUDGET
+            {
                 return Err("target_request_budget_reached");
             }
         }
         // Calls are serialized by the supervised bridge. This pause caps the
         // rate even when the model launches a loop in its terminal tool.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let host = url.host_str().ok_or("target_hostname_required")?;
-        let addresses: Vec<SocketAddr> =
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
-                .await
-                .map_err(|_| "target_dns_timeout")?
-                .map_err(|_| "target_dns_failed")?
-                .collect();
-        if addresses.is_empty()
-            || addresses.len() > 32
-            || addresses.iter().any(|a| !public_ip(a.ip()))
-        {
-            return Err("target_dns_not_public");
-        }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &addresses)
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|_| "target_client_unavailable")?;
+        let (client, destination) = self.target_transport(&url).await?;
         let method = reqwest::Method::from_bytes(probe.method.as_bytes())
             .map_err(|_| "unsupported_method")?;
         let mut request = client
-            .request(method, url.clone())
+            .request(method, destination)
             .header("user-agent", "Patchriot-authorized-review/0.0.2");
         for (key, value) in &probe.headers {
             request = request.header(key, value);
         }
-        let authorization = self.access.authorization(probe.authenticated);
+        let authenticated = !login
+            && self.scope.authentication.is_some()
+            && self.access.authenticated(&url, probe.authenticated);
         request = self.access.apply(request, &url, probe.authenticated);
         if let Some(data) = &probe.data {
             request = request.body(data.clone());
         }
         let response = request.send().await;
-        let retained_body = probe.data.as_ref().map(|v| self.access.redact(v));
+        let retained_body = if login {
+            None
+        } else {
+            probe.data.as_ref().map(|v| self.access.redact(v))
+        };
         let mut evidence = HttpEvidence {
             request_body_excerpt: retained_body
                 .as_ref()
@@ -486,11 +617,16 @@ impl LiveBroker {
             request_body_sha256: retained_body
                 .as_ref()
                 .map(|v| hex::encode(Sha256::digest(v.as_bytes()))),
-            authenticated: authorization.is_some(),
+            authenticated,
+            login,
             id: 0,
             method: probe.method,
             url: probe.url,
-            request_headers: probe.headers,
+            request_headers: if login {
+                BTreeMap::new()
+            } else {
+                probe.headers
+            },
             status: None,
             headers: BTreeMap::new(),
             body_excerpt: String::new(),
@@ -503,6 +639,7 @@ impl LiveBroker {
                 .as_secs() as i64,
         };
         let mut received = Vec::new();
+        let mut login_redirect = None;
         let mut body_truncated = false;
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
@@ -510,6 +647,13 @@ impl LiveBroker {
                 self.access
                     .remember(&url, response.headers(), probe.authenticated);
                 evidence.status = Some(response.status().as_u16());
+                if login {
+                    login_redirect = response
+                        .headers()
+                        .get("location")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                }
                 for &name in RECORDED_HEADERS {
                     if let Some(value) = response.headers().get(name).and_then(|v| v.to_str().ok())
                     {
@@ -539,9 +683,12 @@ impl LiveBroker {
                         }
                     }
                 }
-                let (redacted, shortened) = self
-                    .access
-                    .redact_limited(&String::from_utf8_lossy(&received), 256 * 1024);
+                let (redacted, shortened) = if login {
+                    (String::from_utf8_lossy(&received).into_owned(), false)
+                } else {
+                    self.access
+                        .redact_limited(&String::from_utf8_lossy(&received), 256 * 1024)
+                };
                 received = redacted.into_bytes();
                 body_truncated |= shortened;
                 evidence.truncated |= shortened;
@@ -553,14 +700,53 @@ impl LiveBroker {
                 evidence.truncated |= evidence.body_excerpt.len() < received.len();
             }
         }
+        if login {
+            evidence.headers.clear();
+            evidence.body_excerpt.clear();
+            evidence.body_sha256 = None;
+            evidence.truncated = true;
+        }
         let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
         evidence.id = count.evidence.len() as u32 + 1;
         count.evidence_bytes += serde_json::to_vec(&evidence)
             .map_err(|_| "evidence_encoding_failed")?
             .len();
-        let reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":body_truncated});
+        let mut reply = json!({"remaining_cost_allowance_microusd":MAX_SPEND.saturating_sub(count.reserved),"recorded_header_names":RECORDED_HEADERS,"evidence":evidence,"body":String::from_utf8_lossy(&received),"body_truncated":body_truncated});
         count.evidence.push(evidence);
+        if login {
+            reply["login_redirect"] = json!(login_redirect);
+        }
         Ok(reply)
+    }
+    async fn target_transport(
+        &self,
+        url: &url::Url,
+    ) -> Result<(reqwest::Client, url::Url), &'static str> {
+        #[cfg(test)]
+        if let Some(address) = self.test_target {
+            let mut destination = url.clone();
+            destination.set_scheme("http").unwrap();
+            destination.set_host(Some("127.0.0.1")).unwrap();
+            destination.set_port(Some(address.port())).unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            return Ok((client, destination));
+        }
+        let host = url.host_str().ok_or("target_hostname_required")?;
+        let addresses: Vec<SocketAddr> =
+            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
+                .await
+                .map_err(|_| "target_dns_timeout")?
+                .map_err(|_| "target_dns_failed")?
+                .collect();
+        let client = target_client(host, &addresses)?
+            .build()
+            .map_err(|_| "target_client_unavailable")?;
+        Ok((client, url.clone()))
     }
     pub async fn respond(&self, request: Request, output: mpsc::Sender<Frame>) {
         if is_chat_path(&request.path) {
@@ -599,7 +785,7 @@ impl LiveBroker {
         let (status, body) = match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/v1/models") => (
                 200,
-                json!({"object":"list","data":[{"id":MODEL,"object":"model","context_length":200000}]}),
+                json!({"object":"list","data":[{"id":self.provider.model(),"object":"model","context_length":200000}]}),
             ),
             ("POST", "/patchriot/http") => {
                 match self.http(request.body.unwrap_or(Value::Null)).await {
@@ -675,8 +861,8 @@ impl LiveBroker {
                 } else {
                     WebsiteRunState::Failed
                 },
-                provider: "abliteration.ai".into(),
-                model: MODEL.into(),
+                provider: self.provider.name().into(),
+                model: self.provider.model().into(),
                 image_digest: settings.image.clone(),
                 duration_ms: report.duration_ms.min(u128::from(u64::MAX)) as u64,
                 inference_calls: count.calls,
@@ -716,6 +902,28 @@ impl LiveBroker {
     }
 }
 
+/// Called afresh for every probe. A public answer on an earlier request cannot
+/// authorize a later private address. CNAME resolution never expands URL scope.
+fn target_client(
+    host: &str,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::ClientBuilder, &'static str> {
+    if addresses.is_empty()
+        || addresses.len() > 32
+        || addresses
+            .iter()
+            .any(|a| !public_ip(a.ip()) || a.port() != 443)
+    {
+        return Err("target_dns_not_public");
+    }
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addresses)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15)))
+}
+
 /// Only the fixed startup phase may attach tool transcripts. A later terminal
 /// print from the model cannot masquerade as that phase. HTTP evidence is still
 /// recorded separately by the Rust broker; neither source attests operator honesty.
@@ -743,15 +951,30 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
 
 /// Provider usage is a billing observation, not proof of an invoice. Charge
 /// uncached rates conservatively. Missing usage keeps the original reservation.
-fn reported_cost(bytes: &[u8], stream: bool) -> Option<u64> {
-    fn cost(v: &Value) -> Option<u64> {
+fn token_cost(provider: LiveProvider, input: u64, output: u64) -> Option<u64> {
+    // Published uncached USD per million tokens, checked 2026-11-03.
+    // Integer microdollars, rounded up; cached discounts are not assumed.
+    let (input_rate, output_rate) = match provider {
+        LiveProvider::Abliteration | LiveProvider::Venice => (3_000_000, 5_000_000),
+        LiveProvider::NearDeepSeek => (300_000, 1_200_000),
+    };
+    Some(
+        input
+            .checked_mul(input_rate)?
+            .checked_add(output.checked_mul(output_rate)?)?
+            .div_ceil(1_000_000),
+    )
+}
+
+fn reported_cost(bytes: &[u8], stream: bool, provider: LiveProvider) -> Option<u64> {
+    let cost = |v: &Value| -> Option<u64> {
         let p = v["usage"]["prompt_tokens"].as_u64()?;
         let c = v["usage"]["completion_tokens"].as_u64()?;
         if p == 0 || p > 10_000_000 || c > 1_000_000 {
             return None;
         }
-        p.checked_mul(3)?.checked_add(c.checked_mul(5)?)
-    }
+        token_cost(provider, p, c)
+    };
     if stream {
         bytes
             .split(|b| *b == b'\n')
@@ -801,6 +1024,18 @@ mod tests {
             assert!(parse_assessment(malformed).is_none());
         }
     }
+    fn reviewers() -> Vec<patchriot_protocol::website_reviews::WebsiteReviewer> {
+        (0..3)
+            .map(|i| patchriot_protocol::website_reviews::WebsiteReviewer {
+                device_id: uuid::Uuid::new_v4(),
+                operator_id: uuid::Uuid::new_v4(),
+                operator_name: "Owned fixture operator".into(),
+                device_name: format!("Fixture {i}"),
+                declared_model: MODEL.into(),
+                compute_group: "fixture".into(),
+            })
+            .collect()
+    }
     fn broker() -> Arc<LiveBroker> {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "fixture-provider-credential-not-real").unwrap();
@@ -809,6 +1044,7 @@ mod tests {
             LiveScope {
                 authentication: None,
                 auth_check_path: None,
+                session_login: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
@@ -930,6 +1166,9 @@ mod tests {
         for body in [
             json!({"method":"GET","url":"http://169.254.169.254/latest/meta-data"}),
             json!({"method":"GET","url":"https://elsewhere.example"}),
+            json!({"method":"GET","url":"https://sub.example.com"}),
+            json!({"method":"GET","url":"https://example.com.elsewhere.example"}),
+            json!({"method":"GET","url":"https://user@example.com"}),
             json!({"method":"POST","url":"https://example.com"}),
             json!({"method":"GET","url":"https://example.com","headers":{"Authorization":"private"}}),
             json!({"method":"GET","url":"https://example.com","headers":{"Host":"internal"}}),
@@ -940,6 +1179,62 @@ mod tests {
         assert_eq!(count.calls, 0);
         assert!(count.evidence.is_empty());
         assert_eq!(count.reserved, 0);
+    }
+    #[test]
+    fn dns_answers_are_rechecked_and_mixed_private_answers_are_rejected() {
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        assert!(target_client("owned.example", &[public]).is_ok());
+        for changed in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "169.254.169.254:443",
+            "[::1]:443",
+            "[fd00::1]:443",
+            "1.1.1.1:80",
+        ] {
+            let changed = changed.parse().unwrap();
+            assert!(target_client("owned.example", &[changed]).is_err());
+            assert!(target_client("owned.example", &[public, changed]).is_err());
+        }
+        assert!(target_client("owned.example", &[]).is_err());
+    }
+    #[tokio::test]
+    async fn target_transport_records_redirects_without_contacting_the_destination() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let original = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = original.local_addr().unwrap();
+        let destination = format!("http://{}/must-not-run", blocked.local_addr().unwrap());
+        let location = destination.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = original.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        // Only this test substitutes local transport after exercising the same
+        // client builder. Production accepts public HTTPS and has no override.
+        let client = target_client("owned.example", &["1.1.1.1:443".parse().unwrap()])
+            .unwrap()
+            .resolve("owned.example", address)
+            .build()
+            .unwrap();
+        let result = client
+            .get(format!("http://owned.example:{}/", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(result.headers()["location"], destination);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), blocked.accept())
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
     }
     #[test]
     fn plaintext_credentials_never_enter_the_container_assignment() {
@@ -954,7 +1249,7 @@ mod tests {
                     pentest_id: uuid::Uuid::new_v4(),
                     scope,
                     scope_sha256: hash,
-                    reviewers: vec![],
+                    reviewers: reviewers(),
                     provider: "abliteration.ai".into(),
                 },
                 previous_reports: vec![],
@@ -969,6 +1264,60 @@ mod tests {
         let input: Value = serde_json::from_str(&encoded).unwrap();
         assert!(input["evidence"].get("credentials").is_none());
         assert!(encoded.contains("auth_check_path"));
+    }
+    #[test]
+    fn large_prior_reports_fit_the_container_input_without_losing_evidence() {
+        let scope: LiveScope = serde_json::from_value(json!({
+            "origins":["https://example.com"],"methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1"
+        }))
+        .unwrap();
+        let scope = scope.normalized().unwrap();
+        let prior = |role| {
+            serde_json::from_value(json!({
+                "role":role,"assessment":null,"evidence":[{"id":1,"method":"GET",
+                    "url":"https://example.com/","request_headers":{},"status":200,"headers":{},
+                    "body_excerpt":"x".repeat(MAX_RESULT_BYTES - 4096),"truncated":true,
+                    "error":null,"observed_at":1}]
+            }))
+            .unwrap()
+        };
+        let mut task = Task {
+            role: ReviewRole::Challenger,
+            scope_sha256: scope.hash().unwrap(),
+            evidence: PentestEvidence {
+                context: PentestContext {
+                    pentest_id: uuid::Uuid::new_v4(),
+                    scope_sha256: scope.hash().unwrap(),
+                    scope,
+                    reviewers: reviewers(),
+                    provider: "abliteration.ai".into(),
+                },
+                previous_reports: vec![prior("investigator"), prior("reproducer")],
+                credentials: None,
+            },
+        };
+        let bytes = task.input().unwrap();
+        assert!(bytes.len() > 2 * MAX_RESULT_BYTES - 16384 && bytes.len() <= MAX_EVIDENCE_BYTES);
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["evidence"]["previous_reports"],
+            serde_json::to_value(&task.evidence.previous_reports).unwrap()
+        );
+        task.evidence.previous_reports[0].evidence[0]
+            .body_excerpt
+            .push_str(&"x".repeat(300 * 1024));
+        assert!(task.input().is_err());
+    }
+    #[tokio::test]
+    async fn exhausted_evidence_budget_refuses_a_new_probe_before_network_io() {
+        let broker = broker();
+        broker.counters.lock().unwrap().evidence_bytes =
+            HTTP_EVIDENCE_BUDGET - HTTP_RECORD_RESERVE + 1;
+        let reply = broker
+            .http(json!({"method":"GET","url":"https://example.com/"}))
+            .await;
+        assert_eq!(reply.unwrap_err(), "target_request_budget_reached");
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
     }
     #[tokio::test]
     async fn active_scope_rejects_unapproved_bodies_and_header_overrides_before_io() {
@@ -1008,6 +1357,98 @@ mod tests {
         assert!(prepared.get("api_key").is_none());
         r.body.as_mut().unwrap()["model"] = json!("other");
         assert!(broker.chat(&r).is_err());
+    }
+    #[test]
+    fn venice_keeps_provider_features_and_model_choice_out_of_agent_control() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().provider = LiveProvider::Venice;
+        let mut request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(
+                json!({"model":LiveProvider::Venice.model(),"messages":[{"role":"user","content":"Owned example"}],
+                "store":true,"fallbacks":[{"model":"other"}],"venice_parameters":{"enable_web_search":"on","enable_web_scraping":true,"enable_x_search":true},
+                "base_url":"https://other.example","api_key":"must-not-forward","user":"customer-id","stream":true}),
+            ),
+        };
+        let prepared = broker.chat(&request).unwrap();
+        assert_eq!(prepared["model"], LiveProvider::Venice.model());
+        assert_eq!(prepared["store"], false);
+        assert_eq!(prepared["fallbacks"], json!([]));
+        assert_eq!(prepared["venice_parameters"]["enable_web_search"], "off");
+        for key in [
+            "enable_web_scraping",
+            "enable_x_search",
+            "include_venice_system_prompt",
+        ] {
+            assert_eq!(prepared["venice_parameters"][key], false);
+        }
+        assert_eq!(prepared["stream_options"]["include_usage"], true);
+        for key in ["api_key", "base_url", "user"] {
+            assert!(prepared.get(key).is_none());
+        }
+        request.body.as_mut().unwrap()["model"] = json!(LiveProvider::Abliteration.model());
+        assert_eq!(broker.chat(&request), Err("wrong_model"));
+    }
+    #[test]
+    fn near_uses_its_pinned_model_and_closes_tools_without_unsupported_schema() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().provider = LiveProvider::NearDeepSeek;
+        let request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(json!({"model":LiveProvider::NearDeepSeek.model(),
+                "messages":[{"role":"user","content":"Owned example"}],
+                "tools":[{"type":"function","function":{"name":"terminal"}}],
+                "store":true,"base_url":"https://other.example","api_key":"must-not-forward",
+                "response_format":{"type":"json_schema"},"fallbacks":["other"]})),
+        };
+        let mut prepared = broker.chat(&request).unwrap();
+        assert_eq!(prepared["model"], LiveProvider::NearDeepSeek.model());
+        assert_eq!(prepared["store"], false);
+        for key in ["base_url", "api_key", "response_format", "fallbacks"] {
+            assert!(prepared.get(key).is_none());
+        }
+        broker.counters.lock().unwrap().calls = FINAL_REPORT_CALL;
+        broker.finish_before_limit(&mut prepared).unwrap();
+        assert!(prepared.get("tools").is_none());
+        assert!(prepared.get("response_format").is_none());
+        assert_eq!(prepared["tool_choice"], "none");
+        assert!(
+            prepared["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("unfinished checks")
+        );
+    }
+    #[test]
+    fn mixed_provider_assignment_binds_each_role_and_rejects_a_false_disclosure() {
+        let scope = broker().scope.clone();
+        let mut selected = reviewers();
+        selected[0].declared_model = LiveProvider::Venice.model().into();
+        let mut task = Task {
+            role: ReviewRole::Investigator,
+            scope_sha256: scope.hash().unwrap(),
+            evidence: PentestEvidence {
+                context: PentestContext {
+                    pentest_id: uuid::Uuid::new_v4(),
+                    scope_sha256: scope.hash().unwrap(),
+                    scope,
+                    reviewers: selected,
+                    provider: "abliteration.ai, venice.ai".into(),
+                },
+                previous_reports: vec![],
+                credentials: None,
+            },
+        };
+        assert_eq!(task.model(), Some(LiveProvider::Venice.model()));
+        assert!(task.input().is_ok());
+        task.role = ReviewRole::Challenger;
+        assert_eq!(task.model(), Some(LiveProvider::Abliteration.model()));
+        task.evidence.context.provider = "abliteration.ai".into();
+        assert!(task.input().is_err());
     }
     #[tokio::test]
     async fn full_engine_requires_consent_and_keeps_the_reviewers_budget() {
@@ -1102,18 +1543,33 @@ mod tests {
     }
     #[test]
     fn provider_usage_uses_uncached_prices_and_incomplete_usage_keeps_the_reservation() {
+        assert_eq!(token_cost(LiveProvider::NearDeepSeek, 1000, 200), Some(540));
+        assert_eq!(token_cost(LiveProvider::NearDeepSeek, 1, 0), Some(1));
+        assert_eq!(token_cost(LiveProvider::NearDeepSeek, u64::MAX, 1), None);
         let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":900}}}"#;
-        assert_eq!(reported_cost(body, false), Some(4000));
+        assert_eq!(
+            reported_cost(body, false, LiveProvider::Abliteration),
+            Some(4000)
+        );
         let stream = b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200}}\n\ndata: [DONE]\n\n";
-        assert_eq!(reported_cost(stream, true), Some(4000));
+        assert_eq!(
+            reported_cost(stream, true, LiveProvider::Abliteration),
+            Some(4000)
+        );
         for missing in [
             b"{}".as_slice(),
             br#"{"usage":{"prompt_tokens":1000}}"#,
             br#"{"usage":{"prompt_tokens":0,"completion_tokens":200}}"#,
         ] {
-            assert_eq!(reported_cost(missing, false), None);
+            assert_eq!(
+                reported_cost(missing, false, LiveProvider::Abliteration),
+                None
+            );
         }
-        assert_eq!(reported_cost(b"data: {\"usage\":", true), None);
+        assert_eq!(
+            reported_cost(b"data: {\"usage\":", true, LiveProvider::Abliteration),
+            None
+        );
     }
     #[tokio::test]
     async fn exhausted_cost_reservation_fails_before_a_provider_request() {

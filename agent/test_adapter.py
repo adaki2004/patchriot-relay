@@ -18,6 +18,22 @@ import live_review
 
 
 class LiveOverviewTests(unittest.TestCase):
+    def test_two_large_role_reports_reach_the_runner_without_truncation(self):
+        previous = [{"role": role, "evidence": [{"id": 1, "body_excerpt": "x" * (4 * 1024 * 1024 - 4096)}]}
+                    for role in ("investigator", "reproducer")]
+        task = {"kind": "live_http_v1", "role": "challenger", "evidence": {
+            "context": {"scope": {"origins": ["https://owned.example"]}}, "previous_reports": previous}}
+        wire = json.dumps(task).encode() + b"\n"
+        self.assertGreater(len(wire), 8 * 1024 * 1024 - 16384)
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            self.assertEqual(live_review.load(io.BytesIO(wire), directory), "challenger")
+            self.assertEqual(json.loads((directory / "previous.json").read_text()), previous)
+            oversized = b" " * live_review.MAX_INPUT + wire
+            with self.assertRaises(ValueError):
+                live_review.load(io.BytesIO(oversized), directory)
+            self.assertEqual(json.loads((directory / "previous.json").read_text()), previous)
+
     def test_large_prior_transcripts_stay_in_files_and_citations_keep_their_role(self):
         scope = {"origins": ["https://owned.example"], "objective": "Owned fixture", "methods": ["GET", "HEAD", "OPTIONS"]}
         prior = [{"role": "investigator", "assessment": {

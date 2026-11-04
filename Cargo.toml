@@ -23,6 +23,9 @@ url = "2.5"
 uuid = { version = "1.22", features = ["serde"] }
 zeroize = "1.9"
 base64 = "0.22"
+scraper = { version = "0.27", default-features = false }
+nearai-inference-sdk = "=0.2.1"
+futures-util = "0.3"
 
 [lints.rust]
 unsafe_code = "forbid"
