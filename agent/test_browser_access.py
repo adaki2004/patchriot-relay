@@ -232,6 +232,48 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         denied=await page.evaluate("()=>new Promise(resolve=>ethereum.sendAsync({id:1,method:'eth_sendTransaction',params:[]},error=>resolve(error.code)))")
         self.assertEqual(denied,4200)
 
+    async def test_discovery_before_navigation_does_not_grant_wallet_access(self):
+        page=await self.start('wallet')
+        await page.goto('about:blank')
+        mode=await page.evaluate("()=>window.__patchriot_wallet_rpc({method:'wallet_mode'})")
+        self.assertEqual(mode,{'legacy':False})
+        error=await page.evaluate("async()=>{try{await window.__patchriot_wallet_rpc({method:'eth_accounts'});return null;}catch(e){return e.message;}}")
+        self.assertIn('outside approved page',error)
+
+    async def test_wait_allows_a_late_script_to_finish_before_the_next_inspection(self):
+        page=await self.start('session')
+        original=self.browser.call
+        entered, release=asyncio.Event(), asyncio.Event()
+        async def delayed(path,data):
+            if path=='http' and data['url']==ORIGIN+'/late.js':
+                entered.set()
+                await release.wait()
+                return {'evidence':{'id':100,'status':200,'error':None},'headers':[['content-type','application/javascript']], 'body_base64':base64.b64encode(b'window.lateScriptLoaded=true').decode()}
+            return await original(path,data)
+        self.browser.call=delayed
+        await page.evaluate("()=>{const script=document.createElement('script');script.src='/late.js';document.head.append(script)}")
+        await asyncio.wait_for(entered.wait(),timeout=5)
+        waiting=asyncio.create_task(self.browser.operation({'command':'wait'}))
+        await asyncio.sleep(.1)
+        self.assertFalse(waiting.done())
+        release.set()
+        status=await asyncio.wait_for(waiting,timeout=5)
+        self.assertEqual(status['pending_requests'],0)
+        self.assertTrue(await page.evaluate('window.lateScriptLoaded'))
+
+    async def test_request_failure_keeps_policy_codes_but_not_arbitrary_error_text(self):
+        page=await self.start('session')
+        async def denied(path,data):
+            if data['url'].endswith('/budget'):
+                raise ValueError('target_request_budget_reached')
+            raise ValueError('Authorization: Bearer private-value')
+        self.browser.call=denied
+        for path in ('/budget','/private-error'):
+            await page.evaluate("async path=>{try{await fetch(path)}catch{}}",path)
+        status=await self.browser.operation({'command':'status'})
+        self.assertEqual(status['request_errors'],['target_request_budget_reached','browser_request_failed'])
+        self.assertNotIn('private-value',json.dumps(status))
+
     async def test_repeated_response_headers_allow_navigation_and_keep_separate_cookies(self):
         page=await self.start('session')
         await page.goto(ORIGIN+'/repeated-headers', timeout=5000)

@@ -8,6 +8,7 @@ import base64
 import json
 import hmac
 import os
+import re
 import secrets
 import sys
 import urllib.error
@@ -141,20 +142,30 @@ class BrowserAccess:
                 separator = '\n' if key == 'set-cookie' else ', '
                 response_headers[key] = response_headers[key] + separator + value if key in response_headers else value
             await route.fulfill(status=evidence['status'], headers=response_headers, body=base64.b64decode(reply['body_base64']))
-        except Exception:
-            self.errors = (self.errors + ['browser_request_failed'])[-12:]
+        except Exception as error:
+            # Relay policy failures are short codes. Preserve them so an agent
+            # can distinguish a spent request budget from a broken website;
+            # never copy arbitrary exception text or headers into its context.
+            code = str(error) if isinstance(error, ValueError) else ''
+            if not re.fullmatch(r'[a-z][a-z0-9_]{1,79}', code):
+                code = 'browser_request_failed'
+            self.errors = (self.errors + [code])[-12:]
             await route.abort('failed')
         finally:
             self.inflight -= 1
 
     async def wallet(self, source, request):
         frame = source['frame']
-        if frame != source['page'].main_frame or origin(frame.url) != self.origin:
+        if frame != source['page'].main_frame:
             raise ValueError('Wallet request outside approved page')
         if self.scope.get('authentication') != 'wallet':
             raise ValueError('Wallet login not selected')
         if request.get('method') == 'wallet_mode':
+            # Discovery can run before navigation commits. This reveals only
+            # a transport preference, never an address or signing permission.
             return {'legacy':self.legacy_wallet}
+        if origin(frame.url) != self.origin:
+            raise ValueError('Wallet request outside approved page')
         if request.get('method') == 'unsupported_method':
             name = request.get('name')
             if isinstance(name, str) and 0 < len(name) <= 80 and name.replace('_','').isascii() and name.replace('_','').isalnum() and len(self.unsupported_wallet_methods) < 12:
@@ -209,6 +220,20 @@ class BrowserAccess:
 
     async def operation(self, value):
         command = value.get('command')
+        if command == 'wait':
+            # Waiting uses no inference and lets the bounded asset queue drain.
+            # Repeated model calls while a JS bundle loads share the bridge and
+            # can otherwise postpone the very UI the agent is inspecting.
+            deadline = asyncio.get_running_loop().time() + 120
+            try:
+                await self.page().wait_for_load_state('load', timeout=120000)
+            except Exception:
+                pass
+            # Lazy imports can start after the load event. Do not busy-loop
+            # through model calls while those requests are still in progress.
+            while self.inflight and not self.pending and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(.25)
+            return await self.operation({'command':'status'})
         if command == 'status':
             # Verification is set only by the broker's explicit check below.
             # Do not queue an inspection behind every asset still loading.
@@ -297,7 +322,7 @@ class BrowserAccess:
 
 def cli():
     parser = argparse.ArgumentParser(description='Private account filling and login proof for the approved browser')
-    parser.add_argument('command',choices=['status','begin','fill','approve','reject','check','legacy'])
+    parser.add_argument('command',choices=['status','wait','begin','fill','approve','reject','check','legacy'])
     parser.add_argument('--username', help='CSS selector for username/email input; never enter credentials here')
     parser.add_argument('--password', help='CSS selector for password input; never enter credentials here')
     parser.add_argument('--id', help='Pending signature ID, after reviewing its exact message')
@@ -307,7 +332,7 @@ def cli():
     settings = json.loads(Path('/work/browser-access.json').read_text())
     req = urllib.request.Request(settings['url']+'/',data=json.dumps(args).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+settings['secret']})
     try:
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req,timeout=60) as response: print(response.read().decode())
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req,timeout=150 if args['command']=='wait' else 60) as response: print(response.read().decode())
     except urllib.error.HTTPError as error:
         print(error.read(MAX_CONTROL).decode()); sys.exit(1)
 
