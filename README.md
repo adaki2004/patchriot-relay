@@ -4,7 +4,7 @@
 
 The relay connects a managed Kali machine to Patchriot’s dispatcher, starts Hermes in an isolated container and returns its evidence. It is the connection and supervision layer; Hermes is the agent, and the selected model supplies its inference.
 
-[Patchriot ↗](https://patchriot.tech) · [Core](https://github.com/adaki2004/patchriot-core) · [Agent overview](https://patchriot.tech/#/docs/agents)
+[Patchriot ↗](https://patchriot.net) · [Core](https://github.com/adaki2004/patchriot-core) · [Agent overview](https://patchriot.net/#/docs/agents)
 
 ```mermaid
 flowchart LR
