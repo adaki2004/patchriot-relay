@@ -63,6 +63,7 @@ impl Access {
                 secrets.push(Zeroizing::new(token.clone()));
                 Some(format!("Bearer {token}"))
             }
+            TestCredentials::Wallet {} => None,
             TestCredentials::Session { password, .. } => {
                 secrets.push(Zeroizing::new(password.clone()));
                 None
@@ -249,6 +250,7 @@ mod tests {
             authentication: Some(patchriot_protocol::pentests::TestAuthKind::Bearer),
             auth_check_path: Some("/private".into()),
             session_login: None,
+            wallet_login: None,
         };
         let credentials = TestCredentials::Bearer {
             token: "synthetic-bearer-for-tests".into(),

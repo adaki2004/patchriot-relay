@@ -5,9 +5,9 @@ use scraper::{Html, Selector};
 
 impl LiveBroker {
     pub(super) async fn ensure_session(&self) -> Result<(), &'static str> {
-        let Some(login) = &self.scope.session_login else {
+        if self.scope.session_login.is_none() && self.scope.wallet_login.is_none() {
             return Ok(());
-        };
+        }
         let mut outcome = self.login_state.lock().await;
         if let Some(result) = *outcome {
             return result;
@@ -15,7 +15,17 @@ impl LiveBroker {
         // Cancellation or a dropped connection must not trigger more password
         // submissions. A new assessment is needed to try a different account.
         *outcome = Some(Err("login_not_completed"));
-        let result = self.start_session(login).await;
+        let result = if let Some(login) = &self.scope.wallet_login {
+            self.start_wallet_session(login).await
+        } else {
+            self.start_session(
+                self.scope
+                    .session_login
+                    .as_ref()
+                    .ok_or("invalid_login_scope")?,
+            )
+            .await
+        };
         *outcome = Some(result);
         result
     }

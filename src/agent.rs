@@ -183,6 +183,7 @@ impl Settings {
                     patchriot_protocol::pentests::LiveToolProfile::AuthenticatedHttpV1,
                     patchriot_protocol::pentests::LiveToolProfile::SessionLoginV1,
                     patchriot_protocol::pentests::LiveToolProfile::FormDiscoveryV1,
+                    patchriot_protocol::pentests::LiveToolProfile::WalletLoginV1,
                 ]
             } else if matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
@@ -843,6 +844,10 @@ pub fn run(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
                 Some("10" | "11" | "12")
             )
+        || live
+            .as_ref()
+            .is_some_and(|task| task.evidence.context.scope.wallet_login.is_some())
+            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "12"
         || live.as_ref().is_some_and(|task| {
             task.evidence
                 .context

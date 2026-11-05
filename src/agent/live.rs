@@ -8,6 +8,7 @@ mod access;
 mod login;
 mod near;
 mod routing;
+mod wallet;
 
 #[cfg(test)]
 pub const MODEL: &str = LiveProvider::MODELS[0];
@@ -1067,6 +1068,7 @@ mod tests {
                 authentication: None,
                 auth_check_path: None,
                 session_login: None,
+                wallet_login: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
