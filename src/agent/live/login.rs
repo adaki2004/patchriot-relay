@@ -404,6 +404,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patchriot_login_page_is_discovered_without_browser_javascript() {
+        // Exercise the HTML shipped by our sibling core checkout, rather than
+        // an invented form. Core separately tests its session and 401 boundary.
+        let html =
+            std::fs::read_to_string("../patchriot-core/crates/server/src/login_page.html").unwrap();
+        let (mut broker, server) = automatic_fixture(vec![
+            response("200 OK", "", &html),
+            response("303 See Other", "Location: /account\r\nSet-Cookie: __Host-patchriot_session=fixture-account-cookie; Secure; HttpOnly; Path=/\r\n", ""),
+            response("200 OK", "", r#"{"account":{"display_name":"Owned fixture"}}"#),
+            response("401 Unauthorized", "", r#"{"error":"sign_in_required"}"#),
+        ]).await;
+        Arc::get_mut(&mut broker).unwrap().scope.auth_check_path = Some("/api/account".into());
+        let signed = broker
+            .http(json!({"method":"GET","url":"https://owned.example/api/account"}))
+            .await
+            .unwrap();
+        assert_eq!(signed["evidence"]["status"], 200);
+        let anonymous=broker.http(json!({"method":"GET","url":"https://owned.example/api/account","authenticated":false})).await.unwrap();
+        assert_eq!(anonymous["evidence"]["status"], 401);
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /login "));
+        assert!(requests[1].starts_with("POST /login "));
+        assert!(requests[1].contains("username=tester%40example.com"));
+        assert!(requests[1].contains("password=fixture-password-only"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("origin: https://owned.example")
+        );
+        assert!(requests[2].contains("fixture-account-cookie"));
+        assert!(!requests[3].to_ascii_lowercase().contains("cookie:"));
+    }
+
+    #[tokio::test]
     async fn automatic_login_submits_once_and_keeps_discovered_secrets_private() {
         let (broker, server) = automatic_fixture(vec![
             response("200 OK", "", LOGIN_FORM),
