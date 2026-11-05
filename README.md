@@ -28,6 +28,8 @@ Only the model step runs inside NEAR’s TEE. The agent host and its approved op
 
 Scout investigates, Recon checks its leads and a third reviewer challenges serious or uncertain findings. Reports list the tools actually run. A matching answer is not proof of a vulnerability or of independent reviewers.
 
+Later roles reuse completed discovery records. A missing or failed discovery tool may be retried once; unfinished coverage remains visible. If a run stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.
+
 > **DON’T TRUST! VERIFY!** Read this source and its dependencies—or ask your own security agent to review them. Inspect the container, network and permission settings before pairing a machine or sharing private work.
 
 ## Joining the managed service

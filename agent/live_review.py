@@ -12,6 +12,36 @@ def runs_discovery(role):
     return role == "investigator"
 
 
+def discovery_plan(role, scope, previous):
+    """Reuse completed runs; permit one recovery per tool family in later roles.
+
+    A missing assessment does not erase successful tool receipts. Conversely,
+    a completed assessment cannot stand in for a missing discovery run.
+    """
+    runs_discovery(role)  # Validate the assigned role.
+    required = ['patchriot-baseline', 'patchriot-crawl', 'nuclei']
+    if 'artex_engine_v1' in scope.get('tools', []):
+        required.append('artex-engine')
+    plan = []
+    for tool in required:
+        attempts = []
+        for report in previous[:2]:
+            records = [r for r in report.get('tool_runs', []) if r.get('tool') == tool]
+            if records:
+                expected = len(scope['origins']) if tool in ('patchriot-crawl', 'nuclei') else 1
+                completed = len(records) >= expected and all(
+                    r.get('exit_code') == 0 and not r.get('failure') for r in records)
+                attempts.append((report.get('role'), completed))
+        inherited = next((name for name, done in reversed(attempts) if done), None)
+        # Only one later role retries a tool family. An earlier crash before
+        # startup has no receipt; the first available later role can recover it.
+        recovered_before = any(name != 'investigator' for name, _ in attempts)
+        action = ('run' if role == 'investigator' else 'reuse' if inherited
+                  else 'unavailable' if recovered_before else 'recover')
+        plan.append({'tool': tool, 'action': action, 'source_role': inherited})
+    return plan
+
+
 def load(stream, directory):
     line = stream.readline(MAX_INPUT + 1)
     task = json.loads(line)
@@ -37,12 +67,16 @@ def overview(directory):
         summary = assessment.get("summary", "")
         findings = assessment.get("findings", [])
         prior.append({"role": report["role"], "summary": summary[:600],
+                      "assessment_received": report.get("assessment") is not None,
+                      "execution_state": report.get("execution", {}).get("state"),
+                      "failure_reason": report.get("execution", {}).get("failure_reason"),
                       "summary_shortened": len(summary) > 600,
-                      "finding_count": len(findings),
+                      "finding_count": len(findings) if report.get("assessment") is not None else None,
                       "findings": [{"title": f["title"][:200], "severity": f["severity"],
                                     "support": f["support"], "prior_role_evidence_ids": f["evidence_ids"][:24]}
                                    for f in findings[:24]]})
     return {"scope": context["scope"], "previous_reports": prior,
+            "discovery_plan": tools.get("discovery_plan", []),
             "current_tools": [{"tool": t["tool"], "exit_code": t["exit_code"],
                                "failure": t["failure"], "request_count": len(t["evidence_ids"]),
                                "current_role_evidence_ids": t["evidence_ids"][:24],
@@ -58,7 +92,7 @@ def prompt(role, browser=False):
     }
     initial = ("The pinned runner performed the discovery bundle: a bounded link crawl, three curated Nuclei checks, a versioned baseline suite and control requests. If artex_engine_v1 is selected, inspect /work/artex-results.json for this role's engine run."
                if runs_discovery(role) else
-               "This role runs targeted controls, not another full discovery scan. Earlier scanner and ARTEX records are in previous.json, under each role's tool_runs. Review those records, then use fresh requests to test material claims and their assumptions. Do not rerun the baseline, crawl, Nuclei or ARTEX bundle. If earlier discovery was incomplete, preserve that gap rather than imply full coverage. No current-role artex-results.json is expected.")
+               "This role runs fresh controls and reuses completed discovery from previous.json. The runner may also recover a missing or failed discovery tool once; the overview's discovery_plan says what ran, was reused or remains unavailable. Inspect current tool-results.json and any current artex-results.json for recovery work. Do not rerun completed discovery. Use fresh requests to test material claims and their assumptions. Preserve remaining gaps instead of implying full coverage.")
     result = f"""You are the {role} conducting an authorized live website security test. {duties[role]}
 Start with the overview below, then inspect the relevant entries in /work/scope.json, /work/previous.json and /work/tool-results.json. Load each JSON file separately with Python json.load; print selected fields rather than concatenating or dumping entire files. If terminal output is shortened, read the original file in smaller pieces; do not try to repair the shortened display or its spillover copy. {initial} Inspect recorded outputs and request IDs; these are leads, not proved findings. IDs in tool-results.json belong to your current role, while IDs in previous.json belong to earlier roles and must not be copied into your citations. Report unavailable, failed or truncated tool coverage. Spend your own probes on meaningful leads and missing checks. When revisiting the same issue, keep its exact title and cite the request that demonstrates it first, followed by controls. A different affected endpoint or cause is a separate finding. The exact approved HTTPS origins and objective are in scope.json. Read /patchriot/live-review-skill.txt for the testing method.
 You have a normal terminal inside a disposable isolated container. Write Python analysis scripts, parse HTML/JavaScript, compare responses and design your own non-destructive HTTP probes. This is live testing, not an offline snapshot exercise.

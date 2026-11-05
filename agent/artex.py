@@ -168,7 +168,7 @@ class Engine:
             self.__exit__(None, None, None)
             raise
 
-    def assess(self, scope, targets, role):
+    def assess(self, scope, targets, role, stop=lambda: False):
         seconds = max(1, int(self.deadline - time.monotonic()))
         body = task_body(scope, targets, seconds, role)
         body['llm_profile_ids'] = [self.profile_id]
@@ -179,6 +179,9 @@ class Engine:
         reason = 'time_budget'
         while time.monotonic() < self.deadline:
             task = self.client.call('/api/tasks/' + identifier)
+            if stop():
+                reason = 'model_request_rejected'
+                break
             if should_stop(task):
                 reason = 'model_budget' if task.get('llm_failover_state') == 'chain_exhausted' else task['status']
                 break
@@ -212,12 +215,19 @@ class Engine:
                 self.log.close()
 
 
-def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL):
+def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
+        stop=lambda: False, emit=lambda _: None):
     from web_tools import ScopeMirror, record
     from live_http import request
     started, timestamp = time.monotonic(), int(time.time())
     refs, failure, code = [], None, None
     result = {'engine': 'ARTEX', 'commit': VERSION, 'coverage_complete': False}
+    # Preserve that discovery started even if the entire role is interrupted.
+    # The final receipt replaces this entry, using the same tool/start identity.
+    emit(record('artex-engine', VERSION, ['/opt/artex/artex', *scope['origins']], started,
+                timestamp, [], json.dumps({**result, 'stop_reason': 'interrupted',
+                    'limitations': ['The engine started but has not returned its final record.']}),
+                exit_code=None, failure='incomplete'))
     try:
         if time.monotonic() >= deadline:
             raise TimeoutError('no engine time remaining')
@@ -225,7 +235,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL)
             mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or request, methods=scope['methods'])) for origin in scope['origins']]
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
             try:
-                result = engine.assess(scope, [mirror.url for mirror in mirrors], role)
+                result = engine.assess(scope, [mirror.url for mirror in mirrors], role, stop=stop)
                 code = 0
                 if not result['coverage_complete']:
                     failure = 'incomplete'

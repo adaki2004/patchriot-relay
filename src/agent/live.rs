@@ -15,8 +15,28 @@ mod wallet;
 pub const MODEL: &str = LiveProvider::MODELS[0];
 pub const MAX_FRAME: usize = 512 * 1024;
 pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
+pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
+// Tool results are separate messages, not model calls. Keep a count bound in
+// addition to the byte limit without cutting a valid 200-call role in half.
+const MAX_MODEL_MESSAGES: usize = 1024;
 pub fn is_chat_path(path: &str) -> bool {
-    path == "/v1/chat/completions" || path == ENGINE_CHAT
+    path == "/v1/chat/completions" || path == ENGINE_CHAT || path == SUMMARY_CHAT
+}
+/// A rejected discovery request must stop that engine, not discard the later
+/// reviewer's chance to report the saved evidence. These errors send no model
+/// request. Authentication, attestation and scope failures still stop the role.
+pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool {
+    request.path == ENGINE_CHAT
+        && matches!(
+            reason,
+            "engine_budget_reached"
+                | "model_history_limit"
+                | "model_messages_empty"
+                | "model_message_role"
+                | "model_message_content"
+                | "model_request_too_large"
+                | "invalid_tools"
+        )
 }
 // Generous pilot ceilings. Stop investigation early enough to save a report;
 // increasing time/calls must not let the engine spend the reviewer's reserve.
@@ -205,6 +225,7 @@ impl LiveBroker {
         progress: &Progress,
         phase: LivePhase,
         completed_tools: u8,
+        model_request: Option<LiveModelProgress>,
     ) {
         if let (Ok(count), Ok(mut current)) = (self.counters.lock(), progress.lock()) {
             *current = LiveProgress {
@@ -212,6 +233,7 @@ impl LiveBroker {
                 http_requests: count.evidence.len() as u16,
                 inference_calls: count.calls,
                 completed_tools,
+                model_request,
             };
         }
     }
@@ -296,16 +318,34 @@ impl LiveBroker {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or("messages_required")?;
-        if messages.is_empty()
-            || messages.len() > 160
-            || messages.iter().any(|m| {
-                !matches!(
-                    m["role"].as_str(),
-                    Some("user" | "system" | "assistant" | "tool")
-                ) || !(m["content"].is_string() || m["content"].is_null())
-            })
-        {
-            return Err("invalid_model_messages");
+        if messages.is_empty() {
+            return Err("model_messages_empty");
+        }
+        if messages.len() > MAX_MODEL_MESSAGES {
+            eprintln!(
+                "model history rejected: message_count={} limit={MAX_MODEL_MESSAGES}",
+                messages.len()
+            );
+            return Err("model_history_limit");
+        }
+        for (index, message) in messages.iter().enumerate() {
+            if !matches!(
+                message["role"].as_str(),
+                Some("user" | "system" | "assistant" | "tool")
+            ) {
+                eprintln!(
+                    "model message rejected: index={index} field=role message_count={}",
+                    messages.len()
+                );
+                return Err("model_message_role");
+            }
+            if !(message["content"].is_string() || message["content"].is_null()) {
+                eprintln!(
+                    "model message rejected: index={index} field=content message_count={}",
+                    messages.len()
+                );
+                return Err("model_message_content");
+            }
         }
         // Construct the provider request: URLs, credentials and arbitrary routing
         // fields supplied by a model or runtime never reach provider configuration.
@@ -335,6 +375,11 @@ impl LiveBroker {
                 // options from the agent. NEAR's SDK owns encrypted transport.
             }
         }
+        // Conversation summaries are bookkeeping, not another deep research
+        // turn. High reasoning exhausted their output cap without a summary.
+        if request.path == SUMMARY_CHAT {
+            body["reasoning_effort"] = json!("low");
+        }
         if let Some(tools) = input.get("tools") {
             if !tools.as_array().is_some_and(|v| {
                 v.len() <= if engine { 64 } else { 16 } && v.iter().all(|t| t["type"] == "function")
@@ -362,7 +407,7 @@ impl LiveBroker {
     ) -> Result<(), &'static str> {
         let mut body = self.chat(request)?;
         let engine = request.path == ENGINE_CHAT;
-        if !engine {
+        if !engine && request.path != SUMMARY_CHAT {
             self.finish_before_limit(&mut body)?;
         }
         if self.fallback_key.is_some() {
@@ -777,21 +822,24 @@ impl LiveBroker {
     pub async fn respond(&self, request: Request, output: mpsc::Sender<Frame>) {
         if is_chat_path(&request.path) {
             match self.model(&request, &output).await {
-                Err("engine_budget_reached") => {
-                    // Upstream pauses after consecutive 429s. Its wrapper
-                    // collects the partial report and shuts down the engine.
-                    // No provider request is sent for these rejected calls.
+                Err(reason) if recoverable_engine_error(&request, reason) => {
+                    // The wrapper observes the rejection, collects partial
+                    // evidence and closes discovery before starting Hermes.
                     let _ = output
                         .send(Frame::Start {
                             id: request.id,
-                            status: 429,
+                            status: if reason == "engine_budget_reached" {
+                                429
+                            } else {
+                                400
+                            },
                             content_type: "application/json",
                         })
                         .await;
                     let _ = output
                         .send(Frame::Chunk {
                             id: request.id,
-                            hex: hex::encode(br#"{"error":"engine_budget_reached"}"#),
+                            hex: hex::encode(serde_json::to_vec(&json!({"error":reason})).unwrap()),
                         })
                         .await;
                     let _ = output.send(Frame::End { id: request.id }).await;
@@ -981,6 +1029,13 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         if let Ok(run) = parsed {
             bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
             if records.len() < 20 && bytes <= 256 * 1024 && run.valid(evidence) {
+                if run.tool == "artex-engine" {
+                    records.retain(|previous: &LiveToolRun| {
+                        !(previous.tool == run.tool
+                            && previous.started_at == run.started_at
+                            && previous.arguments == run.arguments)
+                    });
+                }
                 records.push(run);
                 continue;
             }
@@ -1076,6 +1131,143 @@ mod tests {
                 compute_group: "fixture".into(),
             })
             .collect()
+    }
+    #[test]
+    fn long_tool_conversations_are_not_confused_with_the_call_budget() {
+        let broker = broker();
+        let mut messages = vec![json!({"role":"system","content":"Owned regression fixture"})];
+        for turn in 0..160 {
+            messages.push(json!({"role":"assistant","content":null,"tool_calls":[{
+                "id":format!("call_{turn}"),"type":"function",
+                "function":{"name":"terminal","arguments":"{}"}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":format!("call_{turn}"),"content":"Observed fixture result"}));
+        }
+        let mut request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            body: Some(json!({"model":MODEL,"messages":messages})),
+        };
+        assert_eq!(
+            broker.chat(&request).unwrap()["messages"],
+            request.body.as_ref().unwrap()["messages"]
+        );
+        for (message, error) in [
+            (
+                json!({"role":"unexpected","content":"fixture"}),
+                "model_message_role",
+            ),
+            (
+                json!({"role":"user","content":{"unexpected":"fixture"}}),
+                "model_message_content",
+            ),
+        ] {
+            request.body.as_mut().unwrap()["messages"] = json!([message]);
+            assert_eq!(broker.chat(&request), Err(error));
+        }
+        request.body.as_mut().unwrap()["messages"] = json!([]);
+        assert_eq!(broker.chat(&request), Err("model_messages_empty"));
+        request.body.as_mut().unwrap()["messages"] = json!(vec![
+            json!({"role":"user","content":"fixture"});
+            MAX_MODEL_MESSAGES + 1
+        ]);
+        assert_eq!(broker.chat(&request), Err("model_history_limit"));
+        request.body.as_mut().unwrap()["messages"] =
+            json!([{"role":"user","content":"x".repeat(MAX_FRAME)}]);
+        assert_eq!(broker.chat(&request), Err("model_request_too_large"));
+        assert_eq!(broker.counters.lock().unwrap().calls, 0);
+    }
+    #[test]
+    fn summaries_use_low_reasoning_without_changing_provider_or_privacy() {
+        for provider in [
+            LiveProvider::Abliteration,
+            LiveProvider::Venice,
+            LiveProvider::NearDeepSeek,
+        ] {
+            let mut broker = broker();
+            Arc::get_mut(&mut broker).unwrap().provider = provider;
+            let request = Request {
+                id: 1,
+                method: "POST".into(),
+                path: SUMMARY_CHAT.into(),
+                body: Some(
+                    json!({"model":provider.model(),"messages":[{"role":"user","content":"Summarize this owned fixture"}],"reasoning_effort":"max","base_url":"https://other.example","api_key":"not-forwarded"}),
+                ),
+            };
+            let body = broker.chat(&request).unwrap();
+            assert_eq!(body["reasoning_effort"], "low");
+            assert_eq!(body["model"], provider.model());
+            assert_eq!(body["max_tokens"], 8192);
+            assert!(body.get("api_key").is_none());
+            assert!(body.get("base_url").is_none());
+            assert!(is_chat_path(SUMMARY_CHAT));
+        }
+    }
+    #[tokio::test]
+    async fn a_rejected_engine_message_preserves_the_following_report() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        let request = json!({"type":"request","request":{"id":1,"method":"POST","path":ENGINE_CHAT,
+            "body":{"model":MODEL,"messages":[{"role":"user","content":{"unsupported":"fixture"}}]}}});
+        let script = format!(
+            r#"
+            printf '%s\n' '{request}'
+            while IFS= read -r frame; do
+                case "$frame" in *'"type":"end"'*) break ;; esac
+            done
+            printf '%s\n' '{{"type":"event","event":"phase","data":{{"name":"agent_ready"}}}}'
+            printf '%s\n' '{{"type":"event","event":"result","data":{{"completed":true,"final_response":"Owned evidence retained"}}}}'
+        "#
+        );
+        let mut command = std::process::Command::new("/bin/sh");
+        command.env_clear().args(["-c", &script]);
+        let report = supervise(
+            command,
+            Bridge::Live(broker.clone()),
+            &|| false,
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "completed");
+        assert_eq!(
+            report.events.last().unwrap()["data"]["final_response"],
+            "Owned evidence retained"
+        );
+        assert_eq!(broker.counters.lock().unwrap().calls, 0);
+        let request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: ENGINE_CHAT.into(),
+            body: None,
+        };
+        for reason in [
+            "wrong_model",
+            "engine_not_selected",
+            "near_signature_invalid",
+            "provider_authentication_failed",
+        ] {
+            assert!(!recoverable_engine_error(&request, reason));
+        }
+    }
+    #[test]
+    fn engine_start_receipt_survives_interruption_and_is_replaced_on_completion() {
+        let mut run = json!({"tool":"artex-engine","version":"fixture","arguments":["/opt/artex/artex","https://example.com"],
+            "started_at":1,"duration_ms":1,"exit_code":null,"failure":"incomplete","evidence_ids":[],
+            "output_sha256":format!("{:x}", Sha256::digest(b"")),"output_excerpt":"","output_truncated":false});
+        let mut events = vec![json!({"event":"live_tool","data":{"run":run}})];
+        let (saved, valid) = tool_records(&events, &[]);
+        assert!(valid);
+        assert_eq!(saved[0].failure.as_deref(), Some("incomplete"));
+        run["failure"] = Value::Null;
+        run["exit_code"] = json!(0);
+        events.push(json!({"event":"live_tool","data":{"run":run}}));
+        let (saved, valid) = tool_records(&events, &[]);
+        assert!(valid);
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].failure.is_none());
     }
     pub(super) fn broker() -> Arc<LiveBroker> {
         let file = tempfile::NamedTempFile::new().unwrap();

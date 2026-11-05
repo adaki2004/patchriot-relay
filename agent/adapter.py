@@ -19,6 +19,7 @@ wire_out = sys.stdout
 wire_lock = threading.Lock()
 transaction_lock = threading.Lock()
 bridge_stopping = threading.Event()
+engine_stopping = threading.Event()
 request_id = 0
 
 
@@ -37,6 +38,15 @@ def website_input(stream, directory, source=False):
     (directory / ("source.json" if source else "snapshot.json")).write_bytes(snapshot)
     (directory / "previous.json").write_text(json.dumps(task["previous_reports"], ensure_ascii=False))
     return task["role"]
+
+
+def configure_compression(home, model, bridge):
+    """Keep summaries on the same scoped broker, with a separate purpose."""
+    with (home / 'config.yaml').open('a') as config:
+        config.write('auxiliary:\n  compression:\n    provider: custom\n    model: '
+                     + json.dumps(model) + '\n    base_url: '
+                     + json.dumps(bridge + '/patchriot/summary/v1')
+                     + '\n    api_key: local-bridge\n    reasoning_effort: low\n')
 
 
 def website_prompt(role):
@@ -170,6 +180,8 @@ class Bridge(BaseHTTPRequestHandler):
                     try:
                         if frame["type"] == "start":
                             status, content_type = frame["status"], frame["content_type"]
+                            if self.path == '/patchriot/artex/v1/chat/completions' and status >= 400:
+                                engine_stopping.set()
                             if not disconnected:
                                 self.send_response(status)
                                 self.send_header("Content-Type", content_type)
@@ -232,6 +244,10 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     os.environ["PATCHRIOT_BRIDGE_URL"] = f"http://127.0.0.1:{server.server_port}"
+    if live:
+        # Use the same broker, pinned model, privacy policy and shared budget.
+        # The separate route lets the relay use low reasoning for summaries.
+        configure_compression(home, model, os.environ['PATCHRIOT_BRIDGE_URL'])
     browser = None
     if live:
         import web_tools
@@ -239,13 +255,16 @@ def main():
         scope = json.loads(Path("/work/scope.json").read_text())["scope"]
         tools = web_tools.run(scope, json.loads(Path("/work/previous.json").read_text()),
                               emit=lambda result: event("live_tool", run=result), role=role)
-        if live_review.runs_discovery(role) and "artex_engine_v1" in scope.get("tools", []):
+        if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
+               for p in tools['discovery_plan']):
             import artex
             # Keep at least four minutes for the review and final report. ARTEX
             # also shares the relay's total model and target-request allowances.
             event("phase", name="artex_engine")
             engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
-            result = artex.run(scope, role, engine_deadline, model=model)
+            result = artex.run(scope, role, engine_deadline, model=model,
+                               stop=engine_stopping.is_set,
+                               emit=lambda result: event("live_tool", run=result))
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)

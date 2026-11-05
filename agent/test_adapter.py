@@ -2,6 +2,7 @@
 import http.client
 import io
 import json
+import os
 import hashlib
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import adapter
@@ -17,7 +19,78 @@ import inspect_source
 import live_review
 
 
+@unittest.skipUnless(os.environ.get('PATCHRIOT_HERMES_SMOKE') == '1', 'requires the pinned isolated Hermes image')
+class CompressionRuntimeTests(unittest.TestCase):
+    def test_real_compressor_uses_the_summary_route_without_provider_credentials(self):
+        seen = []
+        class Model(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                seen.append((self.path, body['model']))
+                content = 'Owned fixture summary: the local check finished and no external request was made.'
+                response = {'id':'owned-summary','object':'chat.completion','created':1,
+                    'model':body['model'],'choices':[{'index':0,'message':{'role':'assistant','content':content},'finish_reason':'stop'}],
+                    'usage':{'prompt_tokens':10,'completion_tokens':20,'total_tokens':30}}
+                if body.get('stream'):
+                    response['object'] = 'chat.completion.chunk'
+                    response['choices'][0]['delta'] = response['choices'][0].pop('message')
+                    wire = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                    content_type = 'text/event-stream'
+                else:
+                    wire, content_type = json.dumps(response).encode(), 'application/json'
+                self.send_response(200)
+                self.send_header('Content-Type',content_type)
+                self.send_header('Content-Length',str(len(wire)))
+                self.end_headers(); self.wfile.write(wire)
+        server = ThreadingHTTPServer(('127.0.0.1',0),Model)
+        thread = threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                home=Path(temp); (home/'config.yaml').write_text('')
+                bridge=f'http://127.0.0.1:{server.server_port}'
+                adapter.configure_compression(home,'owned-fixture',bridge)
+                script = '''import sys,time
+from agent.context_compressor import ContextCompressor
+c=ContextCompressor(model='owned-fixture',provider='custom',base_url=sys.argv[1]+'/v1',api_key='local-bridge',config_context_length=64000)
+summary=c._call_summary_llm('Summarize this owned fixture.',time.monotonic())
+assert 'Owned fixture summary' in summary
+'''
+                env={'PATH':os.environ['PATH'],'HOME':temp,'HERMES_HOME':temp,
+                     'PYTHONPATH':'/opt/hermes','PYTHONDONTWRITEBYTECODE':'1'}
+                result=subprocess.run([sys.executable,'-c',script,bridge],env=env,
+                    capture_output=True,text=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr[-3000:])
+                self.assertEqual(seen,[('/patchriot/summary/v1/chat/completions','owned-fixture')])
+        finally:
+            server.shutdown();server.server_close();thread.join(timeout=2)
+
+
 class LiveOverviewTests(unittest.TestCase):
+    def test_missing_discovery_is_recovered_once_without_repeating_finished_tools(self):
+        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        first = {'role':'investigator', 'assessment':None, 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None}
+            for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}
+        plan = live_review.discovery_plan('reproducer', scope, [first])
+        self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['artex-engine'])
+        self.assertEqual([p['action'] for p in plan[:3]], ['reuse'] * 3)
+        second = {'role':'reproducer', 'tool_runs':[{'tool':'artex-engine','exit_code':None,'failure':'incomplete'}]}
+        plan = live_review.discovery_plan('challenger', scope, [first, second])
+        self.assertEqual(plan[-1]['action'], 'unavailable')
+        second['tool_runs'][0].update(exit_code=0, failure=None)
+        plan = live_review.discovery_plan('challenger', scope, [first, second])
+        self.assertEqual(plan[-1]['action'], 'reuse')
+        self.assertEqual(plan[-1]['source_role'], 'reproducer')
+
+    def test_failed_or_absent_scout_does_not_prevent_followup_discovery(self):
+        scope = {'origins':['https://owned.example'], 'tools':[]}
+        for previous in [[], [{'role':'investigator','tool_runs':[]}],
+                         [{'role':'investigator','tool_runs':[{'tool':'nuclei','exit_code':1,'failure':'timeout'}]}]]:
+            plan = live_review.discovery_plan('reproducer', scope, previous)
+            self.assertTrue(all(p['action']=='recover' for p in plan))
+            self.assertNotIn('artex-engine', [p['tool'] for p in plan])
+
     def test_two_large_role_reports_reach_the_runner_without_truncation(self):
         previous = [{"role": role, "evidence": [{"id": 1, "body_excerpt": "x" * (4 * 1024 * 1024 - 4096)}]}
                     for role in ("investigator", "reproducer")]
@@ -67,6 +140,7 @@ class LiveOverviewTests(unittest.TestCase):
 class BridgeTests(unittest.TestCase):
     def setUp(self):
         adapter.bridge_stopping.clear()
+        adapter.engine_stopping.clear()
 
     def tearDown(self):
         adapter.bridge_stopping.clear()

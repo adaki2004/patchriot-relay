@@ -111,13 +111,16 @@ class WebToolsTests(unittest.TestCase):
 
     def test_followups_do_not_repeat_scanners_or_lose_fresh_control_evidence(self):
         scope = {'origins': ['https://owned.example'], 'methods': ['GET', 'HEAD', 'OPTIONS']}
+        previous = [{'role':'investigator', 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None}
+            for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}]
         for role in ['investigator', 'reproducer', 'challenger']:
             with tempfile.TemporaryDirectory() as temp, patch('baseline.run', return_value={'tool': 'baseline'}) as baseline, \
                     patch.object(tools, 'crawl', return_value={'tool': 'crawl'}) as crawl, \
                     patch.object(tools, 'scanner', return_value={'tool': 'nuclei'}) as scanner, \
                     patch.object(tools, 'controls', return_value={'tool': 'controls'}) as controls:
                 emitted = []
-                result = tools.run(scope, [], Path(temp), emitted.append, role=role)
+                result = tools.run(scope, previous, Path(temp), emitted.append, role=role)
                 self.assertEqual(result['tool_runs'], emitted)
                 self.assertEqual(controls.call_count, 1)
                 for tool in (baseline, crawl, scanner):

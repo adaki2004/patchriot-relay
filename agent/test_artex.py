@@ -43,16 +43,35 @@ class EngineTests(unittest.TestCase):
             def __init__(self, _directory, _bridge, _deadline, model): models.append(model)
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def assess(self, scope, targets, role):
+            def assess(self, scope, targets, role, stop=lambda: False):
                 return {'engine': 'ARTEX', 'commit': artex.VERSION, 'stop_reason': 'model_budget',
                         'coverage_complete': False, 'findings': [], 'commands': []}
         with tempfile.TemporaryDirectory() as temp, patch.object(artex, 'Engine', FakeEngine):
-            record = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(temp), model='abliteration-abliterated-model-large-v2')
+            starts = []
+            record = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(temp), model='abliteration-abliterated-model-large-v2', emit=starts.append)
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(starts[0]['failure'], 'incomplete')
+            self.assertEqual(starts[0]['started_at'], record['started_at'])
             self.assertEqual(models, ['abliteration-abliterated-model-large-v2'])
             self.assertEqual(record['failure'], 'incomplete')
             self.assertEqual(record['exit_code'], 0)
             self.assertEqual(record['arguments'], ['/opt/artex/artex', 'https://owned.example'])
             self.assertEqual(json.loads(record['output_excerpt'])['stop_reason'], 'model_budget')
+
+    def test_bridge_rejection_stops_discovery_without_waiting_for_the_deadline(self):
+        calls = []
+        class FakeClient:
+            def call(self, path, body=None):
+                calls.append((path, body))
+                if path == '/api/tasks': return {'id': 7}
+                if path == '/api/tasks/7': return {'status': 'running'}
+                return {}
+        engine = object.__new__(artex.Engine)
+        engine.client, engine.deadline, engine.profile_id = FakeClient(), time.monotonic() + 600, 1
+        result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator', stop=lambda: True)
+        self.assertEqual(result['stop_reason'], 'model_request_rejected')
+        self.assertFalse(result['coverage_complete'])
+        self.assertIn(('/api/tasks/7/control', {'action': 'pause'}), calls)
 
     def test_engine_cannot_point_its_model_bridge_outside_container_loopback(self):
         for url in ['https://external.example', 'http://127.0.0.1:8/path', 'http://user@127.0.0.1:8',

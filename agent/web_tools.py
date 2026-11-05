@@ -313,17 +313,22 @@ def fetch_checked_request(method, url, **kwargs):
 
 
 def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator"):
-    from live_review import runs_discovery
+    from live_review import discovery_plan
     deadline = time.monotonic() + 180
-    discovery = runs_discovery(role)
+    plan = discovery_plan(role, scope, previous)
+    selected = {p['tool'] for p in plan if p['action'] in ('run', 'recover')}
     records = []
-    if discovery:
+    if 'patchriot-baseline' in selected:
         import baseline
         initial = baseline.run(scope, deadline, fetch_checked_request, record)
         records.append(initial)
         emit(initial)
     for origin in scope["origins"]:
-        checks = [lambda: crawl(origin, deadline), lambda: scanner(origin, deadline)] if discovery else []
+        checks = []
+        if 'patchriot-crawl' in selected:
+            checks.append(lambda: crawl(origin, deadline))
+        if 'nuclei' in selected:
+            checks.append(lambda: scanner(origin, deadline))
         checks.append(lambda: controls(origin, deadline, previous, auth_check_path=scope.get("auth_check_path") if scope.get("authentication") else None))
         for check in checks:
             if time.monotonic() >= deadline:
@@ -331,7 +336,7 @@ def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="inv
             result = check()
             records.append(result)
             emit(result)
-    result = {"profile": PROFILE, "role": role, "tool_runs": records,
+    result = {"profile": PROFILE, "role": role, "tool_runs": records, "discovery_plan": plan,
               "limitations": ["Only three curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
                               "The scanner receives selected headers and decoded text through the broker; use recorded target requests as the source of evidence.",
                               "Scanner host/IP and curl snippets describe a loopback mirror, not the target's IP, TLS or exact upstream headers.",
