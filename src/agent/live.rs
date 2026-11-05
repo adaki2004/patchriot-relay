@@ -5,6 +5,7 @@ use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunSta
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
+mod browser;
 mod login;
 mod near;
 mod routing;
@@ -187,6 +188,7 @@ pub struct LiveBroker {
     counters: Mutex<Counters>,
     access: access::Access,
     login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
+    browser: Mutex<browser::BrowserState>,
     #[cfg(test)]
     test_target: Option<SocketAddr>,
 }
@@ -264,6 +266,7 @@ impl LiveBroker {
             counters: Mutex::new(Counters::default()),
             access,
             login_state: tokio::sync::Mutex::new(None),
+            browser: Mutex::new(browser::BrowserState::default()),
             #[cfg(test)]
             test_target: None,
         }))
@@ -310,6 +313,7 @@ impl LiveBroker {
         // explicitly. Do not request a response schema here: the current provider
         // skips tool calls when a schema is present, even with a forced tool choice.
         let mut body = json!({"model":self.provider.model(),"messages":messages,"max_tokens":8192,"stream":input.get("stream")==Some(&json!(true)),"temperature":0.2,"reasoning_effort":"high"});
+        self.access.redact_json(&mut body["messages"]);
         match self.provider {
             LiveProvider::Abliteration => body["reasoning_effort"] = json!("high"),
             LiveProvider::Venice => {
@@ -815,6 +819,15 @@ impl LiveBroker {
                     Err(e) => (400, json!({"error":e})),
                 }
             }
+            ("POST", path) if path.starts_with("/patchriot/browser/") => {
+                match self
+                    .browser_call(path, request.body.unwrap_or(Value::Null))
+                    .await
+                {
+                    Ok(v) => (200, v),
+                    Err(e) => (400, json!({"error":e})),
+                }
+            }
             _ => (404, json!({"error":"unsupported_bridge_route"})),
         };
         let _ = output
@@ -907,6 +920,11 @@ impl LiveBroker {
             }),
             evidence: count.evidence.clone(),
             tool_runs,
+            browser_access: self
+                .browser
+                .lock()
+                .ok()
+                .and_then(|state| state.proof.clone()),
             raw_summary: {
                 let redacted = self.access.redact(raw);
                 let raw = redacted.as_str();
@@ -1069,6 +1087,7 @@ mod tests {
                 auth_check_path: None,
                 session_login: None,
                 wallet_login: None,
+                browser_login: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],

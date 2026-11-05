@@ -34,6 +34,25 @@ pub mod source;
 pub mod website;
 
 const IMAGE_ENTRY: [&str; 2] = ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"];
+const BROWSER_SECCOMP: &str = include_str!("../agent/browser-seccomp.json");
+
+fn security_options(options: &Value, browser: bool) -> bool {
+    if !browser {
+        return *options == json!(["no-new-privileges"]);
+    }
+    let Some(values) = options.as_array() else {
+        return false;
+    };
+    values.len() == 3
+        && values.iter().any(|v| v == "no-new-privileges")
+        && values.iter().any(|v| v == "apparmor=patchriot-browser-v1")
+        && values.iter().filter_map(Value::as_str).any(|value| {
+            value
+                .strip_prefix("seccomp=")
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                == serde_json::from_str::<Value>(BROWSER_SECCOMP).ok()
+        })
+}
 const TMPFS: [(&str, &str); 3] = [
     (
         "/opt/data",
@@ -114,20 +133,23 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"].contains(
+            || ![
+                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
+            ]
+            .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5", "6", "7", "8", "9", "10", "11", "12"].contains(
+                && !["3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"].contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–12; longer CPU budgets require adapter 3–12"
+                "website reviews require adapter 2–13; longer CPU budgets require adapter 3–13"
                     .into(),
             );
         }
@@ -149,20 +171,20 @@ impl Settings {
             == Some(patchriot_protocol::pentests::LiveProvider::Venice)
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("11" | "12")
+                Some("11" | "12" | "13")
             )
         {
-            return Err("Venice live tests require adapter 11 or 12".into());
+            return Err("Venice live tests require adapter 11–13".into());
         }
         if self.live_provider_key_file.is_none()
             || image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("5" | "6" | "7" | "8" | "9" | "10" | "11" | "12")
+                Some("5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13")
             )
         {
             return Err(
-                "live tests require the inspected adapter 5–12 and a private provider key file"
+                "live tests require the inspected adapter 5–13 and a private provider key file"
                     .into(),
             );
         }
@@ -175,8 +197,11 @@ impl Settings {
         self.require_live_adapter()?;
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         Ok(
-            if image["Config"]["Labels"]["io.patchriot.agent-adapter"] == "12" {
-                vec![
+            if matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("12" | "13")
+            ) {
+                let mut tools = vec![
                     patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1,
                     patchriot_protocol::pentests::LiveToolProfile::ActiveWebV1,
                     patchriot_protocol::pentests::LiveToolProfile::ActiveWebV2,
@@ -184,7 +209,11 @@ impl Settings {
                     patchriot_protocol::pentests::LiveToolProfile::SessionLoginV1,
                     patchriot_protocol::pentests::LiveToolProfile::FormDiscoveryV1,
                     patchriot_protocol::pentests::LiveToolProfile::WalletLoginV1,
-                ]
+                ];
+                if image["Config"]["Labels"]["io.patchriot.agent-adapter"] == "13" {
+                    tools.push(patchriot_protocol::pentests::LiveToolProfile::BrowserLoginV1);
+                }
+                tools
             } else if matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
                 Some("10" | "11")
@@ -217,7 +246,7 @@ impl Settings {
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -705,7 +734,19 @@ async fn supervise(
     Ok(report)
 }
 
+#[cfg(test)]
 fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: bool) -> bool {
+    browser_policy(container, image, args, seconds, engine, false)
+}
+
+fn browser_policy(
+    container: &Value,
+    image: &str,
+    args: &[&str],
+    seconds: u64,
+    engine: bool,
+    browser: bool,
+) -> bool {
     let h = &container["HostConfig"];
     let c = &container["Config"];
     container["Image"] == image
@@ -716,11 +757,13 @@ fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: b
         && h["Init"] == true
         && h["CapDrop"] == json!(["ALL"])
         && no_entries(&h["CapAdd"])
-        && h["SecurityOpt"] == json!(["no-new-privileges"])
+        && security_options(&h["SecurityOpt"], browser)
+        && (!browser || container["AppArmorProfile"] == "patchriot-browser-v1")
         && h["Memory"] == 2_147_483_648u64
         && h["MemorySwap"] == 2_147_483_648u64
         && h["NanoCpus"] == 2_000_000_000u64
-        && h["PidsLimit"] == 128
+        && h["PidsLimit"] == if browser { 256 } else { 128 }
+        && (!browser || h["ShmSize"] == 268435456u64)
         && h["CgroupnsMode"] == "private"
         && h["PidMode"] == ""
         && h["IpcMode"] == "private"
@@ -801,7 +844,7 @@ pub fn run(
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
         || ![
-            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
         ]
         .contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
@@ -809,7 +852,10 @@ pub fn run(
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"].contains(
+            && ![
+                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
+            ]
+            .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -817,14 +863,14 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13")
             )
         || live
             .as_ref()
             .is_some_and(|task| !task.evidence.context.scope.tools.is_empty())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("7" | "8" | "9" | "10" | "11" | "12")
+                Some("7" | "8" | "9" | "10" | "11" | "12" | "13")
             )
         || live.as_ref().is_some_and(|task| {
             task.evidence
@@ -835,28 +881,34 @@ pub fn run(
                 .any(|tool| *tool != patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
         }) && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("8" | "9" | "10" | "11" | "12")
+            Some("8" | "9" | "10" | "11" | "12" | "13")
         )
         || live
             .as_ref()
             .is_some_and(|task| task.evidence.context.scope.session_login.is_some())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("10" | "11" | "12")
+                Some("10" | "11" | "12" | "13")
             )
         || live
             .as_ref()
             .is_some_and(|task| task.evidence.context.scope.wallet_login.is_some())
-            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "12"
+            && !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("12" | "13")
+            )
         || live.as_ref().is_some_and(|task| {
             task.evidence
                 .context
                 .scope
                 .tools
                 .contains(&patchriot_protocol::pentests::LiveToolProfile::ActiveWebV2)
-        }) && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "12"
+        }) && !matches!(
+            image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+            Some("12" | "13")
+        )
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5", "6", "7", "8", "9", "10", "11", "12"].contains(
+            && !["3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"].contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -865,6 +917,10 @@ pub fn run(
         || !no_entries(&image["Config"]["Healthcheck"])
     {
         return Err("build the pinned agent/Dockerfile image before this check".into());
+    }
+    let browser = live.is_some_and(|task| task.evidence.context.scope.browser_login.is_some());
+    if browser && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "13" {
+        return Err("browser login requires the inspected adapter 13 image".into());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1017,6 +1073,26 @@ pub fn run(
             .tools
             .contains(&patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
     });
+    // This is a reviewed profile embedded in the binary, never a page or model
+    // supplied path. Keep its file alive until Docker has read it at creation.
+    let _browser_seccomp = if browser {
+        let mut file = tempfile::NamedTempFile::new()?;
+        std::io::Write::write_all(&mut file, BROWSER_SECCOMP.as_bytes())?;
+        command.extend([
+            "--security-opt".into(),
+            format!("seccomp={}", file.path().display()),
+            "--security-opt=apparmor=patchriot-browser-v1".into(),
+            "--shm-size=256m".into(),
+        ]);
+        let pids = command
+            .iter()
+            .position(|arg| arg == "--pids-limit")
+            .ok_or("missing process limit")?;
+        command[pids + 1] = "256".into();
+        Some(file)
+    } else {
+        None
+    };
     for (path, options) in temporary_storage(engine) {
         command.extend(["--tmpfs".into(), format!("{path}:{options}")]);
     }
@@ -1030,12 +1106,13 @@ pub fn run(
         {
             return Err("agent container creation failed".into());
         }
-        if !policy(
+        if !browser_policy(
             &docker.inspect("container", &owned.name)?,
             &settings.image,
             &args,
             settings.max_attempt_seconds,
             engine,
+            browser,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -1433,6 +1510,54 @@ mod tests {
             "Config":{"Env":["PATCHRIOT_AGENT_MAX_SECONDS=600"],"User":"65534:65534","WorkingDir":"/work","Entrypoint":IMAGE_ENTRY,"Cmd":["owned-model"],"Tty":false,"OpenStdin":true},
             "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"Privileged":false,"Init":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],"Memory":2147483648u64,"MemorySwap":2147483648u64,"NanoCpus":2000000000u64,"PidsLimit":128,"CgroupnsMode":"private","PidMode":"","IpcMode":"private","UTSMode":"","UsernsMode":"","LogConfig":{"Type":"none"},"RestartPolicy":{"Name":"no"},"Tmpfs":TMPFS.into_iter().collect::<std::collections::BTreeMap<_,_>>()}
         })
+    }
+    #[test]
+    fn browser_policy_adds_its_sandbox_without_allowing_host_access() {
+        let mut value = container();
+        value["AppArmorProfile"] = json!("patchriot-browser-v1");
+        value["HostConfig"]["PidsLimit"] = json!(256);
+        value["HostConfig"]["ShmSize"] = json!(268435456);
+        value["HostConfig"]["SecurityOpt"] = json!([
+            "no-new-privileges",
+            "apparmor=patchriot-browser-v1",
+            format!("seccomp={BROWSER_SECCOMP}")
+        ]);
+        assert!(browser_policy(
+            &value,
+            "owned-image",
+            &["owned-model"],
+            600,
+            false,
+            true
+        ));
+        for (path, change) in [
+            ("/AppArmorProfile", json!("unconfined")),
+            (
+                "/HostConfig/SecurityOpt",
+                json!(["no-new-privileges", "seccomp=unconfined"]),
+            ),
+            ("/HostConfig/NetworkMode", json!("host")),
+            ("/HostConfig/IpcMode", json!("host")),
+            ("/HostConfig/Privileged", json!(true)),
+            ("/HostConfig/ReadonlyRootfs", json!(false)),
+            ("/Config/User", json!("root")),
+        ] {
+            let mut changed = value.clone();
+            *changed.pointer_mut(path).unwrap() = change;
+            assert!(
+                !browser_policy(&changed, "owned-image", &["owned-model"], 600, false, true),
+                "{path}"
+            );
+        }
+        value["HostConfig"]["CapAdd"] = json!(["SYS_ADMIN"]);
+        assert!(!browser_policy(
+            &value,
+            "owned-image",
+            &["owned-model"],
+            600,
+            false,
+            true
+        ));
     }
     #[test]
     fn docker_configuration_must_preserve_the_execution_boundary() {

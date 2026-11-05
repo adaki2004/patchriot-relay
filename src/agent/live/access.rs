@@ -17,6 +17,20 @@ pub(super) struct Access {
     sessions: bool,
 }
 impl Access {
+    /// Delivered to the isolated browser controller for filling the supplied
+    /// account. Never include this response in a model transcript or report.
+    pub fn browser_credentials(&self) -> Result<serde_json::Value, &'static str> {
+        let (username, password) = self
+            .login_account
+            .as_ref()
+            .ok_or("test_account_unavailable")?;
+        Ok(serde_json::json!({"username":username.as_str(),"password":password.as_str()}))
+    }
+    pub fn browser_principal(&self) -> Option<&str> {
+        self.login_account
+            .as_ref()
+            .map(|(username, _)| username.as_str())
+    }
     pub fn redact_limited(&self, value: &str, limit: usize) -> (String, bool) {
         let mut text = self.redact(value);
         let shortened = text.len() > limit;
@@ -102,11 +116,20 @@ impl Access {
         ]
         .into())
     }
-    pub fn remember_secret(&self, value: String) {
-        self.secrets
-            .lock()
-            .expect("redaction state poisoned")
-            .push(Zeroizing::new(value));
+    pub fn remember_secret(&self, value: String) -> Result<(), &'static str> {
+        let value = Zeroizing::new(value);
+        let mut secrets = self.secrets.lock().map_err(|_| "redaction_unavailable")?;
+        if value.is_empty() || secrets.iter().any(|old| **old == *value) {
+            return Ok(());
+        }
+        if value.len() > 8192
+            || secrets.len() >= 512
+            || secrets.iter().map(|v| v.len()).sum::<usize>() + value.len() > 256 * 1024
+        {
+            return Err("credential_redaction_limit");
+        }
+        secrets.push(value);
+        Ok(())
     }
     pub fn authenticated(&self, url: &url::Url, enabled: bool) -> bool {
         self.authorization(enabled).is_some() || self.cookies(url, enabled).is_some()
@@ -138,11 +161,11 @@ impl Access {
             let Ok(value) = header.to_str() else { continue };
             if let Some((_, secret)) = value.split(';').next().unwrap_or("").split_once('=')
                 && !secret.is_empty()
+                && self
+                    .remember_secret(secret.trim_matches('"').to_owned())
+                    .is_err()
             {
-                self.secrets
-                    .lock()
-                    .expect("redaction state poisoned")
-                    .push(Zeroizing::new(secret.trim_matches('"').to_owned()));
+                continue;
             }
             *total += header.as_bytes().len();
             self.cookies.set_cookies(&mut std::iter::once(header), url);
@@ -150,22 +173,42 @@ impl Access {
     }
     pub fn redact(&self, value: &str) -> String {
         let secrets = self.secrets.lock().expect("redaction state poisoned");
-        let mut result = value.to_owned();
+        // Match only the original text. Replacing successively would reprocess
+        // the marker itself when a server sets short cookies such as R or E,
+        // allowing a small response to expand repeatedly during redaction.
+        let mut covered = vec![false; value.len()];
         for secret in secrets.iter().filter(|s| !s.is_empty()) {
             // Echoed HTML/JSON/form values cannot smuggle the supplied secret
             // into a model prompt, evidence file or report.
+            let json = serde_json::to_string(secret.as_str()).expect("string is JSON");
             for pattern in [
                 secret.to_string(),
                 url::form_urlencoded::byte_serialize(secret.as_bytes()).collect(),
-                serde_json::to_string(secret.as_str())
-                    .unwrap_or_default()
-                    .trim_matches('"')
-                    .to_owned(),
+                json[1..json.len() - 1].to_owned(),
             ] {
                 if !pattern.is_empty() {
-                    result = result.replace(&pattern, "REDACTED");
+                    for (start, _) in value.match_indices(&pattern) {
+                        covered[start..start + pattern.len()].fill(true);
+                    }
                 }
             }
+        }
+        let mut result = String::with_capacity(value.len());
+        let mut start = 0;
+        while start < value.len() {
+            let hidden = covered[start];
+            let end = covered[start..]
+                .iter()
+                .position(|value| *value != hidden)
+                .map_or(value.len(), |offset| start + offset);
+            if hidden {
+                result.push_str("REDACTED");
+            } else {
+                // Match boundaries are UTF-8 boundaries; merging matches keeps
+                // the untouched spans valid too.
+                result.push_str(&value[start..end]);
+            }
+            start = end;
         }
         result
     }
@@ -182,6 +225,26 @@ impl Access {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn redaction_never_reprocesses_markers_and_preserves_unicode() {
+        let scope: LiveScope = serde_json::from_value(serde_json::json!({
+            "origins":["https://owned.example"], "methods":["GET"]
+        }))
+        .unwrap();
+        let access = Access::new(&scope, None).unwrap();
+        for secret in ["x", "R", "E", "D", "A", "C", "T", "é\"&"] {
+            access.remember_secret(secret.into()).unwrap();
+        }
+        assert_eq!(access.redact(&"x".repeat(8192)), "REDACTED");
+        assert_eq!(access.redact("x ☃ x"), "REDACTED ☃ REDACTED");
+        assert_eq!(
+            access.redact("é\"& é\\\"& %C3%A9%22%26"),
+            "REDACTED REDACTED REDACTED"
+        );
+        let (bounded, shortened) = access.redact_limited("x ☃ x", 11);
+        assert_eq!(bounded, "REDACTED ");
+        assert!(shortened);
+    }
     #[tokio::test]
     async fn a_real_session_keeps_cookies_out_of_anonymous_controls_and_does_not_follow_redirects()
     {
@@ -251,6 +314,7 @@ mod tests {
             auth_check_path: Some("/private".into()),
             session_login: None,
             wallet_login: None,
+            browser_login: None,
         };
         let credentials = TestCredentials::Bearer {
             token: "synthetic-bearer-for-tests".into(),

@@ -37,8 +37,8 @@ impl LiveBroker {
         // Sign the exact bytes, never a reconstructed or model-edited message.
         let signature = sign_login(&key, message);
         drop(key);
-        self.access.remember_secret(signature.clone());
-        self.access.remember_secret(nonce.to_owned());
+        self.access.remember_secret(signature.clone())?;
+        self.access.remember_secret(nonce.to_owned())?;
         let mut verification = match login.verify_payload {
             WalletVerifyPayload::NonceSignature => json!({"nonce":nonce,"signature":signature}),
             WalletVerifyPayload::MessageSignature => {
@@ -100,7 +100,7 @@ impl LiveBroker {
     }
 }
 
-fn wallet_address(key: &SigningKey) -> String {
+pub(super) fn wallet_address(key: &SigningKey) -> String {
     let point = key.verifying_key().to_sec1_point(false);
     let digest = Keccak256::digest(&point.as_bytes()[1..]);
     let lower = hex::encode(&digest[12..]);
@@ -119,7 +119,7 @@ fn wallet_address(key: &SigningKey) -> String {
     format!("0x{address}")
 }
 
-fn sign_login(key: &SigningKey, message: &str) -> String {
+pub(super) fn sign_login(key: &SigningKey, message: &str) -> String {
     let mut digest = Keccak256::new();
     digest.update(format!("\x19Ethereum Signed Message:\n{}", message.len()));
     digest.update(message.as_bytes());
@@ -134,7 +134,7 @@ fn sign_login(key: &SigningKey, message: &str) -> String {
 /// A deliberately small SIWE subset: HTTPS origin, EOA, one chain, fresh nonce,
 /// issued-at and <=10-minute expiry. Resources, request IDs, extra fields and
 /// arbitrary signing formats are not login capabilities for this runner.
-fn validate_message(
+pub(super) fn validate_message(
     message: &str,
     nonce: &str,
     origin: &str,
@@ -142,8 +142,34 @@ fn validate_message(
     chain: u64,
     now: i64,
 ) -> Result<(), &'static str> {
+    validate_siwe(message, nonce, origin, address, chain, now, true)
+}
+
+/// Browser login also accepts EIP-4361's optional expiry and request ID. The
+/// legacy HTTP exchange retains its narrower, mandatory-expiry contract.
+pub(super) fn validate_browser_siwe(
+    message: &str,
+    nonce: &str,
+    origin: &str,
+    address: &str,
+    chain: u64,
+    now: i64,
+) -> Result<(), &'static str> {
+    validate_siwe(message, nonce, origin, address, chain, now, false)
+}
+
+fn validate_siwe(
+    message: &str,
+    nonce: &str,
+    origin: &str,
+    address: &str,
+    chain: u64,
+    now: i64,
+    strict_expiry: bool,
+) -> Result<(), &'static str> {
     let invalid = "wallet_challenge_not_login";
-    if message.len() > 4096
+    if chain == 0
+        || message.len() > 4096
         || !message.is_ascii()
         || message.bytes().any(|b| b.is_ascii_control() && b != b'\n')
         || !(8..=128).contains(&nonce.len())
@@ -191,20 +217,40 @@ fn validate_message(
             .map_err(|_| invalid)
     };
     let issued = timestamp(lines.next(), "Issued At: ")?;
-    let expiry = timestamp(lines.next(), "Expiration Time: ")?;
+    let mut lines = lines.peekable();
+    let expiry = if lines
+        .peek()
+        .is_some_and(|s| s.starts_with("Expiration Time: "))
+    {
+        timestamp(lines.next(), "Expiration Time: ")?
+    } else if strict_expiry {
+        return Err(invalid);
+    } else {
+        issued + 600
+    };
     if issued > now + 30
         || issued < now - 300
         || expiry <= now
         || expiry <= issued
-        || expiry > issued + 600
+        || strict_expiry && expiry > issued + 600
     {
         return Err("wallet_challenge_expired");
     }
-    if let Some(next) = lines.next() {
-        let not_before = timestamp(Some(next), "Not Before: ")?;
-        if not_before > now || not_before > expiry || lines.next().is_some() {
+    if lines.peek().is_some_and(|s| s.starts_with("Not Before: ")) {
+        let not_before = timestamp(lines.next(), "Not Before: ")?;
+        if not_before > now || not_before > expiry {
             return Err(invalid);
         }
+    }
+    if !strict_expiry && lines.peek().is_some_and(|s| s.starts_with("Request ID: ")) {
+        let id = lines.next().unwrap().strip_prefix("Request ID: ").unwrap();
+        if id.len() > 256 || id.bytes().any(|c| c.is_ascii_control() || c == b' ') {
+            return Err(invalid);
+        }
+    }
+    // Resource grants are not ordinary account login and need a separate policy.
+    if lines.next().is_some() {
+        return Err(invalid);
     }
     Ok(())
 }

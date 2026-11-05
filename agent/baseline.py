@@ -96,7 +96,9 @@ def run(scope, deadline, fetch, record):
             "The marker was reflected. Context and browser execution need review; reflection alone is not XSS." if reflected else
             "The marker was not reflected in the retained homepage response." if usable(reflection) else "The probe did not complete.", [reflection, root])
 
-        if scope.get("authentication"):
+        if scope.get("browser_login") is not None:
+            add(origin, "test-account", "Test-account access", "skipped", "Browser login and the protected-access comparison run during the agent investigation. See the separate authenticated-access proof; public baseline checks do not prove login.")
+        elif scope.get("authentication"):
             path = scope["auth_check_path"]
             anonymous = get(origin, path, authenticated=False)
             signed = get(origin, path)
@@ -109,7 +111,8 @@ def run(scope, deadline, fetch, record):
             add(origin, "test-account", "Test-account access", "skipped", "No test account was supplied.")
         add(origin, "forms", "Form and state-changing tests", "inconclusive" if "POST" in scope["methods"] else "skipped",
             "POST is permitted. Inspect the agents' actual requests and findings; permission alone does not prove a form was tested." if "POST" in scope["methods"] else "This request permits read-only methods; no forms are submitted.")
-        add(origin, "browser", "Browser login, SSO and client-side execution", "unsupported", "This runner does not drive a browser or complete interactive login challenges.")
+        if scope.get("browser_login") is None:
+            add(origin, "browser", "Browser login, SSO and client-side execution", "unsupported", "This runner does not drive a browser or complete interactive login challenges.")
 
     complete = all(c["status"] != "inconclusive" for c in checks)
     return record("patchriot-baseline", VERSION, ["--profile", VERSION], started, observed, refs,

@@ -65,6 +65,42 @@ class LiveOverviewTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def setUp(self):
+        adapter.bridge_stopping.clear()
+
+    def tearDown(self):
+        adapter.bridge_stopping.clear()
+
+    def test_final_result_waits_for_the_active_response_and_rejects_late_browser_requests(self):
+        wire = io.StringIO()
+        with patch.object(adapter, 'wire_out', wire):
+            with adapter.transaction_lock:
+                finishing = threading.Thread(target=adapter.finish_result, kwargs={'completed':True})
+                finishing.start()
+                self.assertTrue(adapter.bridge_stopping.wait(timeout=2))
+                result, requests = self.exchange([], 'POST', '/patchriot/browser/status', '{}')
+                self.assertEqual(result[0], 503)
+                self.assertEqual(requests, [])
+                self.assertEqual(wire.getvalue(), '')
+            finishing.join(timeout=2)
+            self.assertFalse(finishing.is_alive())
+        self.assertEqual(json.loads(wire.getvalue()), {'type':'event','event':'result','data':{'completed':True}})
+        result, requests = self.exchange([], 'GET', '/v1/models')
+        self.assertEqual(result[0], 503)
+        self.assertEqual(requests, [])
+
+    def test_failed_browser_cleanup_retains_the_report_without_claiming_completion(self):
+        class StuckBrowser:
+            def close(self):
+                raise TimeoutError('synthetic stuck browser')
+        wire = io.StringIO()
+        with patch.object(adapter, 'wire_out', wire):
+            adapter.finish_result(StuckBrowser(), completed=True, final_response='partial owned observation')
+        result = json.loads(wire.getvalue())['data']
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['final_response'], 'partial owned observation')
+        self.assertEqual(result['cleanup_error'], 'browser_cleanup_unconfirmed')
+
     def test_execution_budget_is_explicit_bounded_and_not_model_controlled(self):
         for value in ["600", "1200", "1800", "3600"]:
             self.assertEqual(adapter.execution_budget(value), int(value))

@@ -18,6 +18,7 @@ MAX_REQUEST = 65536
 wire_out = sys.stdout
 wire_lock = threading.Lock()
 transaction_lock = threading.Lock()
+bridge_stopping = threading.Event()
 request_id = 0
 
 
@@ -110,6 +111,21 @@ def event(kind, **data):
     send({"type": "event", "event": kind, "data": data})
 
 
+def finish_result(browser=None, **data):
+    # Pages can poll while the agent is composing its final answer. Stop new
+    # requests, close the browser and drain the current response before the
+    # terminal event; the relay correctly rejects requests after that event.
+    bridge_stopping.set()
+    if browser:
+        try:
+            browser.close()
+        except Exception:
+            data['completed'] = False
+            data['cleanup_error'] = 'browser_cleanup_unconfirmed'
+    with transaction_lock:
+        event("result", **data)
+
+
 def execution_budget(value):
     """Operator-selected limit; website text and models cannot change it."""
     if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 3600:
@@ -131,11 +147,15 @@ class Bridge(BaseHTTPRequestHandler):
         global request_id
         self.close_connection = True
         try:
+            if bridge_stopping.is_set():
+                return self.send_error(503)
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > MAX_REQUEST or self.headers.get("Transfer-Encoding"):
                 return self.send_error(400)
             body = json.loads(self.rfile.read(length)) if length else None
             with transaction_lock:
+                if bridge_stopping.is_set():
+                    return self.send_error(503)
                 request_id += 1
                 request = {"id": request_id, "method": self.command, "path": self.path, "body": body}
                 send({"type": "request", "request": request})
@@ -212,6 +232,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Bridge)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     os.environ["PATCHRIOT_BRIDGE_URL"] = f"http://127.0.0.1:{server.server_port}"
+    browser = None
     if live:
         import web_tools
         event("phase", name="scoped_tools")
@@ -228,26 +249,31 @@ def main():
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)
-    from run_agent import AIAgent
-    observed = []
-
-    def complete(*args, **kwargs):
-        observed.append(args)
-        event("tool_complete", args=args, kwargs=kwargs)
-
-    agent = AIAgent(
-        model=model, provider="custom", api_mode="chat_completions",
-        base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-        enabled_toolsets=[] if source else ["terminal"], max_iterations=160 if live else 3, max_tokens=8192 if live else (512 if role else 192),
-        reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
-        request_overrides={} if live else {"reasoning_effort": "none"},
-        quiet_mode=True, skip_context_files=True, skip_memory=True,
-        skip_background_review=True, checkpoints_enabled=False,
-        run_budget_seconds=max(1, budget - 30 - int(time.monotonic() - started)), cwd="/work",
-        tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
-        tool_complete_callback=complete,
-    )
+        if scope.get("browser_login") is not None:
+            from browser_access import BrowserRunner
+            browser = BrowserRunner(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
+            os.environ["BROWSER_CDP_URL"] = browser.cdp
+    agent = None
     try:
+        from run_agent import AIAgent
+        observed = []
+
+        def complete(*args, **kwargs):
+            observed.append(args)
+            event("tool_complete", args=args, kwargs=kwargs)
+
+        agent = AIAgent(
+            model=model, provider="custom", api_mode="chat_completions",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
+            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=160 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+            reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
+            request_overrides={} if live else {"reasoning_effort": "none"},
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            skip_background_review=True, checkpoints_enabled=False,
+            run_budget_seconds=max(1, budget - 30 - int(time.monotonic() - started)), cwd="/work",
+            tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
+            tool_complete_callback=complete,
+        )
         if source and (agent.tools or agent.valid_tool_names):
             raise RuntimeError("source review requires an empty model toolset")
         event("phase", name="agent_ready")
@@ -258,7 +284,7 @@ def main():
             "Report only observed output. Do not edit files, install anything or access the network."
         )
         if live:
-            prompt = live_review.prompt(role) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            prompt = live_review.prompt(role, browser=browser is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         regression = False
         for args in observed:
@@ -274,12 +300,17 @@ def main():
             except (ValueError, KeyError, TypeError, IndexError):
                 pass
         completed = result.get("completed") is True and not result.get("failed")
-        event("result", completed=completed, observed_fixture_regression=regression,
-              final_response=result.get("final_response"), api_calls=result.get("api_calls"))
+        finished_browser, browser = browser, None
+        finish_result(finished_browser, completed=completed, observed_fixture_regression=regression,
+                      final_response=result.get("final_response"), api_calls=result.get("api_calls"))
         if (not role and not regression) or not completed:
             raise SystemExit(1)
     finally:
-        agent.close()
+        bridge_stopping.set()
+        if agent:
+            agent.close()
+        if browser:
+            browser.close()
         server.shutdown()
 
 

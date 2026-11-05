@@ -63,7 +63,7 @@ impl LiveBroker {
             if automatic {
                 (resolved, hidden) = discover_form(&page, reply["body"].as_str().unwrap_or(""))?;
                 for value in hidden.values().filter(|value| !value.is_empty()) {
-                    self.access.remember_secret(value.clone());
+                    self.access.remember_secret(value.clone())?;
                 }
             } else if let Some(name) = &login.csrf_field {
                 let submit = public_url(&format!("{origin}{}", login.path))?;
@@ -74,7 +74,7 @@ impl LiveBroker {
                     reply["body"].as_str().unwrap_or(""),
                     name,
                 )?;
-                self.access.remember_secret(token.clone());
+                self.access.remember_secret(token.clone())?;
                 hidden.insert(name.clone(), token);
             }
         }
