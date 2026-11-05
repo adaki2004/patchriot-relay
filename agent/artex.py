@@ -71,7 +71,7 @@ def task_body(scope, targets, seconds, role):
             'These mirrors forward real requests to their corresponding approved websites. They are not the ARTEX admin API. '
             'Inspect the reachable application, use suitable installed tools, validate material leads with benign control requests and record your findings. '
             'Finish within the supplied time and request allowance. Reporting coverage limits is a valid outcome; do not keep creating new work. '
-            'Use only the methods in the approved scope. POST is available only in web_active_v1 for the owner-approved disposable test environment; use JSON or URL-encoded bodies up to 16 KiB. The relay injects any declared test account; never ask for credentials. No fund movement, real purchases, brute force, load testing or persistence. '
+            'Use only the methods in the approved scope. POST is available only in an explicitly authorized active scope (web_active_v1 or web_active_v2), using disposable test data; use JSON or URL-encoded bodies up to 16 KiB. The relay injects any declared test account; never ask for credentials. No fund movement, real purchases, brute force, load testing or persistence. '
             'External network and other hosts are unavailable. Some absolute links and redirects cannot be followed through a mirror; record that limit. '
             'The mirrors return selected response headers and bounded decoded text. They cannot establish TLS configuration, binary-file behavior or real browser execution. '
             'Do not call static reflection a proven XSS exploit. Do not install tools. Use only the reported target HTTP responses as evidence. '

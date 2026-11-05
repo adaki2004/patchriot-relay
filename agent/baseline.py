@@ -3,8 +3,33 @@ import json
 import re
 import secrets
 import time
+from urllib.parse import urljoin, urlsplit
 
 VERSION = "web-checks-v1"
+
+
+def denied_anonymous(scope, evidence):
+    if evidence.get("authenticated") or evidence.get("error"):
+        return False
+    if evidence.get("status") in (401, 403):
+        return True
+    if evidence.get("status") not in (302, 303, 307, 308):
+        return False
+    login = scope.get("session_login") or {}
+    location = evidence.get("headers", {}).get("location")
+    if not login or not location:
+        return False
+    try:
+        base = urlsplit(evidence["url"])
+        destination = urlsplit(urljoin(evidence["url"], location))
+        return (
+            (destination.scheme, destination.hostname, destination.port or 443)
+            == (base.scheme, base.hostname, base.port or 443)
+            and not destination.username and not destination.password
+            and destination.path == login.get("page_path", login.get("path"))
+        )
+    except (ValueError, KeyError):
+        return False
 
 
 def run(scope, deadline, fetch, record):
@@ -76,7 +101,7 @@ def run(scope, deadline, fetch, record):
             anonymous = get(origin, path, authenticated=False)
             signed = get(origin, path)
             ae, se = anonymous.get("evidence", {}), signed.get("evidence", {})
-            confirmed = usable(anonymous) and usable(signed) and ae.get("status") in (401, 403) and 200 <= se.get("status", 0) < 300 and se.get("authenticated") is True
+            confirmed = usable(anonymous) and usable(signed) and denied_anonymous(scope, ae) and 200 <= se.get("status", 0) < 300 and se.get("authenticated") is True
             add(origin, "test-account", "Test-account access and anonymous control", "completed" if confirmed else "inconclusive",
                 "The supplied account reached the protected URL; the anonymous control was denied." if confirmed else
                 "Could not prove authenticated access. Check the protected URL and test account; this is a coverage gap, not a vulnerability finding.", [anonymous, signed])
