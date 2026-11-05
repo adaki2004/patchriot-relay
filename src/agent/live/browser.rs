@@ -355,7 +355,11 @@ impl LiveBroker {
         }
         // Login responses can carry a JavaScript token rather than Set-Cookie.
         // Register it before a browser tool can expose it to model/report text.
-        if let Ok(value) = serde_json::from_slice::<Value>(&body)
+        // Anonymous dependencies cannot establish a target session. Their
+        // public catalogs may be much wider than a bounded login response.
+        // Known secrets are still redacted from all retained evidence below.
+        if !resource
+            && let Ok(value) = serde_json::from_slice::<Value>(&body)
             && let Err(error) = remember_tokens(&self.access, &value, 0)
         {
             evidence.error = Some(error.into());
@@ -774,6 +778,12 @@ mod tests {
                     )
                 } else if head.starts_with("GET /public ") {
                     (200, "", json!({"public":true}).to_string())
+                } else if head.starts_with("GET /public-catalog ") {
+                    (
+                        200,
+                        "",
+                        json!({"items":vec!["public-item"; 300]}).to_string(),
+                    )
                 } else if head.starts_with("GET /identity ") {
                     (
                         200,
@@ -899,6 +909,36 @@ mod tests {
                 .await
                 .is_err()
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn browser_public_dependency_catalogs_do_not_use_session_token_limits() {
+        let (address, server) = target().await;
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.test_target = Some(address);
+        inner.scope.browser_login.as_mut().unwrap().resource_origins =
+            vec!["https://cdn.example.com".into()];
+        let reply = broker.browser_call("/patchriot/browser/http", json!({
+            "method":"GET", "url":"https://cdn.example.com/public-catalog", "authenticated":false
+        })).await.unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        assert!(reply["evidence"]["error"].is_null());
+        let bytes = STANDARD
+            .decode(reply["body_base64"].as_str().unwrap())
+            .unwrap();
+        let catalog: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(catalog["items"].as_array().unwrap().len(), 300);
+        let evidence: HttpEvidence = serde_json::from_value(reply["evidence"].clone()).unwrap();
+        assert!(!evidence.authenticated);
+        assert!(broker.browser.lock().unwrap().proof.is_none());
+        // A target response may carry credentials, so its limit is unchanged.
+        let reply = broker.browser_call("/patchriot/browser/http", json!({
+            "method":"GET", "url":"https://owned.example/public-catalog", "authenticated":true
+        })).await.unwrap();
+        assert_eq!(reply["evidence"]["error"], "browser_json_too_wide");
+        assert_eq!(reply["body_base64"], "");
         server.abort();
     }
 
