@@ -367,6 +367,24 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result[0], 400)
         self.assertFalse(adapter.engine_stopping.is_set())
 
+    def test_provider_rate_limit_ends_discovery_without_replaying_or_closing_the_reviewer(self):
+        frames = [
+            {'type':'start','id':1,'status':429,'content_type':'application/json'},
+            {'type':'chunk','id':1,'hex':b'{"error":"provider_rate_limited"}'.hex()},
+            {'type':'end','id':1},
+        ]
+        result, wire = self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+        self.assertEqual(result[0], 429)
+        self.assertEqual(json.loads(result[2])['error'], 'provider_rate_limited')
+        self.assertEqual(len(wire), 1, 'Do not replay a paid request')
+        self.assertTrue(adapter.engine_stopping.is_set())
+        self.assertFalse(adapter.bridge_stopping.is_set())
+        frames[0]['status'] = 200
+        frames[1]['hex'] = b'{"choices":[]}'.hex()
+        result, wire = self.exchange(frames, 'POST', '/v1/chat/completions', '{}')
+        self.assertEqual(result[0], 200)
+        self.assertEqual(wire[0]['request']['path'], '/v1/chat/completions')
+
     def test_phase_name_is_data_and_events_remain_bounded(self):
         wire = io.StringIO()
         with patch.object(adapter, "wire_out", wire):

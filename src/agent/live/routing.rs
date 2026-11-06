@@ -413,6 +413,53 @@ mod tests {
         assert!(receipt.valid(1));
     }
     #[tokio::test]
+    async fn rate_limited_discovery_preserves_attempts_and_allows_a_later_review() {
+        let broker = broker();
+        let mut routes = Vec::new();
+        let error = broker
+            .route_completion(request(), true, |route, _| {
+                routes.push(route);
+                std::future::ready(Err("provider_rate_limited"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(routes, vec![Route::Near, Route::Venice]);
+        let mut engine_request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: ENGINE_CHAT.into(),
+            body: Some(request()),
+        };
+        assert!(recoverable_engine_error(&engine_request, error));
+        engine_request.path = "/v1/chat/completions".into();
+        assert!(!recoverable_engine_error(&engine_request, error));
+        let failed_reservation = {
+            let count = broker.counters.lock().unwrap();
+            assert_eq!(count.calls, 1);
+            let receipt = count.fallback.as_ref().unwrap();
+            assert!(receipt.valid(1));
+            assert_eq!(receipt.fallback_completed, 0);
+            assert!(count.reserved > 0);
+            count.reserved
+        };
+        // This is the later reviewer, not an automatic replay of discovery.
+        broker
+            .route_completion(request(), false, |route, _| {
+                routes.push(route);
+                std::future::ready(Ok(reply()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(routes, vec![Route::Near, Route::Venice, Route::Venice]);
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(count.calls, 2);
+        assert_eq!(
+            count.reserved,
+            failed_reservation + fallback_cost(1000, 100).unwrap()
+        );
+        assert!(count.fallback.as_ref().unwrap().valid(2));
+    }
+    #[tokio::test]
     async fn recovery_is_one_logical_call_and_sticks_to_venice_for_this_role() {
         let broker = broker();
         let mut routes = Vec::new();

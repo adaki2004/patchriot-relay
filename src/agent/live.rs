@@ -24,13 +24,16 @@ pub fn is_chat_path(path: &str) -> bool {
     path == "/v1/chat/completions" || path == ENGINE_CHAT || path == SUMMARY_CHAT
 }
 /// A rejected discovery request must stop that engine, not discard the later
-/// reviewer's chance to report the saved evidence. These errors send no model
-/// request. Authentication, attestation and scope failures still stop the role.
+/// reviewer's chance to report the saved evidence. Local input errors send no
+/// model request; a provider rate limit keeps its attempt and cost reservation.
+/// Neither is retried here. Authentication, attestation and scope failures stop
+/// the role.
 pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool {
     request.path == ENGINE_CHAT
         && matches!(
             reason,
             "engine_budget_reached"
+                | "provider_rate_limited"
                 | "model_history_limit"
                 | "model_messages_empty"
                 | "model_message_role"
@@ -856,7 +859,10 @@ impl LiveBroker {
                     let _ = output
                         .send(Frame::Start {
                             id: request.id,
-                            status: if reason == "engine_budget_reached" {
+                            status: if matches!(
+                                reason,
+                                "engine_budget_reached" | "provider_rate_limited"
+                            ) {
                                 429
                             } else {
                                 400
@@ -1285,6 +1291,8 @@ mod tests {
             "engine_not_selected",
             "near_signature_invalid",
             "provider_authentication_failed",
+            "provider_unavailable",
+            "wrong_provider_model",
         ] {
             assert!(!recoverable_engine_error(&request, reason));
         }
