@@ -44,6 +44,8 @@ Live conversations start compression at 32,000 tokens within the configured 64,0
 
 Browser status shows when the login window has expired, even while page requests are busy. Reloading cannot renew it. Agents are instructed to preserve any established session, report missing access and continue reachable checks. Managed bot challenges are access limits; agents are instructed not to solve or reverse-engineer them.
 
+The request selects the login method. Supplied-account tests use that account's form; agents are instructed not to divert into wallet or social login. The broker enforces the selected method independently of those instructions.
+
 ARTEX handoffs contain a complete JSON summary, stop reason, evidence references and shortened finding previews. Full engine details remain in the current role's temporary work directory; they are not a permanent transcript archive. NEAR logs separately time attestation, completion and signature checks, including cancelled phases, without printing prompts or responses.
 
 Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.
