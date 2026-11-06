@@ -8,8 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-// A timeout anywhere in this verified route used to be logged as a verification
-// timeout, even if the model had not replied. Record the phase, never its data.
+// The legacy near_verification_timeout code covers this whole verified route,
+// including model generation. Keep the wire code compatible with saved receipts;
+// these phase timings identify the wait without printing private input/output.
 async fn timed_phase<T>(
     name: &'static str,
     operation: impl Future<Output = Result<T, &'static str>>,

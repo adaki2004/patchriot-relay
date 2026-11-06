@@ -26,7 +26,7 @@ flowchart LR
 
 Only the model step runs inside NEAR’s TEE. The agent host and its approved operator still handle assigned content. A consented Venice backup is reported explicitly and has no verified TEE. Containers receive neither host secrets nor unrestricted network access.
 
-Scout investigates, Recon checks its leads and a third reviewer challenges serious or uncertain findings. Reports list the tools actually run. A matching answer is not proof of a vulnerability or of independent reviewers.
+Scout investigates, Recon checks its leads and a third reviewer challenges serious or uncertain findings. Reports list the tools actually run. An optional check can fail while the agent still returns useful evidence; that gap stays visible. Successful defenses and ordinary behavior belong in the summary, not the vulnerability list. A matching answer is not proof of a vulnerability or of independent reviewers.
 
 Later roles reuse completed discovery records. When ARTEX reaches a time, request, model or progress limit after saving target responses, the next agent uses those records for targeted checks instead of repeating the broad scan. Coverage stays incomplete. Missing discovery or a failed startup can be retried once; older, truncated receipts retain that recovery path. If a role stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.
 
