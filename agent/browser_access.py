@@ -153,6 +153,11 @@ class BrowserAccess:
         )
         await self.context.route('**/*', self.route)
         await self.context.route_web_socket('**/*', lambda socket: socket.close())
+        # The container deliberately has no network interface. Approved HTTP
+        # still works through route() and the relay, so the OS offline flag is
+        # misleading to wallet/query libraries. This changes only that browser
+        # hint; interception, origin checks and real request failures remain.
+        await self.context.add_init_script("Object.defineProperty(Navigator.prototype, 'onLine', {get: () => true, configurable: true});")
         await self.context.expose_binding('__patchriot_wallet_rpc', self.wallet)
         if self.scope.get('authentication') == 'wallet':
             await self.context.add_init_script(path=str(Path(__file__).with_name('browser_wallet.js')))
@@ -333,6 +338,7 @@ class BrowserAccess:
             # Do not queue an inspection behind every asset still loading.
             return {'verified':self.verified, 'pages':[p.url.split('?')[0].split('#')[0] for p in self.context.pages if origin(p.url) == self.origin],
                 'wallet_transport':'legacy' if self.legacy_wallet else 'eip6963',
+                'network_transport':'scoped_relay',
                 'unsupported_wallet_methods':sorted(self.unsupported_wallet_methods),
                 'pending_signatures':[{'id':key, **{k:v for k,v in item.items() if k in ('message','address','origin')}} for key,item in self.pending.items()],
                 'request_errors':self.errors[-5:], 'pending_requests':self.inflight,

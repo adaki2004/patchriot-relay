@@ -285,6 +285,19 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.browser.operation({'command':'check','url':'https://cdn.example.com/login'})
 
+    async def test_relay_transport_is_online_to_page_without_opening_external_access(self):
+        page=await self.start('wallet')
+        self.assertTrue(await page.evaluate('navigator.onLine'))
+        await page.evaluate("document.querySelector('#connect').disabled = !navigator.onLine")
+        self.assertFalse(await page.locator('#connect').is_disabled())
+        self.assertEqual(await page.evaluate("async () => (await fetch('/account-data')).status"), 401)
+        before=len(self.browser.calls)
+        self.assertEqual(await page.evaluate("async () => {try {await fetch('https://outside.example/private');return 'unexpected';} catch {return 'blocked';}}"), 'blocked')
+        self.assertEqual(len(self.browser.calls), before)
+        await page.reload()
+        self.assertTrue(await page.evaluate('navigator.onLine'))
+        self.assertFalse((await self.browser.operation({'command':'status'}))['verified'])
+
     async def test_legacy_wallet_retry_uses_injected_rpc_without_impersonating_a_wallet_brand(self):
         page=await self.start('wallet')
         await self.browser.operation({'command':'legacy'})
