@@ -9,6 +9,7 @@ mod browser;
 mod login;
 mod near;
 mod routing;
+mod safety;
 mod wallet;
 
 #[cfg(test)]
@@ -783,11 +784,15 @@ impl LiveBroker {
         {
             return Err("unsupported_probe_headers");
         }
+        safety::check_account_write(&url, &probe.method, probe.data.as_deref())?;
         Ok(url)
     }
 
     async fn exchange(&self, probe: Probe, login: bool) -> Result<Value, &'static str> {
         let url = self.probe_url(&probe, login)?;
+        if let Some(data) = &probe.data {
+            safety::remember_body_secrets(&self.access, data)?;
+        }
         if Instant::now() >= self.deadline {
             return Err("role_deadline_reached");
         }
@@ -858,6 +863,18 @@ impl LiveBroker {
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
             Ok(mut response) => {
+                let json_response = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value
+                            .split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .ends_with("json")
+                    });
                 self.access
                     .remember(&url, response.headers(), probe.authenticated);
                 evidence.status = Some(response.status().as_u16());
@@ -896,6 +913,21 @@ impl LiveBroker {
                             break;
                         }
                     }
+                }
+                // Ordinary probes can receive fresh JSON bearer tokens too.
+                // Register them before returning any body to tools or evidence.
+                let inspected = match serde_json::from_slice::<Value>(&received) {
+                    Ok(value) => browser::remember_tokens(&self.access, &value, 0),
+                    Err(_) if json_response && !received.is_empty() => {
+                        Err("uninspectable_json_response")
+                    }
+                    Err(_) => Ok(()),
+                };
+                if let Err(error) = inspected {
+                    // Keep the attempted request and status, but never retain
+                    // a truncated/uninspectable JSON secret as ordinary text.
+                    evidence.error = Some(error.into());
+                    received.clear();
                 }
                 let (redacted, shortened) = if login {
                     (String::from_utf8_lossy(&received).into_owned(), false)
@@ -2083,6 +2115,89 @@ for _ in range(270): print(frame,flush=True)
         task.evidence.context.provider = "abliteration.ai".into();
         assert!(task.input().is_err());
     }
+    #[tokio::test]
+    async fn generated_login_tokens_are_redacted_before_http_evidence_and_tool_output() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for body in [
+                r#"{"access_token":"fixture-fresh-token","refreshToken":"fixture-refresh-token","password":"fixture-created-password","status":"ok"}"#,
+                r#"{"access_token":"fixture-uninspectable-token""#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 8192];
+                let length = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..length]);
+                assert!(request.contains("fixture-created-password"));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut broker = broker();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.test_target = Some(address);
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        let reply = broker.http(json!({"method":"POST","url":"https://example.com/login",
+            "headers":{"Content-Type":"application/json"},"data":r#"{"email":"test@example.invalid","password":"fixture-created-password"}"#,
+            "authenticated":false})).await.unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        let retained = serde_json::to_string(&broker.counters.lock().unwrap().evidence).unwrap();
+        for secret in [
+            "fixture-created-password",
+            "fixture-fresh-token",
+            "fixture-refresh-token",
+        ] {
+            assert!(!reply.to_string().contains(secret));
+            assert!(!retained.contains(secret));
+            assert_eq!(broker.access.redact(secret), "REDACTED");
+        }
+        assert!(reply["body"].as_str().unwrap().contains("ok"));
+        let incomplete = broker.http(json!({"method":"POST","url":"https://example.com/login",
+            "headers":{"Content-Type":"application/json"},"data":r#"{"password":"fixture-created-password"}"#,
+            "authenticated":false})).await.unwrap();
+        assert_eq!(incomplete["evidence"]["status"], 200);
+        assert_eq!(
+            incomplete["evidence"]["error"],
+            "uninspectable_json_response"
+        );
+        assert_eq!(incomplete["body"], "");
+        assert!(
+            !incomplete
+                .to_string()
+                .contains("fixture-uninspectable-token")
+        );
+        assert_eq!(broker.counters.lock().unwrap().evidence.len(), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_and_discovery_cannot_change_account_credentials() {
+        let mut broker = broker();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        let input = json!({"method":"POST","url":"https://example.com/account",
+            "headers":{"Content-Type":"application/json"},"data":r#"{"current_password":"fixture-old","new_password":"fixture-new"}"#});
+        assert_eq!(
+            broker.http(input.clone()).await,
+            Err("account_credential_changes_not_permitted")
+        );
+        assert_eq!(
+            broker.engine_http(input).await,
+            Err("account_credential_changes_not_permitted")
+        );
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
+    }
+
     #[tokio::test]
     async fn public_engine_never_inherits_supplied_grey_credentials() {
         use tokio::{

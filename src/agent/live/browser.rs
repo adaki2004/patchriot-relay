@@ -218,6 +218,9 @@ impl LiveBroker {
                 },
                 input.login,
             )?;
+            if let Some(data) = &input.data {
+                safety::remember_body_secrets(&self.access, data)?;
+            }
         }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
@@ -306,9 +309,22 @@ impl LiveBroker {
         };
         let mut headers = Vec::new();
         let mut body = Vec::new();
+        let mut json_response = false;
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
             Ok(mut response) => {
+                json_response = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value
+                            .split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .ends_with("json")
+                    });
                 evidence.status = Some(response.status().as_u16());
                 // A browser receives raw response headers. If a new session
                 // secret cannot be tracked for redaction, do not deliver it to
@@ -387,13 +403,17 @@ impl LiveBroker {
         // Anonymous dependencies cannot establish a target session. Their
         // public catalogs may be much wider than a bounded login response.
         // Known secrets are still redacted from all retained evidence below.
-        if !resource
-            && let Ok(value) = serde_json::from_slice::<Value>(&body)
-            && let Err(error) = remember_tokens(&self.access, &value, 0)
-        {
-            evidence.error = Some(error.into());
-            body.clear();
-            headers.clear();
+        if !resource {
+            let inspected = match serde_json::from_slice::<Value>(&body) {
+                Ok(value) => remember_tokens(&self.access, &value, 0),
+                Err(_) if json_response && !body.is_empty() => Err("uninspectable_json_response"),
+                Err(_) => Ok(()),
+            };
+            if let Err(error) = inspected {
+                evidence.error = Some(error.into());
+                body.clear();
+                headers.clear();
+            }
         }
         if !input.login {
             if let Some(data) = input.data {
@@ -590,7 +610,7 @@ impl LiveBroker {
     }
 }
 
-fn remember_tokens(
+pub(super) fn remember_tokens(
     access: &access::Access,
     value: &Value,
     depth: usize,
@@ -604,18 +624,7 @@ fn remember_tokens(
                 return Err("browser_json_too_wide");
             }
             for (key, value) in fields {
-                if [
-                    "token",
-                    "access_token",
-                    "accesstoken",
-                    "refresh_token",
-                    "refreshtoken",
-                    "id_token",
-                    "jwt",
-                    "secret",
-                    "password",
-                ]
-                .contains(&key.to_ascii_lowercase().as_str())
+                if safety::secret_field(key)
                     && let Some(secret) = value.as_str()
                     && !secret.is_empty()
                 {
@@ -764,6 +773,24 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn password_changes_are_blocked_even_when_labeled_as_browser_login() {
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        for login in [false, true] {
+            assert_eq!(broker.browser_call("/patchriot/browser/http", json!({
+                "method":"POST","url":"https://owned.example/api/auth/me/password",
+                "headers":{"Content-Type":"application/json"},
+                "data":r#"{"current_password":"only-synthetic-password","new_password":"fixture-change"}"#,
+                "login":login
+            })).await, Err("account_credential_changes_not_permitted"));
+        }
+        assert_eq!(broker.browser.lock().unwrap().requests, 0);
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
     }
 
     #[tokio::test]
@@ -923,7 +950,12 @@ mod tests {
                         .into(),
                     )
                 };
-                stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                let content_type = if serde_json::from_str::<Value>(&body).is_ok() {
+                    "application/json"
+                } else {
+                    "text/plain"
+                };
+                stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
         });
         (address, task)
