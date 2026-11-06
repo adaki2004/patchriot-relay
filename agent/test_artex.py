@@ -116,12 +116,12 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(result['coverage_complete'])
 
     def test_watchdog_ignores_heartbeats_preserves_leads_and_yields_to_completion(self):
-        # A fake clock exercises the five-minute wait without sleeping. A new
-        # observation at minute four extends it; task heartbeats alone do not.
+        # A fake clock exercises the fifteen-minute wait without sleeping. A new
+        # observation at minute fourteen extends it; task heartbeats alone do not.
         for progress_at, completed_at, expected_time, expected_reason in [
-            (None, None, 300, 'no_engine_progress'),
-            (240, None, 540, 'no_engine_progress'),
-            (None, 300, 300, 'completed'),
+            (None, None, 900, 'no_engine_progress'),
+            (840, None, 1740, 'no_engine_progress'),
+            (None, 900, 900, 'completed'),
         ]:
             with self.subTest(progress_at=progress_at, completed_at=completed_at), tempfile.TemporaryDirectory() as temp:
                 clock, calls = [0.0], []
@@ -137,7 +137,7 @@ class EngineTests(unittest.TestCase):
                         return {}
                 def tick(_seconds): clock[0] += 60
                 engine = object.__new__(artex.Engine)
-                engine.client, engine.deadline, engine.profile_id = FakeClient(), 900, 1
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 2700, 1
                 engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
                 (engine.directory / 'process.log').write_text('')
                 with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
@@ -150,16 +150,16 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(('/api/tasks/7/control', {'action':'pause'}) in calls, completed_at is None)
 
     def test_offline_analysis_extends_watchdog_but_repeats_and_errors_do_not(self):
-        for mode, expected_time, reason in [('analysis', 780, 'done'),
-                                            ('repeated', 540, 'no_engine_progress'),
-                                            ('error', 300, 'no_engine_progress')]:
+        for mode, expected_time, reason in [('analysis', 2100, 'done'),
+                                            ('repeated', 1140, 'no_engine_progress'),
+                                            ('error', 900, 'no_engine_progress')]:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
                 clock = [0.0]
                 class FakeClient:
                     def call(self, path, body=None):
                         if path == '/api/tasks': return {'id': 7}
                         if path == '/api/tasks/7':
-                            return {'status': 'done' if clock[0] >= 780 else 'running'}
+                            return {'status': 'done' if clock[0] >= 2100 else 'running'}
                         if path.startswith('/api/commands'):
                             batch = int(clock[0] // 240) if mode == 'analysis' else 1
                             return {'commands': [] if clock[0] < 240 else [{
@@ -168,7 +168,7 @@ class EngineTests(unittest.TestCase):
                         return {}
                 def tick(_seconds): clock[0] += 30
                 engine = object.__new__(artex.Engine)
-                engine.client, engine.deadline, engine.profile_id = FakeClient(), 900, 1
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 2700, 1
                 engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
                 (engine.directory / 'process.log').write_text('')
                 with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):

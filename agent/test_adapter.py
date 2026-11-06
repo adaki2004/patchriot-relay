@@ -115,6 +115,27 @@ finally:
 
 
 class LiveOverviewTests(unittest.TestCase):
+    def test_validation_only_never_restarts_missing_discovery_and_preserves_claim_evidence(self):
+        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        previous = [{'role':'investigator', 'assessment':{'summary':'Owned fixture', 'findings':[
+            {'title':'Fixture claim', 'evidence_ids':[7]}]}, 'evidence':[{'id':7,'url':'https://owned.example/api','status':403}]}]
+        plan = live_review.discovery_plan('reproducer', scope, previous, 'investigate_validate_v1')
+        self.assertTrue(all(p['action'] == 'unavailable' for p in plan))
+        investigator = live_review.discovery_plan('investigator', scope, [], 'investigate_validate_v1')
+        self.assertTrue(all(p['action'] == 'run' for p in investigator))
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            original = json.dumps(previous)
+            (directory / 'previous.json').write_text(original)
+            live_review.validation_brief(directory)
+            brief = json.loads((directory / 'validation-brief.json').read_text())
+            self.assertEqual(brief[0]['claims'][0]['prior_role_evidence'], previous[0]['evidence'])
+            self.assertEqual((directory / 'previous.json').read_text(), original)
+        prompt = live_review.prompt('reproducer', review_policy='investigate_validate_v1')
+        self.assertIn('Do not run ARTEX', prompt)
+        self.assertIn('fresh', prompt)
+
+
     def test_limited_scan_hands_evidence_to_targeted_review_without_broad_rescan(self):
         import artex
         import copy
@@ -310,9 +331,9 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['cleanup_error'], 'browser_cleanup_unconfirmed')
 
     def test_execution_budget_is_explicit_bounded_and_not_model_controlled(self):
-        for value in ["600", "1200", "1800", "3600"]:
+        for value in ["600", "1200", "1800", "3600", "10800"]:
             self.assertEqual(adapter.execution_budget(value), int(value))
-        for value in ["", "0", "599", "3601", " 600", "600.0", "-600", "٦٠٠"]:
+        for value in ["", "0", "599", "10801", " 600", "600.0", "-600", "٦٠٠"]:
             with self.assertRaises(ValueError):
                 adapter.execution_budget(value)
 

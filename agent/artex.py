@@ -22,7 +22,7 @@ API_LIMIT = 512 * 1024
 API = 'http://127.0.0.1:8787'
 POSTGRES = '/usr/lib/postgresql/17/bin/'
 TERMINAL = {'completed', 'done', 'failed', 'paused', 'stopped', 'timed_out', 'timeout', 'unavailable'}
-NO_ENGINE_PROGRESS_SECONDS = 300
+NO_ENGINE_PROGRESS_SECONDS = 900
 SETTLEMENT_RESERVE_SECONDS = 300
 
 
@@ -136,6 +136,13 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'When that reserve is reached, stop opening new goals, record untested areas, and finish the task. Do not exhaust the allowance with path wordlists or repeated broad scans. '
             'These mirrors forward real requests to their corresponding approved websites. They are not the ARTEX admin API. '
             'Inspect the reachable application, use suitable installed tools, validate material leads with benign control requests and record your findings. '
+            'The deliverable is a completed scoped assessment, not a requirement to find a vulnerability. '
+            'Create a finite coverage plan covering the observed application: routes and exposed configuration; input handling; public authentication/recovery boundaries; '
+            'API methods and cross-origin behavior; sensitive-data exposure; and relevant client-side code. '
+            'For each applicable area record tested cases and controls as facts, plus findings where supported; explicitly record unavailable or inapplicable areas. '
+            'Use the full permitted suite for that plan. Do not invent extra goals merely because no vulnerability was found. '
+            'Once the applicable planned tests are finished, record a final coverage fact with evidence, then use prove_goal for the assessment goal referencing that fact. '
+            'A negative assessment can meet the goal. Resource exhaustion is not completion: preserve any untested planned cases as gaps. '
             'Finish within the supplied time and request allowance. Reporting coverage limits is a valid outcome; do not keep creating new work. '
             'For generated form or signup data use name "Authorized security test", company "Security testing", email "security-test@example.com", '
             'and message "Authorized security test. No action is needed; this is disposable test data." '
@@ -369,7 +376,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         'Only recorded broker requests establish that a target was contacted. Engine findings and command counts are not independent verification.',
         'Only the methods and test-account access declared in scope were allowed. Browser login, network discovery, external callbacks and unrestricted egress are unsupported. Missing binaries and blocked tests are coverage gaps.',
         'A budget-limited run may contain useful findings while leaving goals unfinished. Review its stop reason and the later agents’ control requests.',
-        'Discovery stops after five minutes without a new target observation or distinct successful tool result. Heartbeats, tool errors and repeated command/output pairs do not reset that timer. Local analysis is activity, not proof of target coverage; the hard time and spending limits still apply.',
+        'Discovery stops after fifteen minutes without a new target observation or distinct successful tool result. Heartbeats, tool errors and repeated command/output pairs do not reset that timer. Local analysis is activity, not proof of target coverage; the hard time and spending limits still apply.',
     ]
     # The full file is for this role. Its handoff must remain valid JSON even
     # when upstream commands include long scripts or page responses.

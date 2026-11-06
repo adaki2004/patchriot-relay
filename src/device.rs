@@ -1653,7 +1653,7 @@ mod tests {
             agent_execution_deadline(start, &renewal, 3600).unwrap(),
             start + Duration::from_secs(539)
         );
-        for invalid in [0, 599, 3601, u64::MAX] {
+        for invalid in [0, 599, 10801, u64::MAX] {
             assert!(agent_execution_deadline(start, &renewal, invalid).is_err());
         }
     }

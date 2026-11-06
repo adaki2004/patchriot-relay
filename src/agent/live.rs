@@ -19,7 +19,7 @@ const ENGINE_HTTP: &str = "/patchriot/artex/http";
 pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
 // addition to the byte limit without cutting the expanded role allowance in half.
-const MAX_MODEL_MESSAGES: usize = 4096;
+const MAX_MODEL_MESSAGES: usize = 16384;
 // Long reasoning calls can exceed ninety seconds. Bound the whole reply,
 // including NEAR verification, while allowing three minutes within the existing
 // role deadline and spend cap. No unverified reply is used.
@@ -67,7 +67,7 @@ pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool 
 }
 // Generous pilot ceilings. Stop investigation early enough to save a report;
 // increasing time/calls must not let the engine spend the reviewer's reserve.
-const MAX_SPEND: u64 = 10_000_000;
+const MAX_SPEND: u64 = 30_000_000;
 const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS - 200;
 const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
 // A verified primary call and its consented backup can each wait minutes.
@@ -177,7 +177,8 @@ impl Task {
             )
             .as_deref()
                 != Some(self.evidence.context.provider.as_str())
-            || self.evidence.context.reviewers.len() != 3
+            || self.evidence.context.reviewers.len()
+                != self.evidence.context.review_policy.team_size()
             || self.evidence.previous_reports.len() > 2
         {
             return Err("invalid live assignment".into());

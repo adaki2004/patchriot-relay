@@ -24,6 +24,12 @@ engine_stop_reason = None
 request_id = 0
 
 
+def report_validation(**details):
+    # Phase is part of the supervisor wire contract; a new event type would
+    # abort the role before the final result can be delivered.
+    event('phase', name='report_validation', **details)
+
+
 class MessageTooLarge(RuntimeError):
     """The request is valid JSON but exceeds the local transport allowance."""
 
@@ -147,8 +153,8 @@ def finish_result(browser=None, **data):
 
 def execution_budget(value):
     """Operator-selected limit; website text and models cannot change it."""
-    if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 3600:
-        raise ValueError("agent time limit must be 600..3600 seconds")
+    if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 10800:
+        raise ValueError("agent time limit must be 600..10800 seconds")
     return int(value)
 
 
@@ -309,23 +315,26 @@ def main():
     if live:
         import web_tools
         event("phase", name="scoped_tools")
-        scope = json.loads(Path("/work/scope.json").read_text())["scope"]
+        context = json.loads(Path("/work/scope.json").read_text())
+        scope = context["scope"]
+        review_policy = context.get("review_policy")
         from workflow import Workflow, public_scope
         previous = json.loads(Path("/work/previous.json").read_text())
-        workflow = Workflow(scope, live_review.discovery_plan(role, scope, previous),
+        workflow = Workflow(scope, live_review.discovery_plan(role, scope, previous, review_policy),
                             lambda value: event("workflow", workflow=value))
         tools = web_tools.run(scope, previous,
-                              emit=lambda result: event("live_tool", run=result), role=role, workflow=workflow)
+                              emit=lambda result: event("live_tool", run=result), role=role, workflow=workflow,
+                              review_policy=review_policy)
         # Browser sign-in happens in Hermes below. This initial engine pass has
         # public-route coverage for browser-login scopes, not a signed-in session.
         if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
                for p in tools['discovery_plan']):
             import artex
-            # Give discovery half the role while reserving the other half for
-            # verification and reporting. The broker owns the shared limits.
-            # also shares the relay's total model and target-request allowances.
+            # Allow the investigator to finish its full scoped engine plan,
+            # reserving a closing window for authentication/reporting.
+            # The broker still owns total time, request and money limits.
             event("phase", name="artex_engine")
-            engine_deadline = min(started + budget - min(600, budget / 2), time.monotonic() + budget / 2)
+            engine_deadline = started + budget - min(900, budget / 3)
             workflow.begin("artex-engine")
             try:
                 result = artex.run(public_scope(scope), role, engine_deadline, model=model,
@@ -353,10 +362,10 @@ def main():
         agent = AIAgent(
             model=model, provider="custom", api_mode="chat_completions",
             base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-            # The relay asks for the final report before its 600-call ceiling.
+            # The relay asks for the final report before its 2400-call ceiling.
             # A smaller Hermes turn limit can interrupt that handoff and emit a
             # failed partial summary. Time, HTTP and money limits stay in Rust.
-            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=600 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=2400 if live else 3, max_tokens=8192 if live else (512 if role else 192),
             reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
             request_overrides={} if live else {"reasoning_effort": "none"},
             quiet_mode=True, skip_context_files=True, skip_memory=True,
@@ -375,12 +384,13 @@ def main():
             "Report only observed output. Do not edit files, install anything or access the network."
         )
         if live:
-            prompt = live_review.prompt(role, browser=browser is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            live_review.validation_brief(Path('/work'))
+            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         if live:
             import report_finish
             result = report_finish.finish(agent, result, started + budget - 30,
-                emit=lambda **details: event('report_validation', **details))
+                emit=report_validation)
         regression = False
         for args in observed:
             if len(args) < 4 or args[1] != "terminal":

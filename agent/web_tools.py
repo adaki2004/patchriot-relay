@@ -318,11 +318,11 @@ def fetch_checked_request(method, url, **kwargs):
     return fetch_checked(request, method, url, **kwargs)
 
 
-def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator", workflow=None):
+def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator", workflow=None, review_policy=None):
     from live_review import discovery_plan
     from workflow import public_scope
     from functools import partial
-    plan = discovery_plan(role, scope, previous)
+    plan = discovery_plan(role, scope, previous, review_policy)
     selected = {p['tool'] for p in plan if p['action'] in ('run', 'recover')}
     public = public_scope(scope)
     # A supplied account must not change public probes or their authentication.

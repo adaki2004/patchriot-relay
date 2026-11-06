@@ -2,8 +2,8 @@
 import json
 from urllib.parse import urlsplit
 
-# Two 4 MiB role reports plus bounded scope/team metadata; matches the protocol.
-MAX_INPUT = 2 * 8 * 1024 * 1024 + 256 * 1024
+# Two role reports plus bounded scope/team metadata; matches the protocol.
+MAX_INPUT = 2 * 32 * 1024 * 1024 + 256 * 1024
 
 
 def reusable_partial(record, report, scope):
@@ -46,7 +46,7 @@ def runs_discovery(role):
     return role == "investigator"
 
 
-def discovery_plan(role, scope, previous):
+def discovery_plan(role, scope, previous, review_policy=None):
     """Reuse completed/usable partial runs; recover absent or failed tools once.
 
     A missing assessment does not erase successful tool receipts. Conversely,
@@ -83,7 +83,7 @@ def discovery_plan(role, scope, previous):
         recovered_before = any(name != 'investigator' for name, _ in attempts)
         action = ('run' if role == 'investigator' else 'reuse' if inherited
                   else 'reuse_partial' if partial
-                  else 'unavailable' if recovered_before else 'recover')
+                  else 'unavailable' if recovered_before or review_policy == 'investigate_validate_v1' else 'recover')
         entry = {'tool': tool, 'action': action, 'source_role': inherited}
         if action == 'reuse_partial':
             entry.update(source_role=partial[0], coverage_complete=False, stop_reason=partial[1])
@@ -134,12 +134,34 @@ def overview(directory):
                               for t in tools["tool_runs"][:20]]}
 
 
-def prompt(role, browser=False):
+def validation_brief(directory):
+    """A compact index into saved evidence, never a substitute for fresh controls."""
+    previous = json.loads((directory / 'previous.json').read_text())
+    brief = []
+    for report in previous[:2]:
+        assessment = report.get('assessment') or {}
+        evidence = {item['id']: item for item in report.get('evidence', [])}
+        brief.append({'source_role': report['role'], 'execution': report.get('execution'),
+                      'summary': assessment.get('summary', ''), 'limitations': assessment.get('limitations', []),
+                      'claims': [{'finding': finding,
+                                  'prior_role_evidence': [evidence[id] for id in finding.get('evidence_ids', []) if id in evidence]}
+                                 for finding in assessment.get('findings', [])]})
+    (directory / 'validation-brief.json').write_text(json.dumps(brief))
+
+
+def prompt(role, browser=False, review_policy=None):
     duties = {
         "investigator": "Act as Scout: map the approved website, follow its real resources and test concrete weaknesses. Prefer a few well-supported findings to a long checklist.",
         "reproducer": "Act as Recon: read previous.json, independently repeat the earlier probes, test their assumptions and try to disprove each material claim. Cite your own request IDs. Also investigate important gaps.",
         "challenger": "Act as Verifier: review previous.json, retest material claims, separate actual vulnerabilities from hardening advice and false positives. Give actionable fixes and explicit residual uncertainty. Do not rubber-stamp earlier reports.",
     }
+    validation_only = review_policy == 'investigate_validate_v1' and role == 'reproducer'
+    if validation_only:
+        duties[role] = ('Act as the independent validator. Validate the investigator findings with fresh, minimal positive and negative controls. '
+            'Read validation-brief.json and the exact cited previous evidence. Do not run ARTEX, repeat broad discovery or start a new general vulnerability hunt. '
+            'For each claim decide reproduced, not_reproduced or needs_review from your own evidence. '
+            'If the investigator has no findings, check its evidence and bounded negative controls on the principal tested surfaces; an empty findings list is valid. '
+            'Preserve coverage gaps you cannot resolve by a focused check. Complete the report when the validation list is finished.')
     initial = ("The pinned runner performed the discovery bundle: a bounded link crawl, three curated Nuclei checks, a versioned baseline suite, ARES-derived HTTP fingerprints and control requests. Inspect each receipt: unavailable or unfinished tools are coverage gaps. If artex_engine_v1 is selected, inspect /work/artex-results.json for this role's engine run."
                if runs_discovery(role) else
                "This role runs fresh controls and reuses discovery from previous.json. A reuse_partial entry means the broad scan stopped at a limit after saving real responses: inspect that evidence, test material leads and address specific gaps instead of repeating the whole scan. Its coverage remains incomplete. The runner may recover a missing or failed discovery tool once; discovery_plan says what ran, was reused or remains unavailable. Inspect current tool-results.json and any current artex-results.json for recovery work. Use fresh requests to test material claims and their assumptions. Preserve remaining gaps instead of implying full coverage.")
@@ -174,4 +196,8 @@ Status includes login.state and seconds_remaining_estimate without waiting behin
 For wallet login, connect the injected Patchriot Test Wallet through the site's wallet chooser. When it requests a signature, inspect `python /patchriot/browser_access.py status`. Read the exact pending message and actual page context. Approve only a login for this disposable address and approved website with `python /patchriot/browser_access.py approve --id ID`; otherwise reject. A generated signature is not login proof. No transactions, permits, trades, delegation or typed-data signing; unsupported transports remain gaps. Do not register accounts or complete email verification without separate permission.
 After login, find a real protected GET resource or account API observed in the browser. Run `python /patchriot/browser_access.py check --url URL`. For an account API that returns 200 even anonymously, add `--json-pointer /user/email` (or the actual pointer) to compare the supplied username or generated wallet address. The relay fetches the same resource with and without access and records both evidence IDs. Only verified:true establishes access. A cookie, changed screen, signature or 200 alone is insufficient. Do not invent identity fields or cite a public page as proof. When verified, continue testing signed-in pages through the same browser; cookie-backed HTTP tools can also reuse the relay session. A browser-only bearer session must stay in the browser unless its scoped broker request already supplies it. Preserve any public-only or unverified gaps in your final report. Browser status exposes the verification state and pending messages without session secrets.
 """
+    if validation_only:
+        result = result.replace("Use remaining investigation time for missing public controls before expanding signed-in work.",
+                                "Use fresh controls only for the supplied claims and material evidence gaps; do not repeat discovery.")
+        result += "\nThis is the validation stage: finish after the supplied claim list and bounded negative controls are assessed. Do not spend the remaining allowance on unrelated exploration.\n"
     return result
