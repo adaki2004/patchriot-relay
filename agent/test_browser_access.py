@@ -110,7 +110,13 @@ class FixtureBrowser(BrowserAccess):
             # TCP/crypto tests. This fixture checks the controller's session handoff.
             assert data['url'] == ORIGIN + '/account-data'
             assert 'session=owned-fixture' in data['headers']['cookie']
-            return {'verified':True,'authenticated_evidence_id':8,'anonymous_evidence_id':9}
+            records = []
+            for status in (200, 401):
+                self.seq += 1
+                records.append({'id':self.seq,'url':data['url'],'method':'GET','status':status,
+                    'body_excerpt':'Redacted fixture record','error':None})
+            return {'verified':True,'authenticated_evidence_id':records[0]['id'],
+                'anonymous_evidence_id':records[1]['id'],'evidence':records}
         assert path == 'http'
         if origin_of(data['url']) in self.resources:
             assert not data['authenticated'] and not data['login']
@@ -159,10 +165,14 @@ def origin_of(url):
 class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory=tempfile.TemporaryDirectory()
+        self.evidence_directory = Path(self.directory.name) / 'http-evidence'
+        self.cache_patch = patch('live_http.EVIDENCE_DIRECTORY', self.evidence_directory)
+        self.cache_patch.start()
         self.browser=None
 
     async def asyncTearDown(self):
         if self.browser: await self.browser.close()
+        self.cache_patch.stop()
         self.directory.cleanup()
 
     async def start(self, mode, layout='challenge'):
@@ -183,6 +193,19 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         result=await self.browser.operation({'command':'check','url':ORIGIN+'/account-data'})
         self.assertTrue(result['verified'])
         self.assertTrue(self.browser.verified)
+        self.assertNotIn('evidence', result, 'Keep full records out of the status preview')
+        records = [json.loads(Path(name).read_text()) for name in result['evidence_files']]
+        self.assertEqual([record['id'] for record in records],
+            [result['authenticated_evidence_id'], result['anonymous_evidence_id']])
+        self.assertEqual([record['status'] for record in records], [200, 401])
+        self.assertTrue((self.evidence_directory / '1.json').exists(), 'Ordinary browser requests are retained too')
+        saved = '\n'.join(p.read_text() for p in self.evidence_directory.glob('*.json'))
+        for secret in ('synthetic-password', 'owned-fixture', 'body_base64', 'set-cookie'):
+            self.assertNotIn(secret, saved)
+        call_count = len(self.browser.calls)
+        for record in records:
+            self.assertEqual(json.loads((self.evidence_directory / f"{record['id']}.json").read_text()), record)
+        self.assertEqual(len(self.browser.calls), call_count, 'Evidence reads must not repeat requests')
 
     async def wallet_login(self, layout):
         page=await self.start('wallet',layout)

@@ -18,6 +18,7 @@ from collections import OrderedDict
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+from live_http import retain_evidence
 
 MAX_CONTROL = 32768
 
@@ -168,6 +169,12 @@ class BrowserAccess:
         path.chmod(0o600)
         return cdp
 
+    def retain(self, reply):
+        retain_evidence(reply)
+        if reply.get('evidence_cache_error'):
+            self.errors = (self.errors + ['browser_evidence_cache_unavailable'])[-12:]
+        return reply.get('evidence_file')
+
     async def route(self, route):
         request = route.request
         self.inflight += 1
@@ -198,6 +205,7 @@ class BrowserAccess:
                     return
                 reply = await self.call('http', {'method':request.method, 'url':request.url,
                     'headers':headers, 'data':request.post_data, 'authenticated':not resource, 'login':login})
+            self.retain(reply)
             evidence = reply['evidence']
             if evidence.get('error'):
                 self.errors = (self.errors + [evidence['error']])[-12:]
@@ -372,6 +380,10 @@ class BrowserAccess:
             cookies = await self.context.cookies([url])
             if cookies: headers['cookie'] = '; '.join(c['name'] + '=' + c['value'] for c in cookies)
             result = await self.call('check', {'url':url,'headers':headers,'json_pointer':value.get('json_pointer')})
+            # Only the broker's redacted records enter the working cache, never
+            # browser headers, cookies or the raw authenticated response body.
+            result['evidence_files'] = [self.retain({'evidence':record})
+                                        for record in result.pop('evidence', [])]
             self.verified = result['verified']
             return result
         raise ValueError('Unknown browser access operation')

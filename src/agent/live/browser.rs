@@ -497,7 +497,8 @@ impl LiveBroker {
                 .proof = Some(proof.clone());
         }
         Ok(
-            json!({"verified":verified,"proof":if verified {Some(proof)} else {None},"authenticated_evidence_id":signed.evidence.id,"anonymous_evidence_id":anonymous.evidence.id}),
+            json!({"verified":verified,"proof":if verified {Some(proof)} else {None},"authenticated_evidence_id":signed.evidence.id,"anonymous_evidence_id":anonymous.evidence.id,
+                "evidence":[signed.evidence,anonymous.evidence]}),
         )
     }
 
@@ -889,6 +890,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(proof["verified"], true);
+        let returned: Vec<HttpEvidence> =
+            serde_json::from_value(proof["evidence"].clone()).unwrap();
+        assert_eq!(returned.len(), 2);
+        assert_eq!(returned[0].id, proof["authenticated_evidence_id"]);
+        assert_eq!(returned[1].id, proof["anonymous_evidence_id"]);
+        assert_eq!(returned[0].status, Some(200));
+        assert_eq!(returned[1].status, Some(401));
+        {
+            let authoritative = broker.counters.lock().unwrap();
+            for record in &returned {
+                assert_eq!(
+                    serde_json::to_value(record).unwrap(),
+                    serde_json::to_value(&authoritative.evidence[(record.id - 1) as usize])
+                        .unwrap()
+                );
+            }
+        }
+        assert!(!proof.to_string().contains("synthetic-session"));
+        assert!(!proof.to_string().contains("only-synthetic-password"));
         let retained = serde_json::to_value(&broker.counters.lock().unwrap().evidence)
             .unwrap()
             .to_string();
