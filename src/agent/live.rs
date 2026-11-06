@@ -242,6 +242,7 @@ pub struct LiveBroker {
     deadline: Instant,
     final_report_reserve: Duration,
     counters: Mutex<Counters>,
+    workflow: Mutex<Option<AssessmentWorkflow>>,
     access: access::Access,
     login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
     browser: Mutex<browser::BrowserState>,
@@ -249,6 +250,20 @@ pub struct LiveBroker {
     test_target: Option<SocketAddr>,
 }
 impl LiveBroker {
+    pub(super) fn accept_workflow(&self, data: &Value) -> bool {
+        let Ok(workflow) = serde_json::from_value::<AssessmentWorkflow>(data.clone()) else {
+            return false;
+        };
+        if !workflow.valid() {
+            return false;
+        }
+        if let Ok(mut saved) = self.workflow.lock() {
+            *saved = Some(workflow);
+            true
+        } else {
+            false
+        }
+    }
     pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
         serde_json::from_value::<LiveToolRun>(data.clone()).is_ok_and(|run| {
             self.counters
@@ -264,7 +279,32 @@ impl LiveBroker {
         model_request: Option<LiveModelProgress>,
     ) {
         if let (Ok(count), Ok(mut current)) = (self.counters.lock(), progress.lock()) {
+            let mut workflow = self.workflow.lock().ok().and_then(|w| w.clone());
+            if let Some(workflow) = &mut workflow {
+                if self.scope.authentication.is_some() && phase != LivePhase::ScopedTools {
+                    let proof = self.browser.lock().ok().and_then(|s| s.proof.clone());
+                    workflow.checks[5].state = if proof.is_some() {
+                        CheckState::Recorded
+                    } else if count.evidence.iter().any(|e| e.login || e.authenticated) {
+                        CheckState::Running
+                    } else {
+                        CheckState::Pending
+                    };
+                    workflow.checks[5].evidence_count = if proof.is_some() { 2 } else { 0 };
+                    if count.evidence.iter().any(|e| {
+                        e.authenticated
+                            && !e.login
+                            && proof.as_ref().is_none_or(|p| p.authenticated_id != e.id)
+                    }) {
+                        workflow.checks[6].state = CheckState::Running;
+                    }
+                }
+                if phase == LivePhase::Finishing {
+                    workflow.checks[7].state = CheckState::Running;
+                }
+            }
             *current = LiveProgress {
+                workflow,
                 phase,
                 http_requests: count.evidence.len() as u16,
                 inference_calls: count.calls,
@@ -332,6 +372,7 @@ impl LiveBroker {
             final_report_reserve: (deadline.saturating_duration_since(Instant::now()) / 3)
                 .min(Duration::from_secs(FINAL_REPORT_SECONDS)),
             counters: Mutex::new(Counters::default()),
+            workflow: Mutex::new(None),
             access,
             login_state: tokio::sync::Mutex::new(None),
             browser: Mutex::new(browser::BrowserState::default()),
@@ -648,7 +689,7 @@ impl LiveBroker {
         self.exchange(probe, false).await
     }
 
-    async fn engine_http(&self, body: Value) -> Result<Value, &'static str> {
+    async fn engine_http(&self, mut body: Value) -> Result<Value, &'static str> {
         if !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1) {
             return Err("engine_not_selected");
         }
@@ -659,6 +700,11 @@ impl LiveBroker {
             {
                 return Err("engine_http_budget_reached");
             }
+        }
+        // Public investigation is identical in black and grey modes. Never
+        // inject an account into a scanner's apparently anonymous curl call.
+        if let Some(probe) = body.as_object_mut() {
+            probe.insert("authenticated".into(), json!(false));
         }
         self.http(body).await
     }
@@ -1026,6 +1072,7 @@ impl LiveBroker {
         }
         let passed = passed && tools_valid;
         let mut result = PentestResult {
+            workflow: None,
             kind: PentestResultKind::PentestAgentV1,
             scope_sha256: self.scope.hash().unwrap_or_default(),
             execution: LiveExecution {
@@ -1073,9 +1120,17 @@ impl LiveBroker {
                 raw[..end].to_owned()
             },
         };
+        if let Some(mut workflow) = self.workflow.lock().ok().and_then(|w| w.clone()) {
+            workflow.finish(&self.scope, &result);
+            result.workflow = Some(workflow.into());
+        }
         result.omit_binary_excerpts();
         if !result.valid(&self.scope) {
             result.assessment = None;
+            if let Some(mut workflow) = result.workflow.take() {
+                workflow.finish(&self.scope, &result);
+                result.workflow = Some(workflow);
+            }
         }
         result
     }
@@ -1967,6 +2022,78 @@ for _ in range(270): print(frame,flush=True)
         assert_eq!(task.model(), Some(LiveProvider::Abliteration.model()));
         task.evidence.context.provider = "abliteration.ai".into();
         assert!(task.input().is_err());
+    }
+    #[tokio::test]
+    async fn public_engine_never_inherits_supplied_grey_credentials() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let length = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..length]).to_lowercase();
+            assert!(!request.contains("authorization:"));
+            assert!(!request.contains("cookie:"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+        });
+        let scope=serde_json::from_value::<LiveScope>(json!({"origins":["https://owned.example"],
+            "methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1",
+            "tools":["artex_engine_v1","authenticated_http_v1"],"authentication":"basic","auth_check_path":"/private"})).unwrap().normalized().unwrap();
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key.path(), "synthetic-fixture-provider-key").unwrap();
+        let credentials = TestCredentials::Basic {
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+        };
+        let mut broker = LiveBroker::new_with_credentials(
+            LiveProvider::Abliteration,
+            key.path(),
+            scope,
+            Instant::now() + Duration::from_secs(30),
+            Some(&credentials),
+            None,
+        )
+        .unwrap();
+        Arc::get_mut(&mut broker).unwrap().test_target = Some(address);
+        let reply = broker
+            .engine_http(
+                json!({"method":"GET","url":"https://owned.example/","authenticated":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        assert!(!broker.counters.lock().unwrap().evidence[0].authenticated);
+        server.await.unwrap();
+    }
+    #[test]
+    fn structured_progress_does_not_invent_login_activity() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.authentication = Some(TestAuthKind::Basic);
+        let checks = CheckId::ALL
+            .into_iter()
+            .map(|id| CheckProgress {
+                id,
+                state: CheckState::Pending,
+                evidence_count: 0,
+                source_role: None,
+            })
+            .collect();
+        let workflow = AssessmentWorkflow { version: 1, checks };
+        assert!(broker.accept_workflow(&serde_json::to_value(workflow).unwrap()));
+        let progress = Progress::default();
+        broker.update_progress(&progress, LivePhase::Investigating, 0, None);
+        assert_eq!(
+            progress.lock().unwrap().workflow.as_ref().unwrap().checks[5].state,
+            CheckState::Pending
+        );
+        assert!(!broker.accept_workflow(&json!({"version":1,"checks":[]})));
     }
     #[tokio::test]
     async fn full_engine_requires_consent_and_keeps_the_reviewers_budget() {

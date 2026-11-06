@@ -318,33 +318,45 @@ def fetch_checked_request(method, url, **kwargs):
     return fetch_checked(request, method, url, **kwargs)
 
 
-def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator"):
+def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator", workflow=None):
     from live_review import discovery_plan
-    deadline = time.monotonic() + 180
+    from workflow import public_scope
+    from functools import partial
     plan = discovery_plan(role, scope, previous)
     selected = {p['tool'] for p in plan if p['action'] in ('run', 'recover')}
+    public = public_scope(scope)
+    # A supplied account must not change public probes or their authentication.
+    anonymous = partial(request, authenticated=False)
+    def public_fetch(method, url, headers=None, **kwargs):
+        kwargs['authenticated'] = False
+        return fetch_checked(request, method, url, headers, **kwargs)
     records = []
-    if 'patchriot-baseline' in selected:
-        import baseline
-        initial = baseline.run(scope, deadline, fetch_checked_request, record)
-        records.append(initial)
-        emit(initial)
-    for origin in scope["origins"]:
-        checks = []
-        if 'ares-web-surface' in selected:
-            import ares_web
-            checks.append(lambda: ares_web.run(origin, deadline))
-        if 'patchriot-crawl' in selected:
-            checks.append(lambda: crawl(origin, deadline))
-        if 'nuclei' in selected:
-            checks.append(lambda: scanner(origin, deadline))
-        checks.append(lambda: controls(origin, deadline, previous, auth_check_path=scope.get("auth_check_path") if scope.get("authentication") else None))
-        for check in checks:
-            if time.monotonic() >= deadline:
-                break
-            result = check()
+    import baseline
+    import ares_web
+    # Each family gets its own bounded window. A slow crawl cannot silently
+    # consume the signatures/fingerprints window, in either assessment mode.
+    for tool in ('patchriot-baseline', 'patchriot-crawl', 'nuclei', 'ares-web-surface'):
+        if tool not in selected:
+            continue
+        if workflow:
+            workflow.begin(tool)
+        deadline = time.monotonic() + 45
+        family = []
+        if tool == 'patchriot-baseline':
+            family.append(baseline.run(public, deadline, public_fetch, record))
+        else:
+            check = {'patchriot-crawl': crawl, 'nuclei': scanner, 'ares-web-surface': ares_web.run}[tool]
+            for origin in public['origins']:
+                family.append(check(origin, deadline, fetch=anonymous))
+        for result in family:
             records.append(result)
             emit(result)
+        if workflow:
+            workflow.finish(tool, family)
+    for origin in public['origins']:
+        result = controls(origin, time.monotonic() + 15, previous, fetch=anonymous)
+        records.append(result)
+        emit(result)
     result = {"profile": PROFILE, "role": role, "tool_runs": records, "discovery_plan": plan,
               "limitations": ["Only three curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
                               "The scanner receives selected headers and decoded text through the broker; use recorded target requests as the source of evidence.",

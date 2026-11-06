@@ -286,7 +286,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         if time.monotonic() >= deadline:
             raise TimeoutError('no engine time remaining')
         with ExitStack() as stack:
-            mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or partial(request, discovery=True), methods=scope['methods'])) for origin in scope['origins']]
+            mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or partial(request, discovery=True, authenticated=False), methods=scope['methods'])) for origin in scope['origins']]
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
             try:
                 result = engine.assess(scope, [mirror.url for mirror in mirrors], role, stop=stop,

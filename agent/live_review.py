@@ -33,6 +33,7 @@ def reusable_partial(record, report, scope):
             continue
         if (evidence.get('id') in refs and type(evidence.get('status')) is int
                 and 100 <= evidence['status'] <= 599 and not evidence.get('error')
+                and not evidence.get('authenticated') and not evidence.get('login')
                 and f'{url.scheme}://{url.netloc}' in scope['origins']):
             return detail['stop_reason']
     return None
@@ -63,8 +64,14 @@ def discovery_plan(role, scope, previous):
             records = [r for r in report.get('tool_runs', []) if r.get('tool') == tool]
             if records:
                 expected = len(scope['origins']) if tool in ('patchriot-crawl', 'nuclei', 'ares-web-surface') else 1
-                completed = len(records) >= expected and all(
-                    r.get('exit_code') == 0 and not r.get('failure') for r in records)
+                evidence = {e.get('id'): e for e in report.get('evidence', [])}
+                refs = [id for r in records for id in r.get('evidence_ids', [])]
+                covered = {urlsplit(evidence[id].get('url', '')).scheme + '://' + urlsplit(evidence[id].get('url', '')).netloc for id in refs if id in evidence}
+                origins_complete = tool not in ('patchriot-crawl', 'nuclei', 'ares-web-surface') or set(scope['origins']).issubset(covered)
+                completed = origins_complete and len(records) >= expected and bool(refs) and all(
+                    r.get('exit_code') == 0 and not r.get('failure') and not r.get('output_truncated') and r.get('evidence_ids') for r in records) and all(
+                    id in evidence and not evidence[id].get('authenticated') and not evidence[id].get('login')
+                    and not evidence[id].get('error') and type(evidence[id].get('status')) is int for id in refs)
                 attempts.append((report.get('role'), completed))
                 if len(records) == 1:
                     reason = reusable_partial(records[0], report, scope)
@@ -119,6 +126,7 @@ def overview(directory):
                                    for f in findings[:24]]})
     return {"scope": context["scope"], "previous_reports": prior,
             "discovery_plan": tools.get("discovery_plan", []),
+            "workflow": json.loads((directory / "workflow.json").read_text()) if (directory / "workflow.json").exists() else None,
             "current_tools": [{"tool": t["tool"], "exit_code": t["exit_code"],
                                "failure": t["failure"], "request_count": len(t["evidence_ids"]),
                                "current_role_evidence_ids": t["evidence_ids"][:24],
@@ -136,6 +144,7 @@ def prompt(role, browser=False):
                if runs_discovery(role) else
                "This role runs fresh controls and reuses discovery from previous.json. A reuse_partial entry means the broad scan stopped at a limit after saving real responses: inspect that evidence, test material leads and address specific gaps instead of repeating the whole scan. Its coverage remains incomplete. The runner may recover a missing or failed discovery tool once; discovery_plan says what ran, was reused or remains unavailable. Inspect current tool-results.json and any current artex-results.json for recovery work. Use fresh requests to test material claims and their assumptions. Preserve remaining gaps instead of implying full coverage.")
     result = f"""You are the {role} conducting an authorized live website security test. {duties[role]}
+Read /work/workflow.json first. Public baseline, mapping, signatures, fingerprints and public analysis are the common checklist for both black and grey modes. Grey adds verified access and signed-in checks; it never substitutes login work for public work. Incomplete public stages remain gaps even if authentication succeeds. Use remaining investigation time for missing public controls before expanding signed-in work. Record bounded checks of discovered input handling, session/CSRF boundaries and object access where the scope and disposable data allow; report unavailable test identities explicitly. Never infer unlimited throughput from a few accepted requests or perform password guessing/load tests to fill a checklist.
 Start with the overview below, then inspect the relevant entries in /work/scope.json, /work/previous.json and /work/tool-results.json. Load each JSON file separately with Python json.load; print selected fields rather than concatenating or dumping entire files. If terminal output is shortened, read the original file in smaller pieces; do not try to repair the shortened display or its spillover copy. {initial} Inspect recorded outputs and request IDs; these are leads, not proved findings. IDs in tool-results.json belong to your current role, while IDs in previous.json belong to earlier roles and must not be copied into your citations. Report unavailable, failed or truncated tool coverage. Spend your own probes on meaningful leads and missing checks. When revisiting the same issue, keep its exact title and cite the request that demonstrates it first, followed by controls. A different affected endpoint or cause is a separate finding. The exact approved HTTPS origins and objective are in scope.json. Read /patchriot/live-review-skill.txt for the testing method.
 You have a normal terminal inside a disposable isolated container. Write Python analysis scripts, parse HTML/JavaScript, compare responses and design your own non-destructive HTTP probes. This is live testing, not an offline snapshot exercise.
 For every target request use Python /patchriot/live_http.py METHOD URL --header 'Name: value', or import request from live_http with sys.path.insert(0, '/patchriot'). It returns evidence.id, actual status, selected headers, body and a hash. recorded_header_names lists exactly which response headers the relay captures. Only infer absence for a name in that list; other headers were not observed. Use --save-body /work/page.txt to save large responses, then inspect specific parts with Python; the CLI preview is shortened. The reply also shows remaining_cost_allowance_microusd. Start your final report before the allowance is depleted. Use only scope.methods. An active scope (web_active_v1 or web_active_v2) additionally permits POST against the explicitly authorized website and disposable test data with JSON or URL-encoded data, at most 16 KiB; use --data and the appropriate Content-Type. For baseline scopes, do not submit forms; only the relay can perform the exact declared session login. If login fails, report that authenticated coverage is missing; do not attempt another login or call a token endpoint yourself. A declared Basic/bearer account or configured form/JSON login is handled by the relay once per role; session cookies are injected into approved requests; never request or print credentials. Use --anonymous for comparison requests. No browser login, MFA/SSO, real purchases, fund transfers, brute force, load tests or exploit persistence. Do not install unreviewed tools or contact other hosts. A denied URL is a scope limit, not evidence that a website is vulnerable. The relay, not you, enforces origin, DNS, rate and spend limits. API keys are not available inside this container.

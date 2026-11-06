@@ -172,8 +172,8 @@ class WebToolsTests(unittest.TestCase):
 
     def test_followups_do_not_repeat_scanners_or_lose_fresh_control_evidence(self):
         scope = {'origins': ['https://owned.example'], 'methods': ['GET', 'HEAD', 'OPTIONS']}
-        previous = [{'role':'investigator', 'tool_runs':[
-            {'tool':name, 'exit_code':0, 'failure':None}
+        previous = [{'role':'investigator', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None, 'evidence_ids':[1]}
             for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}]
         for role in ['investigator', 'reproducer', 'challenger']:
             with tempfile.TemporaryDirectory() as temp, patch('baseline.run', return_value={'tool': 'baseline'}) as baseline, \

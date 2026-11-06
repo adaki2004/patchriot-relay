@@ -160,13 +160,13 @@ class LiveOverviewTests(unittest.TestCase):
 
     def test_missing_discovery_is_recovered_once_without_repeating_finished_tools(self):
         scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
-        first = {'role':'investigator', 'assessment':None, 'tool_runs':[
-            {'tool':name, 'exit_code':0, 'failure':None}
+        first = {'role':'investigator', 'assessment':None, 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None, 'evidence_ids':[1]}
             for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}
         plan = live_review.discovery_plan('reproducer', scope, [first])
         self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['artex-engine'])
         self.assertEqual([p['action'] for p in plan[:3]], ['reuse'] * 3)
-        second = {'role':'reproducer', 'tool_runs':[{'tool':'artex-engine','exit_code':None,'failure':'incomplete'}]}
+        second = {'role':'reproducer', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[{'tool':'artex-engine','exit_code':None,'failure':'incomplete','evidence_ids':[1]}]}
         plan = live_review.discovery_plan('challenger', scope, [first, second])
         self.assertEqual(plan[-1]['action'], 'unavailable')
         second['tool_runs'][0].update(exit_code=0, failure=None)
@@ -176,12 +176,12 @@ class LiveOverviewTests(unittest.TestCase):
 
     def test_ares_discovery_from_older_runner_is_added_once_and_then_reused(self):
         scope = {'origins':['https://owned.example'], 'tools':[]}
-        first = {'role':'investigator', 'tool_runs':[
-            {'tool':name, 'exit_code':0, 'failure':None}
+        first = {'role':'investigator', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None, 'evidence_ids':[1]}
             for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}
         plan = live_review.discovery_plan('reproducer', scope, [first])
         self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['ares-web-surface'])
-        second = {'role':'reproducer', 'tool_runs':[{'tool':'ares-web-surface','exit_code':0,'failure':None}]}
+        second = {'role':'reproducer', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[{'tool':'ares-web-surface','exit_code':0,'failure':None,'evidence_ids':[1]}]}
         self.assertEqual(live_review.discovery_plan('challenger', scope, [first,second])[-1],
                          {'tool':'ares-web-surface','action':'reuse','source_role':'reproducer'})
         scope['origins'].append('https://other-owned.example')

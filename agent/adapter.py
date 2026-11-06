@@ -310,8 +310,12 @@ def main():
         import web_tools
         event("phase", name="scoped_tools")
         scope = json.loads(Path("/work/scope.json").read_text())["scope"]
-        tools = web_tools.run(scope, json.loads(Path("/work/previous.json").read_text()),
-                              emit=lambda result: event("live_tool", run=result), role=role)
+        from workflow import Workflow, public_scope
+        previous = json.loads(Path("/work/previous.json").read_text())
+        workflow = Workflow(scope, live_review.discovery_plan(role, scope, previous),
+                            lambda value: event("workflow", workflow=value))
+        tools = web_tools.run(scope, previous,
+                              emit=lambda result: event("live_tool", run=result), role=role, workflow=workflow)
         # Browser sign-in happens in Hermes below. This initial engine pass has
         # public-route coverage for browser-login scopes, not a signed-in session.
         if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
@@ -320,9 +324,10 @@ def main():
             # Keep at least four minutes for the review and final report. ARTEX
             # also shares the relay's total model and target-request allowances.
             event("phase", name="artex_engine")
-            engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
+            engine_deadline = min(started + budget - 240, time.monotonic() + budget / 3)
+            workflow.begin("artex-engine")
             try:
-                result = artex.run(scope, role, engine_deadline, model=model,
+                result = artex.run(public_scope(scope), role, engine_deadline, model=model,
                                    stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
                                    emit=lambda result: event("live_tool", run=result))
             finally:
@@ -330,6 +335,7 @@ def main():
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)
+            workflow.finish("artex-engine", [result])
         if scope.get("browser_login") is not None:
             from browser_access import BrowserRunner
             browser = BrowserRunner(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
