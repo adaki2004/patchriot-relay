@@ -32,6 +32,8 @@ Later roles reuse completed discovery records. A missing or failed discovery too
 
 Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.
 
+The reviewer can inspect the exact saved HTTP records from discovery before citing a finding. Reading those records does not repeat the requests. Scanner output remains a lead to check, and a completed report is not proof that every claim is correct.
+
 > **DON’T TRUST! VERIFY!** Read this source and its dependencies—or ask your own security agent to review them. Inspect the container, network and permission settings before pairing a machine or sharing private work.
 
 ## Joining the managed service

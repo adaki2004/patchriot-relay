@@ -1,6 +1,7 @@
 """Owned HTTP fixtures only. No provider key or target network is used."""
 import hashlib
 import http.client
+import io
 import json
 from pathlib import Path
 import sys
@@ -11,9 +12,53 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 import web_tools as tools
+import live_http
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_discovery_keeps_exact_redacted_records_after_the_http_budget_is_used(self):
+        records = [
+            {'id':25, 'method':'GET', 'url':'https://owned.example/private', 'status':401,
+             'body_excerpt':'Sign in required', 'headers':{}, 'truncated':False},
+            {'id':26, 'method':'GET', 'url':'https://owned.example/public', 'status':200,
+             'body_excerpt':'Public content', 'headers':{}, 'truncated':True},
+        ]
+        replies = [io.BytesIO(json.dumps({'evidence':r, 'body':'full response not for the cache'}).encode()) for r in records]
+        from urllib.error import HTTPError
+        exhausted = HTTPError('http://bridge/patchriot/artex/http', 429, 'budget', {},
+                              io.BytesIO(b'{"error":"engine_http_budget_reached"}'))
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(live_http, 'EVIDENCE_DIRECTORY', Path(temp) / 'http-evidence'), \
+                patch.dict('os.environ', {'PATCHRIOT_BRIDGE_URL':'http://bridge'}), \
+                patch.object(live_http, 'urlopen', side_effect=[*replies, exhausted]) as upstream:
+            from functools import partial
+            with tools.ScopeMirror('https://owned.example', time.monotonic()+5,
+                                   partial(live_http.request, discovery=True)) as mirror:
+                for path, status in [('/private',401),('/public',200),('/third',502)]:
+                    client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+                    client.request('GET', path)
+                    response = client.getresponse()
+                    self.assertEqual(response.status, status)
+                    response.read(); client.close()
+                self.assertEqual(mirror.refs, [25,26])
+            for record in records:
+                saved = Path(temp) / 'http-evidence' / f"{record['id']}.json"
+                self.assertEqual(json.loads(saved.read_text()), record)
+                self.assertNotIn('full response not for the cache', saved.read_text())
+                self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(upstream.call_count, 3)
+            self.assertEqual(len(list((Path(temp) / 'http-evidence').iterdir())), 2)
+
+    def test_unavailable_working_cache_keeps_the_broker_response_and_reports_the_gap(self):
+        reply = {'evidence':{'id':7,'status':200}, 'body':'observed'}
+        with patch.object(Path, 'mkdir', side_effect=OSError('fixture unavailable')):
+            self.assertEqual(live_http.retain_evidence(reply), {
+                'evidence':{'id':7,'status':200}, 'body':'observed',
+                'evidence_cache_error':'unavailable'})
+        self.assertNotIn('evidence_file', reply)
+        for value in ('../outside', True, 0):
+            self.assertEqual(live_http.retain_evidence({'evidence':{'id':value}}), {'evidence':{'id':value}})
+
     def test_links_stay_on_exact_origin_and_forms_are_only_recorded(self):
         parser = tools.Links('https://owned.example/', 'https://owned.example')
         parser.feed('''<a href="/docs#part">ok</a><script src="//other.example/app.js"></script>
