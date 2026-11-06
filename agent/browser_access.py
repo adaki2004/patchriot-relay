@@ -133,6 +133,8 @@ class BrowserAccess:
         self.wallet_account = None
         self.wallet_lock = asyncio.Lock()
         self.blocked_origins = set()
+        self.login_deadline = None
+        self.login_exhausted = False
         self.directory, self.executable = Path(directory), executable
 
     async def call(self, path, data):
@@ -238,6 +240,8 @@ class BrowserAccess:
             code = str(error) if isinstance(error, ValueError) else ''
             if not re.fullmatch(r'[a-z][a-z0-9_]{1,79}', code):
                 code = 'browser_request_failed'
+            if code == 'browser_login_submission_limit' and self.login_deadline is not None:
+                self.login_exhausted = True
             if code == 'target_request_budget_reached':
                 self.http_exhausted = True
             self.errors = (self.errors + [code])[-12:]
@@ -336,7 +340,13 @@ class BrowserAccess:
         if command == 'status':
             # Verification is set only by the broker's explicit check below.
             # Do not queue an inspection behind every asset still loading.
+            # Estimate from the successful begin receipt, without queuing status
+            # behind page requests. The Rust broker still enforces the real limit.
+            remaining = None if self.login_deadline is None else max(0, self.login_deadline - asyncio.get_running_loop().time())
+            login_state = ('verified' if self.verified else 'not_started' if remaining is None else
+                           'expired' if remaining == 0 else 'exhausted' if self.login_exhausted else 'active')
             return {'verified':self.verified, 'pages':[p.url.split('?')[0].split('#')[0] for p in self.context.pages if origin(p.url) == self.origin],
+                'login':{'state':login_state,'seconds_remaining_estimate':None if remaining is None else int(remaining)},
                 'wallet_transport':'legacy' if self.legacy_wallet else 'eip6963',
                 'network_transport':'scoped_relay',
                 'unsupported_wallet_methods':sorted(self.unsupported_wallet_methods),
@@ -366,7 +376,14 @@ class BrowserAccess:
             return {'filled':True}
         if command == 'begin':
             self.page()
-            return await self.call('begin', {})
+            started = asyncio.get_running_loop().time()
+            try:
+                result = await self.call('begin', {})
+            except ValueError as error:
+                if str(error) == 'browser_login_expired': self.login_deadline = 0
+                raise
+            self.login_deadline = started + min(300, max(0, result.get('expires_in_seconds', 0)))
+            return result
         if command in ('approve','reject'):
             pending = self.pending.get(value.get('id'))
             if not pending or pending['future'].done(): raise ValueError('Signature no longer pending')

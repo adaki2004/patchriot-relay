@@ -68,6 +68,13 @@ impl LiveBroker {
             "/patchriot/browser/credentials" => self.access.browser_credentials(),
             "/patchriot/browser/begin" => {
                 let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+                if state
+                    .login_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                    && state.proof.is_none()
+                {
+                    return Err("browser_login_expired");
+                }
                 if state.login_deadline.is_some() || state.proof.is_some() {
                     return Err("browser_login_already_started");
                 }
@@ -78,7 +85,29 @@ impl LiveBroker {
             "/patchriot/browser/check" => self.browser_check(input).await,
             "/patchriot/browser/status" => {
                 let state = self.browser.lock().map_err(|_| "browser_unavailable")?;
-                Ok(json!({"verified":state.proof.is_some(),"proof":state.proof}))
+                let remaining = state
+                    .login_deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs());
+                // The agent needs to distinguish a spent login window from a
+                // broken website. Status never renews it or resets attempts.
+                let phase = if state.proof.is_some() {
+                    "verified"
+                } else if remaining.is_none() {
+                    "not_started"
+                } else if state
+                    .login_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    "expired"
+                } else if state.posts >= MAX_LOGIN_POSTS {
+                    "exhausted"
+                } else {
+                    "active"
+                };
+                Ok(json!({"verified":state.proof.is_some(),"proof":state.proof,
+                    "login":{"state":phase,"seconds_remaining":remaining,
+                        "submissions_remaining":MAX_LOGIN_POSTS.saturating_sub(state.posts),
+                        "signatures_remaining":4_usize.saturating_sub(state.signatures)}}))
             }
             _ => Err("unsupported_browser_operation"),
         }
@@ -735,6 +764,92 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn expired_login_is_visible_and_cannot_be_reopened_or_submit() {
+        for kind in ["wallet", "session"] {
+            let broker = broker(kind);
+            let status = broker
+                .browser_call("/patchriot/browser/status", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(status["login"]["state"], "not_started");
+            assert!(status["login"]["seconds_remaining"].is_null());
+            broker
+                .browser_call("/patchriot/browser/begin", json!({}))
+                .await
+                .unwrap();
+            let expired = Instant::now() - Duration::from_secs(1);
+            {
+                let mut state = broker.browser.lock().unwrap();
+                state.login_deadline = Some(expired);
+                state.posts = 3;
+                state.signatures = 1;
+            }
+            let status = broker
+                .browser_call("/patchriot/browser/status", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                status["login"],
+                json!({"state":"expired","seconds_remaining":0,
+                "submissions_remaining":5,"signatures_remaining":3})
+            );
+            assert_eq!(
+                broker
+                    .browser_call("/patchriot/browser/begin", json!({}))
+                    .await
+                    .unwrap_err(),
+                "browser_login_expired"
+            );
+            assert_eq!(
+                broker
+                    .browser_call(
+                        "/patchriot/browser/http",
+                        json!({
+                            "method":"POST","url":"https://owned.example/session","login":true,
+                            "headers":{"content-type":"application/json"},"data":"{}"
+                        })
+                    )
+                    .await
+                    .unwrap_err(),
+                "browser_login_submission_limit"
+            );
+            let state = broker.browser.lock().unwrap();
+            assert_eq!(state.login_deadline, Some(expired));
+            assert_eq!(state.posts, 3);
+            assert!(broker.counters.lock().unwrap().evidence.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn active_login_status_distinguishes_consumed_submissions_without_resetting_them() {
+        let broker = broker("wallet");
+        broker
+            .browser_call("/patchriot/browser/begin", json!({}))
+            .await
+            .unwrap();
+        let status = broker
+            .browser_call("/patchriot/browser/status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["login"]["state"], "active");
+        assert!(status["login"]["seconds_remaining"].as_u64().unwrap() <= 300);
+        broker.browser.lock().unwrap().posts = MAX_LOGIN_POSTS;
+        let status = broker
+            .browser_call("/patchriot/browser/status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["login"]["state"], "exhausted");
+        assert_eq!(status["login"]["submissions_remaining"], 0);
+        assert!(
+            broker
+                .browser_call("/patchriot/browser/begin", json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(broker.browser.lock().unwrap().posts, MAX_LOGIN_POSTS);
     }
 
     async fn target() -> (SocketAddr, tokio::task::JoinHandle<()>) {

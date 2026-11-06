@@ -98,7 +98,7 @@ class FixtureBrowser(BrowserAccess):
 
     async def call(self, path, data):
         if path == 'credentials': return {'username':'fixture@example.com','password':'synthetic-password'}
-        if path == 'begin': return {'login_submissions':8}
+        if path == 'begin': return {'login_submissions':8,'expires_in_seconds':300}
         if path == 'status': return {'verified':self.verified}
         if path == 'wallet':
             if data['method'] == 'eth_accounts': return {'address':ADDRESS}
@@ -258,6 +258,19 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(control['y'],0)
         self.assertNotIn('never-echo-this',json.dumps(status))
         self.assertEqual(status['pending_requests'],0)
+
+    async def test_status_discloses_expired_broker_window_while_page_remains_usable(self):
+        page=await self.start('session')
+        await self.browser.operation({'command':'begin'})
+        active=await self.browser.operation({'command':'status'})
+        self.assertEqual(active['login']['state'],'active')
+        self.browser.login_deadline = asyncio.get_running_loop().time() - 1
+        status=await self.browser.operation({'command':'status'})
+        self.assertEqual(status['login'],{'state':'expired','seconds_remaining_estimate':0})
+        self.assertFalse(status['verified'])
+        self.assertEqual(status['pages'],[ORIGIN+'/'])
+        self.assertEqual(await page.locator('#user').count(),1)
+        self.assertNotIn('synthetic-password',json.dumps(status))
 
     async def test_checkbox_control_uses_its_visible_label_and_status_does_not_wait_for_http(self):
         page=await self.start('session')

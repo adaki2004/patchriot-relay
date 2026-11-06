@@ -344,7 +344,10 @@ def main():
         agent = AIAgent(
             model=model, provider="custom", api_mode="chat_completions",
             base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=160 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+            # The relay asks for the final report before its 200-call ceiling.
+            # A smaller Hermes turn limit can interrupt that handoff and emit a
+            # failed partial summary. Time, HTTP and money limits stay in Rust.
+            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=200 if live else 3, max_tokens=8192 if live else (512 if role else 192),
             reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
             request_overrides={} if live else {"reasoning_effort": "none"},
             quiet_mode=True, skip_context_files=True, skip_memory=True,
