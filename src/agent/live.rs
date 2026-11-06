@@ -1402,6 +1402,71 @@ mod tests {
         assert_eq!(observed.inference_calls, 0);
     }
     #[tokio::test]
+    async fn bounded_model_requests_do_not_spend_the_retained_output_allowance() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT;
+        // Actual framed requests, rejected locally by the already-used engine
+        // budget. No model or website is called. Repeated conversation history
+        // can exceed the log allowance while every request remains in bounds.
+        let script = r#"
+import json,sys
+for i in range(1,76):
+    print(json.dumps({'type':'request','request':{'id':i,'method':'POST',
+        'path':'/patchriot/artex/v1/chat/completions','body':{
+        'model':'abliterated-model-large-v2','messages':[{'role':'user','content':'x'*(480*1024)}]}}}),flush=True)
+    for line in sys.stdin:
+        if json.loads(line)['type']=='end': break
+print(json.dumps({'type':'event','event':'result','data':{'completed':True,'final_response':'Owned saved evidence'}}),flush=True)
+"#;
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", script]);
+        let report = supervise(
+            command,
+            Bridge::Live(broker.clone()),
+            &|| false,
+            Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "completed");
+        assert_eq!(report.requests, 75);
+        assert!(report.output_bytes > 32 * 1024 * 1024);
+        assert_eq!(
+            report.events.last().unwrap()["data"]["final_response"],
+            "Owned saved evidence"
+        );
+        assert_eq!(broker.counters.lock().unwrap().calls, ENGINE_CALL_LIMIT);
+        assert_eq!(broker.counters.lock().unwrap().reserved, 0);
+    }
+
+    #[tokio::test]
+    async fn live_tool_output_still_has_a_cumulative_limit() {
+        let script = r#"
+import json
+frame=json.dumps({'type':'event','event':'tool_complete','data':{'output':'x'*(128*1024)}})
+for _ in range(270): print(frame,flush=True)
+"#;
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", script]);
+        let report = supervise(
+            command,
+            Bridge::Live(broker()),
+            &|| false,
+            Duration::from_secs(15),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "output_limit");
+        assert!(report.events.len() < 256);
+        assert_eq!(report.inference_calls, 0);
+    }
+
+    #[tokio::test]
     async fn rejected_engine_retries_do_not_consume_the_reviewers_call_allowance() {
         let mut broker = broker();
         Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];

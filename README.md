@@ -36,6 +36,8 @@ A provider rate limit during discovery ends that engine attempt and preserves it
 
 Conversations still have a transport size limit. If the HTTP body or its encoded message is too large, the local bridge returns a size error so Hermes can compact its history. That rejected input never reaches the model provider; it is not retried as a network outage.
 
+Repeated model-request history does not consume the retained-output allowance. Each request still has its frame, call, time and spending limits; stderr and tool/result events retain their separate cumulative limit. Stop logs record these byte counts without printing prompts or target responses.
+
 Live conversations start compression at 32,000 tokens within the configured 64,000-token window. Summaries are asked to stay under 1,000 words and retain scope, evidence references and unfinished checks; the model's output and spending limits remain enforced separately. The relay reserves up to ten minutes of a role for its report, capped at one third of the role's time allowance, allowing for slow verified model responses and the consented backup. Saved requests remain available after compression; neither a summary nor an unfinished run counts as a verified finding.
 
 Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.

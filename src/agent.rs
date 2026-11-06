@@ -540,6 +540,9 @@ async fn supervise(
     let mut final_seen = false;
     let mut live_phase = patchriot_protocol::pentests::LivePhase::Starting;
     let mut completed_tools = 0u8;
+    let mut retained_output_bytes = 0usize;
+    let mut request_bytes = 0usize;
+    let mut stderr_bytes = 0usize;
     let mut report = AgentRun {
         outcome: "completed",
         failure_reason: None,
@@ -577,7 +580,9 @@ async fn supervise(
                 let n = n?;
                 err_open = n != 0;
                 report.output_bytes += n;
-                if report.output_bytes > broker.output_limit() {
+                stderr_bytes += n;
+                retained_output_bytes += n;
+                if retained_output_bytes > broker.output_limit() {
                     report.outcome = "output_limit";
                     break;
                 }
@@ -586,10 +591,6 @@ async fn supervise(
                 let n = n?;
                 out_open = n != 0;
                 report.output_bytes += n;
-                if report.output_bytes > broker.output_limit() {
-                    report.outcome = "output_limit";
-                    break;
-                }
                 pending.extend_from_slice(&out[..n]);
                 while let Some(end) = pending.iter().position(|&b| b == b'\n') {
                     if end > broker.max_frame() {
@@ -599,6 +600,19 @@ async fn supervise(
                     }
                     let wire = serde_json::from_slice::<Wire>(&pending[..end]);
                     pending.drain(..=end);
+                    // Live request frames carry the conversation again on each
+                    // model call. They are bounded by frame size, request count,
+                    // time and spending limits, and are not retained as output.
+                    // Logs and result/tool events still share the output cap.
+                    if matches!(&broker, Bridge::Live(_)) && matches!(&wire, Ok(Wire::Request { .. })) {
+                        request_bytes += end + 1;
+                    } else {
+                        retained_output_bytes += end + 1;
+                    }
+                    if retained_output_bytes > broker.output_limit() {
+                        report.outcome = "output_limit";
+                        break 'running;
+                    }
                     match wire {
                         Ok(Wire::Request { request }) => {
                             report.requests += 1;
@@ -746,12 +760,15 @@ async fn supervise(
     // Log only fixed reason codes and counts. Frames may contain credentials,
     // target responses or private model messages and must not enter the log.
     eprintln!(
-        "agent stopped: outcome={} reason={:?} exit_code={:?} requests={} output_bytes={} inference_attempts={} final_event={} duration_ms={}",
+        "agent stopped: outcome={} reason={:?} exit_code={:?} requests={} output_bytes={} retained_output_bytes={} stderr_bytes={} request_bytes={} inference_attempts={} final_event={} duration_ms={}",
         report.outcome,
         report.failure_reason,
         report.exit_code,
         report.requests,
         report.output_bytes,
+        retained_output_bytes,
+        stderr_bytes,
+        request_bytes,
         report.inference_calls,
         final_seen,
         report.duration_ms,
