@@ -90,6 +90,10 @@ pub struct Settings {
     live_provider_key_file: Option<PathBuf>,
     #[serde(default)]
     venice_fallback_key_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secondary_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secondary_key_file: Option<PathBuf>,
     #[serde(default = "default_agent_attempt_seconds")]
     max_attempt_seconds: u64,
 }
@@ -169,14 +173,20 @@ impl Settings {
         if let Some(path) = &self.venice_fallback_key_file {
             live::read_provider_key(path)?;
         }
+        if let Some(path) = &self.secondary_key_file {
+            live::read_provider_key(path)?;
+        }
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
-        if patchriot_protocol::pentests::LiveProvider::from_model(&self.model)
-            == Some(patchriot_protocol::pentests::LiveProvider::Venice)
-            && !matches!(
-                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("11" | "12" | "13" | "14" | "15")
+        if matches!(
+            patchriot_protocol::pentests::LiveProvider::from_model(&self.model),
+            Some(
+                patchriot_protocol::pentests::LiveProvider::Venice
+                    | patchriot_protocol::pentests::LiveProvider::VeniceDeepSeek
             )
-        {
+        ) && !matches!(
+            image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+            Some("11" | "12" | "13" | "14" | "15")
+        ) {
             return Err("Venice live tests require adapter 11–15".into());
         }
         if self.live_provider_key_file.is_none()
@@ -293,7 +303,50 @@ impl Settings {
         {
             return Err("Venice fallback requires the NEAR primary route".into());
         }
+        settings.validate_secondary()?;
         Ok(settings)
+    }
+
+    fn validate_secondary(&self) -> Result<(), &'static str> {
+        use patchriot_protocol::pentests::LiveProvider;
+        if self.secondary_model.is_some() != self.secondary_key_file.is_some() {
+            return Err("secondary_model and secondary_key_file must be configured together");
+        }
+        if let Some(model) = self.secondary_model.as_deref()
+            && (self.live_provider_key_file.is_none()
+                || self.venice_fallback_key_file.is_some()
+                || !LiveProvider::from_model(&self.model)
+                    .zip(LiveProvider::from_model(model))
+                    .is_some_and(|(primary, secondary)| primary.permits_secondary(secondary)))
+        {
+            return Err("unsupported or conflicting secondary model configuration");
+        }
+        Ok(())
+    }
+
+    fn consented_secondary(
+        &self,
+        context: &patchriot_protocol::pentests::PentestContext,
+    ) -> Result<Option<(patchriot_protocol::pentests::LiveProvider, &Path)>, &'static str> {
+        use patchriot_protocol::pentests::LiveProvider;
+        let primary = LiveProvider::from_model(&self.model).ok_or("unsupported live provider")?;
+        let Some(secondary) = context.secondary_for(primary) else {
+            return Ok(None);
+        };
+        if self.secondary_model.as_deref() == Some(secondary.model()) {
+            return self
+                .secondary_key_file
+                .as_deref()
+                .map(|p| Some((secondary, p)))
+                .ok_or("consented secondary key missing");
+        }
+        if secondary == LiveProvider::VeniceDeepSeek
+            && primary == LiveProvider::NearDeepSeek
+            && let Some(path) = self.venice_fallback_key_file.as_deref()
+        {
+            return Ok(Some((secondary, path)));
+        }
+        Err("configured secondary differs from the consented route")
     }
 }
 
@@ -996,11 +1049,7 @@ pub fn run(
                     })
                     .min(Instant::now() + Duration::from_secs(settings.max_attempt_seconds)),
                 task.evidence.credentials.as_ref(),
-                if task.evidence.context.allows_venice_fallback {
-                    settings.venice_fallback_key_file.as_deref()
-                } else {
-                    None
-                },
+                settings.consented_secondary(&task.evidence.context)?,
             )
         })
         .transpose()?;
@@ -1359,6 +1408,8 @@ mod tests {
         Settings {
             live_provider_key_file: None,
             venice_fallback_key_file: None,
+            secondary_model: None,
+            secondary_key_file: None,
             docker_socket: "/var/run/docker.sock".into(),
             image: format!("sha256:{}", "b".repeat(64)),
             model_url: "http://127.0.0.1:11434".into(),
@@ -1751,6 +1802,39 @@ mod tests {
     }
 
     #[test]
+    fn secondary_settings_require_an_exact_pair_and_cannot_override_saved_consent() {
+        use patchriot_protocol::pentests::{LiveProvider, PentestContext};
+        for (primary, secondary) in [
+            (LiveProvider::NearDeepSeek, LiveProvider::VeniceDeepSeek),
+            (LiveProvider::VeniceDeepSeek, LiveProvider::NearDeepSeek),
+        ] {
+            let mut settings = settings();
+            settings.model = primary.model().into();
+            settings.live_provider_key_file = Some("/private/primary.key".into());
+            settings.secondary_model = Some(secondary.model().into());
+            assert!(settings.validate_secondary().is_err());
+            settings.secondary_key_file = Some("/private/secondary.key".into());
+            assert!(settings.validate_secondary().is_ok());
+            let mut context: PentestContext = serde_json::from_value(json!({"pentest_id":uuid::Uuid::nil(),"scope":{"origins":["https://example.com"],"methods":["GET"]},"scope_sha256":"a".repeat(64),"reviewers":[],"provider":primary.name()})).unwrap();
+            assert!(
+                settings.consented_secondary(&context).unwrap().is_none(),
+                "a configured key does not grant permission"
+            );
+            context.fallback_model = Some(secondary.model().into());
+            assert_eq!(
+                settings.consented_secondary(&context).unwrap().unwrap().0,
+                secondary
+            );
+            settings.secondary_model = Some(primary.model().into());
+            assert!(settings.validate_secondary().is_err());
+            assert!(settings.consented_secondary(&context).is_err());
+            settings.secondary_model = Some(secondary.model().into());
+            settings.venice_fallback_key_file = Some("/private/legacy.key".into());
+            assert!(settings.validate_secondary().is_err());
+        }
+    }
+
+    #[test]
     fn hosted_model_configuration_requires_the_matching_fixed_provider() {
         use patchriot_protocol::pentests::LiveProvider;
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1760,6 +1844,7 @@ mod tests {
             LiveProvider::Abliteration,
             LiveProvider::Venice,
             LiveProvider::NearDeepSeek,
+            LiveProvider::VeniceDeepSeek,
         ] {
             input["model"] = json!(provider.model());
             input["model_url"] = json!(provider.api_url());

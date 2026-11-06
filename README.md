@@ -11,7 +11,7 @@ flowchart LR
     D[Dispatcher: approved assignment] --> R[Relay]
     R --> H[Isolated Hermes + testing tools]
     H -->|Scoped requests| W[Verified web app]
-    H <-->|Through relay| N[NEAR AI Private TEE]
+    H <-->|Approved provider via relay| N[NEAR AI Private TEE or Venice]
     H -->|Recorded evidence| R
     R --> D
 ```
@@ -22,9 +22,9 @@ flowchart LR
 | --- | --- |
 | **Relay / managed Kali** | Device identity, assignments, time and spending limits, target checks, cancellation and cleanup |
 | **Isolated Hermes container** | Investigates the approved target with the permitted tools |
-| **NEAR AI Private TEE** | Processes encrypted model requests; the relay verifies attestation and signed responses |
+| **Configured model provider** | NEAR AI: encrypted requests, attestation and signed responses. Venice: the selected API model. The request records the allowed routes. |
 
-Only the model step runs inside NEAR’s TEE. The agent host and its approved operator still handle assigned content. A consented Venice backup is reported explicitly and has no verified TEE. Containers receive neither host secrets nor unrestricted network access.
+On the NEAR route, only the model step runs inside its TEE. The agent host and approved operator still handle assigned content. Venice is also supported as primary or backup; that API route has no relay-verified TEE. Reports preserve actual routing. Containers receive neither host secrets nor unrestricted network access.
 
 Scout investigates, Recon checks its leads and a third reviewer challenges serious or uncertain findings. Reports list the tools actually run. An optional check can fail while the agent still returns useful evidence; that gap stays visible. Successful defenses and ordinary behavior belong in the summary, not the vulnerability list. A matching answer is not proof of a vulnerability or of independent reviewers.
 
@@ -505,18 +505,27 @@ This Venice model is marked **anonymized**, not private. Its upstream provider r
 
 The [Private TEE DeepSeek route](https://near.ai/models/deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated) lists $0.30 per million input tokens and $1.20 per million output tokens on 3 November 2026. The relay uses those uncached rates for its cost ceiling; recheck prices before deployment. A small evidence exercise verified compatibility, not a general cybersecurity ranking. Attestation covers the model service, not the Kali host or the accuracy of a finding. Operators still see the plaintext task. Linux releases include the native crypto verifier; the pinned builder links OpenSSL statically.
 
-### Optional Venice recovery
+### Primary model and optional backup
 
-For new live tests, NEAR can recover through Venice’s `deepseek-v4-1-flash-1017-uncensored`. Add `venice_fallback_key_file` to the NEAR agent JSON, pointing to a mode-0600 file owned by the relay user. The key stays on the host. Keep the primary model, device identity and NEAR key unchanged.
+The primary is the device’s paired `model`, matching `model_url` and private `live_provider_key_file`. Both DeepSeek orders are supported:
 
-Update core, dispatcher/gateway and relays together. Only then set `PATCHRIOT_VENICE_FALLBACK_ENABLED=true` on the dispatcher. New checkout consent names Venice; old requests remain NEAR-only. A local key alone cannot authorize sending a requester’s work to another provider.
+| Provider | Model | API URL |
+| --- | --- | --- |
+| NEAR AI | `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` | `https://cloud-api.near.ai/v1` |
+| Venice | `deepseek-v4-1-flash-1017-uncensored` | `https://api.venice.ai/api/v1` |
 
-A temporary NEAR connection failure, rate limit or unavailable verification service permits one Venice attempt before any model response reaches the agent. The role then stays on Venice; the next role starts with NEAR again. Bad credentials, malformed input, invalid signatures, scope denials and exhausted budgets do not trigger recovery. There is no alternating retry loop and no replay of target tools.
+For a backup, set `secondary_model` to the other model and `secondary_key_file` to its private credential file. Configure both or neither. Keys must be mode 0600 and owned by the relay user; they stay outside containers. No provider order or credential belongs in repository deployment files.
+
+Update core, dispatcher/gateway and relay first. Set the dispatcher’s `PATCHRIOT_INFERENCE_PRIMARY_MODEL` to the selected primary and optionally `PATCHRIOT_INFERENCE_SECONDARY_MODEL` to the backup. New checkout selects already approved devices declaring that primary. If none are available, checkout waits; it does not substitute another model. A model change requires a fresh device identity and approval. Keep the previous devices/configuration for queued work. A settings change applies only to new requests, not saved consent.
+
+Legacy configuration remains supported: `venice_fallback_key_file` on a NEAR relay and `PATCHRIOT_VENICE_FALLBACK_ENABLED=true` on dispatcher. Do not combine the old and new configuration fields. Old consent and receipts retain their original bytes; new requests save the exact optional `fallback_model`. Neither a key nor deployment settings grant permission to send a request to an unapproved provider.
+
+A temporary provider failure, rate limit or unavailable NEAR verification service permits one backup attempt before any model output reaches the agent. That role stays on the backup; the next role starts with its own primary. Bad credentials, malformed input, invalid attestation/signatures, scope denials and exhausted budgets never trigger recovery. A NEAR backup uses the same encryption and verification as a NEAR primary. There is no alternating retry loop and no replay of target tools.
 
 **One agent request uses one call allowance, even when it needs both providers.** Both attempts reserve money under the existing $10-per-role limit; an uncertain failed charge is not refunded in the estimate. Time limits and the final-report reserve still apply. The report, exports and retained work receipt record the fallback model, reason and attempt counts.
 
 Venice lists this model as private, with uncached prices of $0.33/M input and $1.32/M output on 4 November 2026. These are provider declarations, not a Patchriot TEE verification. This route uses HTTPS and does not claim NEAR attestation or identical model weights. Recheck the [model catalogue](https://docs.venice.ai/api-reference/endpoint/models/list) and [privacy terms](https://docs.venice.ai/overview/privacy) before enabling it.
 
-A long repeating response can stop Hermes before it writes a report. The relay checks verified NEAR output before delivery and uses the consented backup for `provider_repetition`. It does not retry website tools. A repeating backup response stops the call; the spending and time limits still apply.
+A long repeating response can stop Hermes before it writes a report. The relay checks buffered model output before delivery and can use the consented backup for `provider_repetition`. NEAR verification still has to pass before its output is accepted. It does not retry website tools. A repeating backup response stops the call; the spending and time limits still apply.
 
 </details>

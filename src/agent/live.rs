@@ -186,7 +186,7 @@ struct Counters {
     evidence: Vec<HttpEvidence>,
     evidence_bytes: usize,
     primary_attempts: u16,
-    fallback: Option<VeniceFallbackReceipt>,
+    fallback: Option<ProviderFallbackReceipt>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +237,7 @@ pub struct LiveBroker {
     near: Option<nearai_inference_sdk::InferenceClient>,
     key: zeroize::Zeroizing<String>,
     fallback_key: Option<zeroize::Zeroizing<String>>,
+    fallback_provider: Option<LiveProvider>,
     scope: LiveScope,
     deadline: Instant,
     final_report_reserve: Duration,
@@ -293,13 +294,16 @@ impl LiveBroker {
         scope: LiveScope,
         deadline: Instant,
         credentials: Option<&TestCredentials>,
-        fallback_key_file: Option<&Path>,
+        fallback: Option<(LiveProvider, &Path)>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let key = read_provider_key(key_file)?;
-        if fallback_key_file.is_some() && provider != LiveProvider::NearDeepSeek {
-            return Err("Venice fallback requires NEAR primary inference".into());
+        if fallback.is_some_and(|(secondary, _)| !provider.permits_secondary(secondary)) {
+            return Err("unsupported primary and secondary model pair".into());
         }
-        let fallback_key = fallback_key_file.map(read_provider_key).transpose()?;
+        let fallback_provider = fallback.map(|(secondary, _)| secondary);
+        let fallback_key = fallback
+            .map(|(_, path)| read_provider_key(path))
+            .transpose()?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -309,6 +313,10 @@ impl LiveBroker {
         let access = access::Access::new(&scope, credentials)?;
         let near = if provider == LiveProvider::NearDeepSeek {
             Some(near::client(&key)?)
+        } else if fallback_provider == Some(LiveProvider::NearDeepSeek) {
+            Some(near::client(
+                fallback_key.as_ref().ok_or("secondary key missing")?,
+            )?)
         } else {
             None
         };
@@ -318,6 +326,7 @@ impl LiveBroker {
             near,
             key,
             fallback_key,
+            fallback_provider,
             scope,
             deadline,
             final_report_reserve: (deadline.saturating_duration_since(Instant::now()) / 3)
@@ -393,7 +402,7 @@ impl LiveBroker {
         self.access.redact_json(&mut body["messages"]);
         match self.provider {
             LiveProvider::Abliteration => body["reasoning_effort"] = json!("high"),
-            LiveProvider::Venice => {
+            LiveProvider::Venice | LiveProvider::VeniceDeepSeek => {
                 // No upstream browsing, extra system prompt, storage or model
                 // fallback. Target text cannot enable these provider features.
                 body["store"] = json!(false);
@@ -454,7 +463,7 @@ impl LiveBroker {
         if !engine && request.path != SUMMARY_CHAT {
             self.finish_before_limit(&mut body)?;
         }
-        if self.fallback_key.is_some() {
+        if self.fallback_key.is_some() || self.provider == LiveProvider::VeniceDeepSeek {
             return self.routed_model(body, engine, request.id, output).await;
         }
         let bytes = serde_json::to_vec(&body).map_err(|_| "invalid_model_request")?;
@@ -591,8 +600,13 @@ impl LiveBroker {
     }
     fn finish_before_limit(&self, body: &mut Value) -> Result<(), &'static str> {
         let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+        let active_provider = count
+            .fallback
+            .as_ref()
+            .and_then(|r| LiveProvider::from_model(&r.model))
+            .unwrap_or(self.provider);
         let next = token_cost(
-            self.provider,
+            active_provider,
             serde_json::to_vec(body)
                 .map_err(|_| "invalid_model_request")?
                 .len() as u64
@@ -612,9 +626,12 @@ impl LiveBroker {
             body["tool_choice"] = json!("none");
             body["reasoning_effort"] = json!("low");
             // Formatting helps the closing turn, but cannot establish evidence.
-            // DeepSeek's current NEAR route advertises tools, not structured
-            // output. Its final JSON still passes the same local validation.
-            if self.provider != LiveProvider::NearDeepSeek {
+            // Keep DeepSeek completion requests compatible across both routes.
+            // The final JSON still passes the same local validation.
+            if !matches!(
+                self.provider,
+                LiveProvider::NearDeepSeek | LiveProvider::VeniceDeepSeek
+            ) {
                 body["response_format"] = assessment_format();
             }
             body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report because a request, evidence, time or model allowance is exhausted or nearly spent. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
@@ -1126,6 +1143,7 @@ fn token_cost(provider: LiveProvider, input: u64, output: u64) -> Option<u64> {
     let (input_rate, output_rate) = match provider {
         LiveProvider::Abliteration | LiveProvider::Venice => (3_000_000, 5_000_000),
         LiveProvider::NearDeepSeek => (300_000, 1_200_000),
+        LiveProvider::VeniceDeepSeek => (330_000, 1_320_000),
     };
     Some(
         input
@@ -1256,6 +1274,7 @@ mod tests {
             LiveProvider::Abliteration,
             LiveProvider::Venice,
             LiveProvider::NearDeepSeek,
+            LiveProvider::VeniceDeepSeek,
         ] {
             let mut broker = broker();
             Arc::get_mut(&mut broker).unwrap().provider = provider;
@@ -1662,6 +1681,7 @@ for _ in range(270): print(frame,flush=True)
             evidence: PentestEvidence {
                 context: PentestContext {
                     allows_venice_fallback: false,
+                    fallback_model: None,
                     review_policy: Default::default(),
                     third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
@@ -1705,6 +1725,7 @@ for _ in range(270): print(frame,flush=True)
             evidence: PentestEvidence {
                 context: PentestContext {
                     allows_venice_fallback: false,
+                    fallback_model: None,
                     review_policy: Default::default(),
                     third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
@@ -1927,6 +1948,7 @@ for _ in range(270): print(frame,flush=True)
             evidence: PentestEvidence {
                 context: PentestContext {
                     allows_venice_fallback: false,
+                    fallback_model: None,
                     review_policy: Default::default(),
                     third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),

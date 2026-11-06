@@ -1,4 +1,4 @@
-//! One consented recovery route. A logical agent call can try NEAR then Venice;
+//! One consented recovery route. Deployment settings select either provider first;
 //! both attempts reserve money, but consume just one call from the work allowance.
 use super::*;
 use std::future::Future;
@@ -7,6 +7,21 @@ use std::future::Future;
 enum Route {
     Near,
     Venice,
+}
+impl Route {
+    fn provider(self) -> LiveProvider {
+        match self {
+            Self::Near => LiveProvider::NearDeepSeek,
+            Self::Venice => LiveProvider::VeniceDeepSeek,
+        }
+    }
+    fn from_provider(provider: LiveProvider) -> Result<Self, &'static str> {
+        match provider {
+            LiveProvider::NearDeepSeek => Ok(Self::Near),
+            LiveProvider::VeniceDeepSeek => Ok(Self::Venice),
+            _ => Err("unsupported_routed_model"),
+        }
+    }
 }
 
 /// Check the complete, still-buffered response before Hermes receives it. Its
@@ -85,7 +100,16 @@ fn repetition_dominates(text: &str) -> bool {
     false
 }
 
-fn fallback_body(mut body: Value) -> Value {
+fn route_body(route: Route, mut body: Value) -> Value {
+    if route == Route::Near {
+        body["model"] = json!(LiveProvider::NearDeepSeek.model());
+        let object = body.as_object_mut().expect("validated chat object");
+        for field in ["venice_parameters", "fallbacks", "response_format"] {
+            object.remove(field);
+        }
+        near::preserve_tool_text(&mut body);
+        return body;
+    }
     body["model"] = json!(VENICE_FALLBACK_MODEL);
     body["stream"] = json!(false);
     body.as_object_mut()
@@ -102,13 +126,9 @@ fn fallback_body(mut body: Value) -> Value {
 
 /// Published uncached Venice rates for the fixed DeepSeek fallback, 2026-11-04.
 /// Failed/ambiguous attempts keep their full reservation; no guessed refunds.
+#[cfg(test)]
 fn fallback_cost(input: u64, output: u64) -> Option<u64> {
-    Some(
-        input
-            .checked_mul(330_000)?
-            .checked_add(output.checked_mul(1_320_000)?)?
-            .div_ceil(1_000_000),
-    )
+    token_cost(LiveProvider::VeniceDeepSeek, input, output)
 }
 
 impl LiveBroker {
@@ -116,12 +136,14 @@ impl LiveBroker {
         let mut response = self
             .client
             .post("https://api.venice.ai/api/v1/chat/completions")
-            .bearer_auth(
+            .bearer_auth(if self.provider == LiveProvider::VeniceDeepSeek {
+                self.key.as_str()
+            } else {
                 self.fallback_key
                     .as_ref()
                     .ok_or("fallback_not_configured")?
-                    .as_str(),
-            )
+                    .as_str()
+            })
             .json(&body)
             .send()
             .await
@@ -182,11 +204,8 @@ impl LiveBroker {
         if length > MAX_FRAME {
             return Err("model_request_too_large");
         }
-        let reservation = match route {
-            Route::Near => token_cost(LiveProvider::NearDeepSeek, length as u64 + 4096, 8192),
-            Route::Venice => fallback_cost(length as u64 + 4096, 8192),
-        }
-        .ok_or("provider_budget_reached")?;
+        let reservation = token_cost(route.provider(), length as u64 + 4096, 8192)
+            .ok_or("provider_budget_reached")?;
         let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
         // A recovery for the last allowed logical call is still allowed. Money,
         // engine reserve and wall time remain bounded for each physical attempt.
@@ -207,19 +226,20 @@ impl LiveBroker {
             count.calls += 1;
         }
         count.reserved += reservation;
-        match route {
-            Route::Near => count.primary_attempts += 1,
-            Route::Venice => {
-                let primary_attempts = count.primary_attempts;
-                let receipt = count.fallback.get_or_insert_with(|| VeniceFallbackReceipt {
-                    model: VENICE_FALLBACK_MODEL.into(),
+        if route.provider() == self.provider {
+            count.primary_attempts += 1;
+        } else {
+            let primary_attempts = count.primary_attempts;
+            let receipt = count
+                .fallback
+                .get_or_insert_with(|| ProviderFallbackReceipt {
+                    model: route.provider().model().into(),
                     reason: reason.unwrap_or("provider_unavailable").into(),
                     primary_attempts,
                     fallback_attempts: 0,
                     fallback_completed: 0,
                 });
-                receipt.fallback_attempts += 1;
-            }
+            receipt.fallback_attempts += 1;
         }
         Ok(reservation)
     }
@@ -235,10 +255,7 @@ impl LiveBroker {
             .as_u64()
             .zip(usage["completion_tokens"].as_u64())
             .filter(|(input, output)| *input > 0 && *input <= 10_000_000 && *output <= 1_000_000)
-            .and_then(|(input, output)| match route {
-                Route::Near => token_cost(LiveProvider::NearDeepSeek, input, output),
-                Route::Venice => fallback_cost(input, output),
-            });
+            .and_then(|(input, output)| token_cost(route.provider(), input, output));
         let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
         if let Some(cost) = cost {
             count.reserved = count
@@ -246,7 +263,7 @@ impl LiveBroker {
                 .saturating_sub(reservation)
                 .saturating_add(cost);
         }
-        if route == Route::Venice {
+        if route.provider() != self.provider {
             count
                 .fallback
                 .as_mut()
@@ -272,28 +289,43 @@ impl LiveBroker {
             .map_err(|_| "counter_unavailable")?
             .fallback
             .is_some();
+        let primary = Route::from_provider(self.provider)?;
+        let secondary = self
+            .fallback_provider
+            .map(Route::from_provider)
+            .transpose()?;
         if already_fell_back {
-            let body = fallback_body(body);
-            let reserved = self.reserve_route(Route::Venice, &body, engine, true, None)?;
-            let completion = send(Route::Venice, body).await?;
-            self.finish_route(Route::Venice, reserved, &completion)?;
+            let secondary = secondary.ok_or("fallback_not_configured")?;
+            let body = route_body(secondary, body);
+            let reserved = self.reserve_route(secondary, &body, engine, true, None)?;
+            let completion = send(secondary, body).await?;
+            self.finish_route(secondary, reserved, &completion)?;
             return Ok(completion);
         }
-        let reserved = self.reserve_route(Route::Near, &body, engine, true, None)?;
-        match send(Route::Near, body.clone()).await {
+        let primary_body = route_body(primary, body.clone());
+        let reserved = self.reserve_route(primary, &primary_body, engine, true, None)?;
+        match send(primary, primary_body).await {
             Ok(completion) => {
-                self.finish_route(Route::Near, reserved, &completion)?;
+                self.finish_route(primary, reserved, &completion)?;
                 Ok(completion)
             }
-            Err(reason) if fallback_available_for(reason) && self.fallback_key.is_some() => {
-                // Nothing has reached the agent. Keep NEAR's uncertain charge,
-                // reserve Venice separately and stay on Venice for this role.
-                let body = fallback_body(body);
-                let reserved =
-                    self.reserve_route(Route::Venice, &body, engine, false, Some(reason))?;
-                eprintln!("model recovery: near.ai -> venice.ai reason={reason}");
-                let completion = send(Route::Venice, body).await?;
-                self.finish_route(Route::Venice, reserved, &completion)?;
+            Err(reason)
+                if fallback_available_for(reason)
+                    && self.fallback_key.is_some()
+                    && secondary.is_some() =>
+            {
+                // Nothing has reached the agent. Keep the primary's uncertain
+                // charge, reserve the backup separately and stay there for this role.
+                let secondary = secondary.ok_or("fallback_not_configured")?;
+                let body = route_body(secondary, body);
+                let reserved = self.reserve_route(secondary, &body, engine, false, Some(reason))?;
+                eprintln!(
+                    "model recovery: {} -> {} reason={reason}",
+                    primary.provider().name(),
+                    secondary.provider().name()
+                );
+                let completion = send(secondary, body).await?;
+                self.finish_route(secondary, reserved, &completion)?;
                 Ok(completion)
             }
             Err(reason) => Err(reason),
@@ -360,6 +392,7 @@ mod tests {
         let mut broker = super::super::tests::broker();
         let value = Arc::get_mut(&mut broker).unwrap();
         value.provider = LiveProvider::NearDeepSeek;
+        value.fallback_provider = Some(LiveProvider::VeniceDeepSeek);
         value.fallback_key = Some(zeroize::Zeroizing::new("fixture-only-key".into()));
         broker
     }
@@ -368,6 +401,119 @@ mod tests {
     }
     fn reply() -> Value {
         json!({"model":VENICE_FALLBACK_MODEL,"choices":[{"message":{"role":"assistant","content":"fixture"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100}})
+    }
+    #[tokio::test]
+    async fn either_order_preserves_one_call_one_failover_and_costs_of_both_attempts() {
+        for primary in [Route::Near, Route::Venice] {
+            let secondary = if primary == Route::Near {
+                Route::Venice
+            } else {
+                Route::Near
+            };
+            for fail_first in [false, true] {
+                let mut broker = broker();
+                let config = Arc::get_mut(&mut broker).unwrap();
+                config.provider = primary.provider();
+                config.fallback_provider = Some(secondary.provider());
+                let mut body = request();
+                body["model"] = json!(primary.provider().model());
+                body["messages"] = json!([{"role":"tool", "tool_call_id":"owned", "content":"[]"}]);
+                let mut routes = Vec::new();
+                for call in 0..2 {
+                    broker
+                        .route_completion(body.clone(), false, |route, sent| {
+                            routes.push(route);
+                            assert_eq!(sent["model"], route.provider().model());
+                            if route == Route::Near {
+                                assert!(sent.get("venice_parameters").is_none());
+                                assert!(sent.get("response_format").is_none());
+                                assert_eq!(
+                                    sent["messages"][0]["content"],
+                                    "Tool result (JSON):\n[]"
+                                );
+                            } else {
+                                assert_eq!(sent["store"], false);
+                                assert_eq!(sent["fallbacks"], json!([]));
+                                assert_eq!(sent["venice_parameters"]["enable_web_search"], "off");
+                            }
+                            let mut response = reply();
+                            response["model"] = json!(route.provider().model());
+                            std::future::ready(if fail_first && call == 0 && route == primary {
+                                Err("provider_rate_limited")
+                            } else {
+                                Ok(response)
+                            })
+                        })
+                        .await
+                        .unwrap();
+                }
+                let count = broker.counters.lock().unwrap();
+                assert_eq!(count.calls, 2);
+                if fail_first {
+                    assert_eq!(routes, [primary, secondary, secondary]);
+                    let receipt = count.fallback.as_ref().unwrap();
+                    assert!(receipt.valid_for(primary.provider().model(), count.calls));
+                    assert_eq!(receipt.fallback_completed, 2);
+                    let reserved = token_cost(
+                        primary.provider(),
+                        serde_json::to_vec(&route_body(primary, body))
+                            .unwrap()
+                            .len() as u64
+                            + 4096,
+                        8192,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        count.reserved,
+                        reserved + 2 * token_cost(secondary.provider(), 1000, 100).unwrap()
+                    );
+                } else {
+                    assert_eq!(routes, [primary, primary]);
+                    assert!(count.fallback.is_none());
+                    assert_eq!(
+                        count.reserved,
+                        2 * token_cost(primary.provider(), 1000, 100).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn venice_primary_can_disable_backup_and_near_backup_verification_cannot_be_bypassed() {
+        for secondary in [None, Some(LiveProvider::NearDeepSeek)] {
+            let mut broker = broker();
+            let config = Arc::get_mut(&mut broker).unwrap();
+            config.provider = LiveProvider::VeniceDeepSeek;
+            config.fallback_provider = secondary;
+            if secondary.is_none() {
+                config.fallback_key = None;
+            }
+            let mut routes = Vec::new();
+            let error = broker
+                .route_completion(request(), false, |route, _| {
+                    routes.push(route);
+                    std::future::ready(Err(if route == Route::Venice {
+                        "provider_unavailable"
+                    } else {
+                        "near_signature_invalid"
+                    }))
+                })
+                .await
+                .unwrap_err();
+            let count = broker.counters.lock().unwrap();
+            assert_eq!(count.calls, 1);
+            assert!(count.reserved > 0);
+            if secondary.is_some() {
+                assert_eq!(routes, [Route::Venice, Route::Near]);
+                assert_eq!(error, "near_signature_invalid");
+                assert_eq!(count.fallback.as_ref().unwrap().fallback_completed, 0);
+            } else {
+                assert_eq!(routes, [Route::Venice]);
+                assert_eq!(error, "provider_unavailable");
+                assert!(count.fallback.is_none());
+            }
+        }
     }
     #[tokio::test]
     async fn stalled_primary_is_dropped_before_one_backup_with_no_budget_refund() {
