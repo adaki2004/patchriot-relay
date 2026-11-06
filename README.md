@@ -48,7 +48,7 @@ ARTEX handoffs contain a complete JSON summary, stop reason, evidence references
 
 Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.
 
-The reviewer can inspect the exact saved HTTP records from discovery, browser requests and login comparisons before citing a finding. These working copies contain the relay's redacted evidence, never raw session headers or cookies. Reading them does not repeat the requests. Scanner output remains a lead to check, and a completed report is not proof that every claim is correct.
+The reviewer can inspect the exact saved HTTP records from discovery, browser requests and login comparisons before citing a finding. These working copies contain the relay's redacted evidence, never raw session headers or cookies. Reading them does not repeat the requests. Scanner output remains a lead to check, and a completed report is not proof that every claim is correct. Agents are instructed to establish who owns a record before claiming cross-account access; a single supplied account may leave that check unresolved.
 
 The browser reuses explicitly public, immutable scripts, styles, fonts and images within a role. Pages, APIs, login responses and direct probes remain fresh. When the HTTP allowance is spent, browser polling stops and the agent writes its report from collected evidence, with unfinished checks disclosed.
 
