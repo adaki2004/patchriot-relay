@@ -209,7 +209,8 @@ class Bridge(BaseHTTPRequestHandler):
                     # HTTP bytes fit, but JSON escaping and the wire envelope
                     # can be larger. Nothing has entered the broker yet.
                     return self.size_error()
-                disconnected = False
+                disconnected, engine_error = False, False
+                error_body = bytearray()
                 while True:
                     line = sys.stdin.buffer.readline(MAX_REQUEST + 1)
                     if not line or len(line) > MAX_REQUEST or not line.endswith(b"\n"):
@@ -221,8 +222,7 @@ class Bridge(BaseHTTPRequestHandler):
                         if frame["type"] == "start":
                             status, content_type = frame["status"], frame["content_type"]
                             if self.path == '/patchriot/artex/v1/chat/completions' and status >= 400:
-                                engine_stop_reason = 'model_request_rejected'
-                                engine_stopping.set()
+                                engine_error = True
                             elif self.path == '/patchriot/artex/http' and status == 429:
                                 engine_stop_reason = 'target_request_budget'
                                 engine_stopping.set()
@@ -233,10 +233,23 @@ class Bridge(BaseHTTPRequestHandler):
                                 self.end_headers()
                         elif frame["type"] == "chunk":
                             chunk = bytes.fromhex(frame["hex"])
+                            if engine_error and len(error_body) <= 4096:
+                                error_body.extend(chunk[:4097 - len(error_body)])
                             if not disconnected:
                                 self.wfile.write(chunk)
                                 self.wfile.flush()
                         elif frame["type"] == "end":
+                            if engine_error:
+                                engine_stop_reason = 'model_request_rejected'
+                                try:
+                                    # Fixed broker reason codes only. A provider
+                                    # error is not ordinary budget exhaustion.
+                                    reason = json.loads(error_body).get('error')
+                                    if reason == 'engine_budget_reached':
+                                        engine_stop_reason = 'model_budget'
+                                except (ValueError, AttributeError):
+                                    pass
+                                engine_stopping.set()
                             return
                         else:
                             raise RuntimeError("model request failed")

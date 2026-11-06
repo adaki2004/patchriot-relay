@@ -115,6 +115,49 @@ finally:
 
 
 class LiveOverviewTests(unittest.TestCase):
+    def test_limited_scan_hands_evidence_to_targeted_review_without_broad_rescan(self):
+        import artex
+        import copy
+        scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
+        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress'):
+            with self.subTest(reason=reason):
+                detail = {'engine': 'ARTEX', 'stop_reason': reason, 'coverage_complete': False,
+                          'failure': 'incomplete'}
+                record = {'tool': 'artex-engine', 'exit_code': 0, 'failure': 'incomplete',
+                          'output_truncated': False, 'evidence_ids': [7],
+                          'output_excerpt': artex.receipt_summary(detail, json.dumps(detail))}
+                first = {'role': 'investigator', 'assessment': None, 'tool_runs': [record],
+                         'evidence': [{'id': 7, 'url': 'https://owned.example/api', 'status': 403}]}
+                saved = copy.deepcopy(first)
+                for role, previous in [('reproducer', [first]), ('challenger', [first, {'role': 'reproducer', 'tool_runs': []}])]:
+                    plan = live_review.discovery_plan(role, scope, previous)[-1]
+                    self.assertEqual(plan, {'tool':'artex-engine','action':'reuse_partial',
+                        'source_role':'investigator','coverage_complete':False,'stop_reason':reason})
+                self.assertEqual(first, saved, 'Original incomplete receipt and evidence must stay intact')
+                self.assertIn('coverage remains incomplete', live_review.prompt('reproducer'))
+
+    def test_partial_scan_without_usable_evidence_or_known_stop_still_recovers(self):
+        import copy
+        base = {'role': 'investigator', 'tool_runs': [{'tool': 'artex-engine', 'exit_code': 0,
+            'failure': 'incomplete', 'output_truncated': False, 'evidence_ids': [7],
+            'output_excerpt': json.dumps({'receipt_schema':1,'engine':'ARTEX','stop_reason':'time_budget',
+                                         'coverage_complete':False,'failure':'incomplete'})}],
+            'evidence': [{'id':7,'url':'https://owned.example/','status':200}]}
+        variants = []
+        for key, value in [('exit_code',None), ('failure','timeout'), ('output_truncated',True),
+                           ('evidence_ids',[]), ('output_excerpt','{"stop_reason":"time_budget",'),
+                           ('output_excerpt','[]')]:
+            record=copy.deepcopy(base);record['tool_runs'][0][key]=value;variants.append(record)
+        for key, value in [('status',None),('status',True),('error','request_error'),('id',8),('url','https://other.example/')]:
+            record=copy.deepcopy(base);record['evidence'][0][key]=value;variants.append(record)
+        for reason in ['interrupted','unavailable','model_request_rejected','provider_rate_limited']:
+            record=copy.deepcopy(base);detail=json.loads(record['tool_runs'][0]['output_excerpt'])
+            detail['stop_reason']=reason;record['tool_runs'][0]['output_excerpt']=json.dumps(detail);variants.append(record)
+        for record in variants:
+            with self.subTest(record=record):
+                plan=live_review.discovery_plan('reproducer',{'origins':['https://owned.example'],'tools':['artex_engine_v1']},[record])
+                self.assertEqual(plan[-1]['action'],'recover')
+
     def test_missing_discovery_is_recovered_once_without_repeating_finished_tools(self):
         scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
         first = {'role':'investigator', 'assessment':None, 'tool_runs':[
@@ -219,6 +262,22 @@ class BridgeTests(unittest.TestCase):
         result, requests = self.exchange(frames, 'POST', '/v1/chat/completions', '{}')
         self.assertEqual(result[0], 200)
         self.assertEqual(len(requests), 1)
+
+    def test_discovery_distinguishes_budget_stop_from_provider_failure(self):
+        for reason, expected in [('engine_budget_reached', 'model_budget'),
+                                 ('provider_rate_limited', 'model_request_rejected'),
+                                 ('near_verification_timeout', 'model_request_rejected')]:
+            with self.subTest(reason=reason):
+                adapter.engine_stopping.clear()
+                payload=json.dumps({'error':reason}).encode()
+                frames=[{'type':'start','id':1,'status':429,'content_type':'application/json'},
+                        {'type':'chunk','id':1,'hex':payload[:10].hex()},
+                        {'type':'chunk','id':1,'hex':payload[10:].hex()}, {'type':'end','id':1}]
+                result, requests=self.exchange(frames,'POST','/patchriot/artex/v1/chat/completions','{}')
+                self.assertEqual(result[0],429)
+                self.assertTrue(adapter.engine_stopping.is_set())
+                self.assertEqual(adapter.engine_stop_reason,expected)
+                self.assertEqual(len(requests),1)
 
     def test_final_result_waits_for_the_active_response_and_rejects_late_browser_requests(self):
         wire = io.StringIO()

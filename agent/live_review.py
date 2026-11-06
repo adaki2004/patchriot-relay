@@ -1,8 +1,41 @@
 """Live-mode task context for Hermes; executable network policy is in Rust."""
 import json
+from urllib.parse import urlsplit
 
 # Two 4 MiB role reports plus bounded scope/team metadata; matches the protocol.
 MAX_INPUT = 2 * 4 * 1024 * 1024 + 256 * 1024
+
+
+def reusable_partial(record, report, scope):
+    """Budget exhaustion is not a reason to repeat an entire broad scan.
+
+    Require a complete summary and real, saved target responses. Unknown/old
+    truncated receipts and startup/transport failures retain the recovery path.
+    This selects targeted follow-up work; it never marks coverage complete.
+    """
+    if (record.get('tool') != 'artex-engine' or record.get('exit_code') != 0
+            or record.get('failure') != 'incomplete' or record.get('output_truncated')):
+        return None
+    try:
+        detail = json.loads(record.get('output_excerpt', ''))
+    except (ValueError, TypeError):
+        return None
+    if (not isinstance(detail, dict) or detail.get('receipt_schema') != 1
+            or detail.get('engine') != 'ARTEX' or detail.get('coverage_complete') is not False
+            or detail.get('failure') != 'incomplete'
+            or detail.get('stop_reason') not in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress')):
+        return None
+    refs = record.get('evidence_ids', [])
+    for evidence in report.get('evidence', []):
+        try:
+            url = urlsplit(evidence.get('url', ''))
+        except ValueError:
+            continue
+        if (evidence.get('id') in refs and type(evidence.get('status')) is int
+                and 100 <= evidence['status'] <= 599 and not evidence.get('error')
+                and f'{url.scheme}://{url.netloc}' in scope['origins']):
+            return detail['stop_reason']
+    return None
 
 
 def runs_discovery(role):
@@ -13,7 +46,7 @@ def runs_discovery(role):
 
 
 def discovery_plan(role, scope, previous):
-    """Reuse completed runs; permit one recovery per tool family in later roles.
+    """Reuse completed/usable partial runs; recover absent or failed tools once.
 
     A missing assessment does not erase successful tool receipts. Conversely,
     a completed assessment cannot stand in for a missing discovery run.
@@ -25,6 +58,7 @@ def discovery_plan(role, scope, previous):
     plan = []
     for tool in required:
         attempts = []
+        partial = None
         for report in previous[:2]:
             records = [r for r in report.get('tool_runs', []) if r.get('tool') == tool]
             if records:
@@ -32,13 +66,21 @@ def discovery_plan(role, scope, previous):
                 completed = len(records) >= expected and all(
                     r.get('exit_code') == 0 and not r.get('failure') for r in records)
                 attempts.append((report.get('role'), completed))
+                if len(records) == 1:
+                    reason = reusable_partial(records[0], report, scope)
+                    if reason:
+                        partial = (report.get('role'), reason)
         inherited = next((name for name, done in reversed(attempts) if done), None)
         # Only one later role retries a tool family. An earlier crash before
         # startup has no receipt; the first available later role can recover it.
         recovered_before = any(name != 'investigator' for name, _ in attempts)
         action = ('run' if role == 'investigator' else 'reuse' if inherited
+                  else 'reuse_partial' if partial
                   else 'unavailable' if recovered_before else 'recover')
-        plan.append({'tool': tool, 'action': action, 'source_role': inherited})
+        entry = {'tool': tool, 'action': action, 'source_role': inherited}
+        if action == 'reuse_partial':
+            entry.update(source_role=partial[0], coverage_complete=False, stop_reason=partial[1])
+        plan.append(entry)
     return plan
 
 
@@ -92,7 +134,7 @@ def prompt(role, browser=False):
     }
     initial = ("The pinned runner performed the discovery bundle: a bounded link crawl, three curated Nuclei checks, a versioned baseline suite, ARES-derived HTTP fingerprints and control requests. Inspect each receipt: unavailable or unfinished tools are coverage gaps. If artex_engine_v1 is selected, inspect /work/artex-results.json for this role's engine run."
                if runs_discovery(role) else
-               "This role runs fresh controls and reuses completed discovery from previous.json. The runner may also recover a missing or failed discovery tool once; the overview's discovery_plan says what ran, was reused or remains unavailable. Inspect current tool-results.json and any current artex-results.json for recovery work. Do not rerun completed discovery. Use fresh requests to test material claims and their assumptions. Preserve remaining gaps instead of implying full coverage.")
+               "This role runs fresh controls and reuses discovery from previous.json. A reuse_partial entry means the broad scan stopped at a limit after saving real responses: inspect that evidence, test material leads and address specific gaps instead of repeating the whole scan. Its coverage remains incomplete. The runner may recover a missing or failed discovery tool once; discovery_plan says what ran, was reused or remains unavailable. Inspect current tool-results.json and any current artex-results.json for recovery work. Use fresh requests to test material claims and their assumptions. Preserve remaining gaps instead of implying full coverage.")
     result = f"""You are the {role} conducting an authorized live website security test. {duties[role]}
 Start with the overview below, then inspect the relevant entries in /work/scope.json, /work/previous.json and /work/tool-results.json. Load each JSON file separately with Python json.load; print selected fields rather than concatenating or dumping entire files. If terminal output is shortened, read the original file in smaller pieces; do not try to repair the shortened display or its spillover copy. {initial} Inspect recorded outputs and request IDs; these are leads, not proved findings. IDs in tool-results.json belong to your current role, while IDs in previous.json belong to earlier roles and must not be copied into your citations. Report unavailable, failed or truncated tool coverage. Spend your own probes on meaningful leads and missing checks. When revisiting the same issue, keep its exact title and cite the request that demonstrates it first, followed by controls. A different affected endpoint or cause is a separate finding. The exact approved HTTPS origins and objective are in scope.json. Read /patchriot/live-review-skill.txt for the testing method.
 You have a normal terminal inside a disposable isolated container. Write Python analysis scripts, parse HTML/JavaScript, compare responses and design your own non-destructive HTTP probes. This is live testing, not an offline snapshot exercise.

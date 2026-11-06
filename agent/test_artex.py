@@ -24,6 +24,33 @@ SCOPE = {'origins': ['https://owned.example'], 'objective': 'Owned fixture only'
 
 
 class EngineTests(unittest.TestCase):
+    def test_oversized_engine_details_leave_a_complete_handoff_and_exact_local_file(self):
+        details = {'engine': 'ARTEX', 'commit': artex.VERSION,
+                   'stop_reason': 'time_budget', 'coverage_complete': False,
+                   'failure': 'incomplete', 'target_mapping': {'https://owned.example': 'http://127.0.0.1:1234'},
+                   'outcome': {str(i): {str(j): '🛡' * 500 for j in range(10)} for i in range(10)},
+                   'findings': [{'summary': 'Owned unverified lead', 'details': 'x' * 40000}],
+                   'commands': {'commands': [{'command': 'long command ' * 10000}]}}
+        class FakeEngine:
+            def __init__(self, *_args): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def assess(self, *_args, **_kwargs): return details.copy()
+        with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine):
+            receipt = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(folder))
+            saved = (Path(folder) / 'artex-results.json').read_text()
+            self.assertEqual(json.loads(saved)['commands'], details['commands'])
+            self.assertGreater(len(saved), 24 * 1024)
+            self.assertFalse(receipt['output_truncated'])
+            summary = json.loads(receipt['output_excerpt'])
+            self.assertEqual(summary['stop_reason'], 'time_budget')
+            self.assertEqual(summary['full_output_sha256'], hashlib.sha256(saved.encode()).hexdigest())
+            self.assertEqual(summary['commands_returned'], 1)
+            self.assertTrue(summary['details_summarized'])
+            self.assertFalse(summary['coverage_complete'])
+            self.assertEqual(receipt['failure'], 'incomplete')
+            self.assertEqual(receipt['output_sha256'], hashlib.sha256(receipt['output_excerpt'].encode()).hexdigest())
+
     def test_exhausted_upstream_planner_stops_even_if_task_is_queued(self):
         self.assertTrue(artex.should_stop({'status': 'queued', 'llm_failover_state': 'chain_exhausted'}))
         self.assertTrue(artex.should_stop({'status': 'completed'}))

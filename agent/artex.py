@@ -5,6 +5,7 @@ tools. Its findings are leads for the review team. The relay owns the deadline,
 network permissions and model key; this container has no external network.
 """
 from contextlib import ExitStack
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,46 @@ API = 'http://127.0.0.1:8787'
 POSTGRES = '/usr/lib/postgresql/17/bin/'
 TERMINAL = {'completed', 'done', 'failed', 'paused', 'stopped', 'timed_out', 'timeout', 'unavailable'}
 NO_TARGET_PROGRESS_SECONDS = 300
+
+
+def receipt_summary(result, full_output):
+    """Keep the handoff parseable; command transcripts can exceed 24 KiB.
+
+    Full details stay in artex-results.json for this role. Later roles receive
+    this bounded summary and the original broker evidence, not cut JSON.
+    """
+    def preview(value, depth=0):
+        if isinstance(value, str):
+            return value[:300]
+        if depth >= 3 and isinstance(value, (dict, list)):
+            return {'omitted_items': len(value)}
+        if isinstance(value, dict):
+            return {str(k)[:80]: preview(v, depth + 1) for k, v in list(value.items())[:6]}
+        if isinstance(value, list):
+            return [preview(v, depth + 1) for v in value[:6]]
+        return value
+    summary = {key: result[key] for key in (
+        'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
+        'distinct_target_observations', 'seconds_without_target_progress',
+        'limitations', 'target_mapping'
+    ) if key in result}
+    commands = result.get('commands', {})
+    entries = commands.get('commands', []) if isinstance(commands, dict) else commands
+    summary.update(receipt_schema=1, details_summarized=True,
+                   full_output_sha256=hashlib.sha256(full_output.encode()).hexdigest(),
+                   details_available_during_role='/work/artex-results.json',
+                   commands_returned=len(entries) if isinstance(entries, list) else 0,
+                   outcome_preview=preview(result.get('outcome')),
+                   findings_preview=preview(result.get('findings')))
+    encoded = json.dumps(summary, ensure_ascii=True)
+    from web_tools import MAX_OUTPUT
+    if len(encoded.encode()) > MAX_OUTPUT:
+        # Unicode escaping or nested engine data must not cut the stop reason
+        # in half. Evidence references and the local full file are unchanged.
+        summary['outcome_preview'] = {'omitted': True}
+        summary['findings_preview'] = {'omitted': True}
+        encoded = json.dumps(summary, ensure_ascii=True)
+    return encoded
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -268,8 +309,8 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         'A budget-limited run may contain useful findings while leaving goals unfinished. Review its stop reason and the later agents’ control requests.',
         'Discovery stops after five minutes without a new recorded target observation. Planning, status polling and identical repeated replies do not reset that timer. This can interrupt slow analysis; it is not proof of complete coverage.',
     ]
-    # Keep coverage and stop information ahead of potentially long transcripts
-    # in the display excerpt. The full file remains available for the review.
+    # The full file is for this role. Its handoff must remain valid JSON even
+    # when upstream commands include long scripts or page responses.
     output = json.dumps({key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
         'distinct_target_observations', 'seconds_without_target_progress',
@@ -277,4 +318,4 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
     ) if key in result}, ensure_ascii=True)
     (directory / 'artex-results.json').write_text(output)
     return record('artex-engine', VERSION, ['/opt/artex/artex', *scope['origins']], started,
-                  timestamp, list(dict.fromkeys(refs)), output, exit_code=code, failure=failure)
+                  timestamp, list(dict.fromkeys(refs)), receipt_summary(result, output), exit_code=code, failure=failure)
