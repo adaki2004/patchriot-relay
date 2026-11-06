@@ -18,7 +18,14 @@ MAX_REQUEST = 65536
 wire_out = sys.stdout
 wire_lock = threading.Lock()
 transaction_lock = threading.Lock()
+bridge_stopping = threading.Event()
+engine_stopping = threading.Event()
+engine_stop_reason = None
 request_id = 0
+
+
+class MessageTooLarge(RuntimeError):
+    """The request is valid JSON but exceeds the local transport allowance."""
 
 
 def website_input(stream, directory, source=False):
@@ -36,6 +43,19 @@ def website_input(stream, directory, source=False):
     (directory / ("source.json" if source else "snapshot.json")).write_bytes(snapshot)
     (directory / "previous.json").write_text(json.dumps(task["previous_reports"], ensure_ascii=False))
     return task["role"]
+
+
+def configure_compression(home, model, bridge):
+    """Compress before large tool results fill the 64K conversation window."""
+    with (home / 'config.yaml').open('a') as config:
+        # Hermes raises percentage-only thresholds for smaller models. An
+        # absolute trigger leaves room for tool results and the final answer.
+        # Exact evidence stays in the task files; summaries are not citations.
+        config.write('compression:\n  enabled: true\n  threshold_tokens: 32000\n'
+                     'auxiliary:\n  compression:\n    provider: custom\n    model: '
+                     + json.dumps(model) + '\n    base_url: '
+                     + json.dumps(bridge + '/patchriot/summary/v1')
+                     + '\n    api_key: local-bridge\n    reasoning_effort: low\n')
 
 
 def website_prompt(role):
@@ -100,7 +120,7 @@ def inspect_website(source=False):
 def send(value):
     encoded = json.dumps(value, ensure_ascii=True)
     if len(encoded.encode()) > MAX_REQUEST:
-        raise RuntimeError("adapter message exceeds its limit")
+        raise MessageTooLarge("adapter message exceeds its limit")
     with wire_lock:
         wire_out.write(encoded + "\n")
         wire_out.flush()
@@ -108,6 +128,21 @@ def send(value):
 
 def event(kind, **data):
     send({"type": "event", "event": kind, "data": data})
+
+
+def finish_result(browser=None, **data):
+    # Pages can poll while the agent is composing its final answer. Stop new
+    # requests, close the browser and drain the current response before the
+    # terminal event; the relay correctly rejects requests after that event.
+    bridge_stopping.set()
+    if browser:
+        try:
+            browser.close()
+        except Exception:
+            data['completed'] = False
+            data['cleanup_error'] = 'browser_cleanup_unconfirmed'
+    with transaction_lock:
+        event("result", **data)
 
 
 def execution_budget(value):
@@ -127,19 +162,55 @@ class Bridge(BaseHTTPRequestHandler):
     def do_POST(self):
         self.exchange()
 
+    def size_error(self):
+        """Let Hermes compact oversized input instead of retrying an outage.
+
+        This reply precedes any pipe write or model call. The byte ceiling is
+        unchanged, and no prompt text is included in the error.
+        """
+        global engine_stop_reason
+        if self.path == '/patchriot/artex/v1/chat/completions':
+            engine_stop_reason = 'model_request_rejected'
+            engine_stopping.set()
+        body = json.dumps({'error':{'type':'invalid_request_error', 'code':'request_too_large',
+            'message':'Request exceeds the bridge size limit. Compact the conversation before retrying.'}}).encode()
+        self.send_response(413)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+
     def exchange(self):
-        global request_id
+        global request_id, engine_stop_reason
         self.close_connection = True
         try:
+            if bridge_stopping.is_set():
+                return self.send_error(503)
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > MAX_REQUEST or self.headers.get("Transfer-Encoding"):
+            if length < 0 or self.headers.get("Transfer-Encoding"):
                 return self.send_error(400)
+            if length > MAX_REQUEST:
+                return self.size_error()
             body = json.loads(self.rfile.read(length)) if length else None
             with transaction_lock:
+                if bridge_stopping.is_set():
+                    return self.send_error(503)
+                if self.path.startswith('/patchriot/artex/') and engine_stopping.is_set():
+                    # A queued engine call must not spend the reviewer's time
+                    # after discovery has stopped. Drain any in-flight reply
+                    # normally; never let the next caller consume its frames.
+                    return self.send_error(429)
                 request_id += 1
                 request = {"id": request_id, "method": self.command, "path": self.path, "body": body}
-                send({"type": "request", "request": request})
-                disconnected = False
+                try:
+                    send({"type": "request", "request": request})
+                except MessageTooLarge:
+                    # HTTP bytes fit, but JSON escaping and the wire envelope
+                    # can be larger. Nothing has entered the broker yet.
+                    return self.size_error()
+                disconnected, engine_error = False, False
+                error_body = bytearray()
                 while True:
                     line = sys.stdin.buffer.readline(MAX_REQUEST + 1)
                     if not line or len(line) > MAX_REQUEST or not line.endswith(b"\n"):
@@ -150,6 +221,11 @@ class Bridge(BaseHTTPRequestHandler):
                     try:
                         if frame["type"] == "start":
                             status, content_type = frame["status"], frame["content_type"]
+                            if self.path == '/patchriot/artex/v1/chat/completions' and status >= 400:
+                                engine_error = True
+                            elif self.path == '/patchriot/artex/http' and status == 429:
+                                engine_stop_reason = 'target_request_budget'
+                                engine_stopping.set()
                             if not disconnected:
                                 self.send_response(status)
                                 self.send_header("Content-Type", content_type)
@@ -157,10 +233,23 @@ class Bridge(BaseHTTPRequestHandler):
                                 self.end_headers()
                         elif frame["type"] == "chunk":
                             chunk = bytes.fromhex(frame["hex"])
+                            if engine_error and len(error_body) <= 4096:
+                                error_body.extend(chunk[:4097 - len(error_body)])
                             if not disconnected:
                                 self.wfile.write(chunk)
                                 self.wfile.flush()
                         elif frame["type"] == "end":
+                            if engine_error:
+                                engine_stop_reason = 'model_request_rejected'
+                                try:
+                                    # Fixed broker reason codes only. A provider
+                                    # error is not ordinary budget exhaustion.
+                                    reason = json.loads(error_body).get('error')
+                                    if reason == 'engine_budget_reached':
+                                        engine_stop_reason = 'model_budget'
+                                except (ValueError, AttributeError):
+                                    pass
+                                engine_stopping.set()
                             return
                         else:
                             raise RuntimeError("model request failed")
@@ -198,7 +287,7 @@ def main():
     # The pilot has only a small local toolset. Expose those schemas directly;
     # an extra discovery/wrapper tool confused CPU models in the owned checks.
     (home / "config.yaml").write_text(
-        'model:\n  ollama_num_ctx: 64000\ntools:\n  tool_search:\n    enabled: "off"\n'
+        'model:\n  context_length: 64000\n  ollama_num_ctx: 64000\ntools:\n  tool_search:\n    enabled: "off"\n'
     )
     if role:
         # The snapshot is already collected. Generic model-specific instructions
@@ -213,41 +302,62 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     os.environ["PATCHRIOT_BRIDGE_URL"] = f"http://127.0.0.1:{server.server_port}"
     if live:
+        # Use the same broker, pinned model, privacy policy and shared budget.
+        # The separate route lets the relay use low reasoning for summaries.
+        configure_compression(home, model, os.environ['PATCHRIOT_BRIDGE_URL'])
+    browser = None
+    if live:
         import web_tools
         event("phase", name="scoped_tools")
         scope = json.loads(Path("/work/scope.json").read_text())["scope"]
         tools = web_tools.run(scope, json.loads(Path("/work/previous.json").read_text()),
                               emit=lambda result: event("live_tool", run=result), role=role)
-        if live_review.runs_discovery(role) and "artex_engine_v1" in scope.get("tools", []):
+        # Browser sign-in happens in Hermes below. This initial engine pass has
+        # public-route coverage for browser-login scopes, not a signed-in session.
+        if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
+               for p in tools['discovery_plan']):
             import artex
             # Keep at least four minutes for the review and final report. ARTEX
             # also shares the relay's total model and target-request allowances.
             event("phase", name="artex_engine")
             engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
-            result = artex.run(scope, role, engine_deadline, model=model)
+            try:
+                result = artex.run(scope, role, engine_deadline, model=model,
+                                   stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
+                                   emit=lambda result: event("live_tool", run=result))
+            finally:
+                engine_stopping.set()
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)
-    from run_agent import AIAgent
-    observed = []
-
-    def complete(*args, **kwargs):
-        observed.append(args)
-        event("tool_complete", args=args, kwargs=kwargs)
-
-    agent = AIAgent(
-        model=model, provider="custom", api_mode="chat_completions",
-        base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-        enabled_toolsets=[] if source else ["terminal"], max_iterations=160 if live else 3, max_tokens=8192 if live else (512 if role else 192),
-        reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
-        request_overrides={} if live else {"reasoning_effort": "none"},
-        quiet_mode=True, skip_context_files=True, skip_memory=True,
-        skip_background_review=True, checkpoints_enabled=False,
-        run_budget_seconds=max(1, budget - 30 - int(time.monotonic() - started)), cwd="/work",
-        tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
-        tool_complete_callback=complete,
-    )
+        if scope.get("browser_login") is not None:
+            from browser_access import BrowserRunner
+            browser = BrowserRunner(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
+            os.environ["BROWSER_CDP_URL"] = browser.cdp
+    agent = None
     try:
+        from run_agent import AIAgent
+        observed = []
+
+        def complete(*args, **kwargs):
+            observed.append(args)
+            event("tool_complete", args=args, kwargs=kwargs)
+
+        agent = AIAgent(
+            model=model, provider="custom", api_mode="chat_completions",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
+            # The relay asks for the final report before its 200-call ceiling.
+            # A smaller Hermes turn limit can interrupt that handoff and emit a
+            # failed partial summary. Time, HTTP and money limits stay in Rust.
+            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=200 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+            reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
+            request_overrides={} if live else {"reasoning_effort": "none"},
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            skip_background_review=True, checkpoints_enabled=False,
+            run_budget_seconds=max(1, budget - 30 - int(time.monotonic() - started)), cwd="/work",
+            tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
+            tool_complete_callback=complete,
+        )
         if source and (agent.tools or agent.valid_tool_names):
             raise RuntimeError("source review requires an empty model toolset")
         event("phase", name="agent_ready")
@@ -258,7 +368,7 @@ def main():
             "Report only observed output. Do not edit files, install anything or access the network."
         )
         if live:
-            prompt = live_review.prompt(role) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            prompt = live_review.prompt(role, browser=browser is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         regression = False
         for args in observed:
@@ -274,12 +384,17 @@ def main():
             except (ValueError, KeyError, TypeError, IndexError):
                 pass
         completed = result.get("completed") is True and not result.get("failed")
-        event("result", completed=completed, observed_fixture_regression=regression,
-              final_response=result.get("final_response"), api_calls=result.get("api_calls"))
+        finished_browser, browser = browser, None
+        finish_result(finished_browser, completed=completed, observed_fixture_regression=regression,
+                      final_response=result.get("final_response"), api_calls=result.get("api_calls"))
         if (not role and not regression) or not completed:
             raise SystemExit(1)
     finally:
-        agent.close()
+        bridge_stopping.set()
+        if agent:
+            agent.close()
+        if browser:
+            browser.close()
         server.shutdown()
 
 

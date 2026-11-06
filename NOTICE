@@ -9,6 +9,10 @@ The public worker's contributor lifecycle informed pairing, capability checks an
 
 Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their own licenses and notices; the Patchriot license does not replace them. This includes the separately Apache-2.0-licensed patchriot-protocol crate, Ed25519 implementation, HTTP/TLS client and operating-system bindings. Preserve the selected dependency licenses when distributing binaries.
 
+Playwright — Microsoft Corporation, Apache-2.0
+https://github.com/microsoft/playwright/tree/v1.60.0
+The Python controller uses playwright 1.60.0 to retain Chromium's namespace sandbox inside the unprivileged container. The complete license is in licenses/playwright-LICENSE.txt. Chromium is distributed by Debian with its package copyright and license notices in the agent image.
+
 Linux release binaries statically link musl 1.2.5; its complete copyright notice is preserved in licenses/musl-COPYRIGHT (https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT?h=v1.2.5). Release archives also include Rust standard-library notices from the pinned toolchain and the dependency license texts.
 
 OpenSSL 3 — https://www.openssl.org/
@@ -51,6 +55,16 @@ MIT license. The agent image downloads the pinned, checksum-verified release.
 Its upstream copyright and full license are retained at /usr/share/licenses/nuclei/LICENSE.md.
 The three selected templates are authored here; no upstream template pack is bundled.
 
+ARES — Mafifrizi, MIT license
+https://github.com/Mafifrizi/ARES/tree/d09251374a82042f2d8069818febcb08289aa3d5
+agent/ares_web.py adapts the path, header and response-body signatures from ares/modules/network/http_fingerprint.py. Copyright (c) 2026 Mafifrizi. The full license is in agent/ares-LICENSE.txt and /usr/share/licenses/ares/LICENSE in the agent image. Patchriot supplies its own bounded broker transport, missing-path controls and observation handling; the upstream framework and automatic severity assignments are not included. No endorsement is implied.
+
 ARTEX — Autumn-27; English fork BaaRai/ARTEX
 https://github.com/BaaRai/ARTEX/tree/9ebc8b6703ead14dc83979d44a4bc482d36cecd8
 AGPL-3.0. The optional agent image builds the full, unmodified upstream Go engine from a checksum-verified source archive. Its license and corresponding source are retained at /usr/share/licenses/artex; the archive includes upstream dependency manifests and notices. The engine uses BaaRai/Norma v0.4.4 as pinned by those manifests. Patchriot's separate adapter restricts execution and target access; it does not replace the upstream planner. A container-local service and disposable database are started only for an approved engine selection. The image includes the bundled skills, not every optional external tool they mention.
+
+Browser AppArmor and seccomp profiles derive from Moby profiles (4b8214fc4971e06172938a1f1554ccff6647ee80), Apache-2.0. Copyright The Moby Authors. Modified to permit Chromium user namespaces and chroot inside them inside the otherwise restricted container. License: licenses/moby-profiles-LICENSE.txt.
+
+agent-browser 0.26.0 — Vercel, Inc., Apache-2.0
+https://github.com/vercel-labs/agent-browser
+The agent image includes the checksum-verified npm distribution used by pinned Hermes, including its license at /opt/agent-browser/LICENSE. It attaches to the scoped Chromium instance and is not installed at task runtime.

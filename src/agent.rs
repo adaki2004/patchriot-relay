@@ -34,6 +34,25 @@ pub mod source;
 pub mod website;
 
 const IMAGE_ENTRY: [&str; 2] = ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"];
+const BROWSER_SECCOMP: &str = include_str!("../agent/browser-seccomp.json");
+
+fn security_options(options: &Value, browser: bool) -> bool {
+    if !browser {
+        return *options == json!(["no-new-privileges"]);
+    }
+    let Some(values) = options.as_array() else {
+        return false;
+    };
+    values.len() == 3
+        && values.iter().any(|v| v == "no-new-privileges")
+        && values.iter().any(|v| v == "apparmor=patchriot-browser-v1")
+        && values.iter().filter_map(Value::as_str).any(|value| {
+            value
+                .strip_prefix("seccomp=")
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                == serde_json::from_str::<Value>(BROWSER_SECCOMP).ok()
+        })
+}
 const TMPFS: [(&str, &str); 3] = [
     (
         "/opt/data",
@@ -71,6 +90,10 @@ pub struct Settings {
     live_provider_key_file: Option<PathBuf>,
     #[serde(default)]
     venice_fallback_key_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secondary_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secondary_key_file: Option<PathBuf>,
     #[serde(default = "default_agent_attempt_seconds")]
     max_attempt_seconds: u64,
 }
@@ -114,20 +137,26 @@ impl Settings {
         let docker = Docker::new(&self.docker_socket)?;
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
-            || !["2", "3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
+            || ![
+                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+            ]
+            .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-                && !["3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
+                && ![
+                    "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                ]
+                .contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                         .as_str()
                         .unwrap_or(""),
                 )
         {
             return Err(
-                "website reviews require adapter 2–11; longer CPU budgets require adapter 3–11"
+                "website reviews require adapter 2–15; longer CPU budgets require adapter 3–15"
                     .into(),
             );
         }
@@ -144,22 +173,31 @@ impl Settings {
         if let Some(path) = &self.venice_fallback_key_file {
             live::read_provider_key(path)?;
         }
+        if let Some(path) = &self.secondary_key_file {
+            live::read_provider_key(path)?;
+        }
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
-        if patchriot_protocol::pentests::LiveProvider::from_model(&self.model)
-            == Some(patchriot_protocol::pentests::LiveProvider::Venice)
-            && image["Config"]["Labels"]["io.patchriot.agent-adapter"] != "11"
-        {
-            return Err("Venice live tests require adapter 11".into());
+        if matches!(
+            patchriot_protocol::pentests::LiveProvider::from_model(&self.model),
+            Some(
+                patchriot_protocol::pentests::LiveProvider::Venice
+                    | patchriot_protocol::pentests::LiveProvider::VeniceDeepSeek
+            )
+        ) && !matches!(
+            image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+            Some("11" | "12" | "13" | "14" | "15")
+        ) {
+            return Err("Venice live tests require adapter 11–15".into());
         }
         if self.live_provider_key_file.is_none()
             || image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("5" | "6" | "7" | "8" | "9" | "10" | "11")
+                Some("5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
             )
         {
             return Err(
-                "live tests require the inspected adapter 5–11 and a private provider key file"
+                "live tests require the inspected adapter 5–15 and a private provider key file"
                     .into(),
             );
         }
@@ -173,6 +211,26 @@ impl Settings {
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
         Ok(
             if matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("12" | "13" | "14" | "15")
+            ) {
+                let mut tools = vec![
+                    patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1,
+                    patchriot_protocol::pentests::LiveToolProfile::ActiveWebV1,
+                    patchriot_protocol::pentests::LiveToolProfile::ActiveWebV2,
+                    patchriot_protocol::pentests::LiveToolProfile::AuthenticatedHttpV1,
+                    patchriot_protocol::pentests::LiveToolProfile::SessionLoginV1,
+                    patchriot_protocol::pentests::LiveToolProfile::FormDiscoveryV1,
+                    patchriot_protocol::pentests::LiveToolProfile::WalletLoginV1,
+                ];
+                if matches!(
+                    image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                    Some("13" | "14" | "15")
+                ) {
+                    tools.push(patchriot_protocol::pentests::LiveToolProfile::BrowserLoginV1);
+                }
+                tools
+            } else if matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
                 Some("10" | "11")
             ) {
@@ -204,7 +262,7 @@ impl Settings {
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -245,7 +303,50 @@ impl Settings {
         {
             return Err("Venice fallback requires the NEAR primary route".into());
         }
+        settings.validate_secondary()?;
         Ok(settings)
+    }
+
+    fn validate_secondary(&self) -> Result<(), &'static str> {
+        use patchriot_protocol::pentests::LiveProvider;
+        if self.secondary_model.is_some() != self.secondary_key_file.is_some() {
+            return Err("secondary_model and secondary_key_file must be configured together");
+        }
+        if let Some(model) = self.secondary_model.as_deref()
+            && (self.live_provider_key_file.is_none()
+                || self.venice_fallback_key_file.is_some()
+                || !LiveProvider::from_model(&self.model)
+                    .zip(LiveProvider::from_model(model))
+                    .is_some_and(|(primary, secondary)| primary.permits_secondary(secondary)))
+        {
+            return Err("unsupported or conflicting secondary model configuration");
+        }
+        Ok(())
+    }
+
+    fn consented_secondary(
+        &self,
+        context: &patchriot_protocol::pentests::PentestContext,
+    ) -> Result<Option<(patchriot_protocol::pentests::LiveProvider, &Path)>, &'static str> {
+        use patchriot_protocol::pentests::LiveProvider;
+        let primary = LiveProvider::from_model(&self.model).ok_or("unsupported live provider")?;
+        let Some(secondary) = context.secondary_for(primary) else {
+            return Ok(None);
+        };
+        if self.secondary_model.as_deref() == Some(secondary.model()) {
+            return self
+                .secondary_key_file
+                .as_deref()
+                .map(|p| Some((secondary, p)))
+                .ok_or("consented secondary key missing");
+        }
+        if secondary == LiveProvider::VeniceDeepSeek
+            && primary == LiveProvider::NearDeepSeek
+            && let Some(path) = self.venice_fallback_key_file.as_deref()
+        {
+            return Ok(Some((secondary, path)));
+        }
+        Err("configured secondary differs from the consented route")
     }
 }
 
@@ -481,6 +582,7 @@ async fn supervise(
     let (tx, mut rx) = mpsc::channel(4);
     let mut task = RequestTask(None);
     let mut active = None;
+    let mut active_model: Option<(Instant, patchriot_protocol::pentests::LiveModelPurpose)> = None;
     let mut last_id = 0;
     let mut pending = Vec::new();
     let mut out = [0u8; 8192];
@@ -491,6 +593,9 @@ async fn supervise(
     let mut final_seen = false;
     let mut live_phase = patchriot_protocol::pentests::LivePhase::Starting;
     let mut completed_tools = 0u8;
+    let mut retained_output_bytes = 0usize;
+    let mut request_bytes = 0usize;
+    let mut stderr_bytes = 0usize;
     let mut report = AgentRun {
         outcome: "completed",
         failure_reason: None,
@@ -518,14 +623,19 @@ async fn supervise(
                     break;
                 }
                 if let (Bridge::Live(broker), Some(progress)) = (&broker, progress) {
-                    broker.update_progress(progress, live_phase, completed_tools);
+                    let model_request = active_model.map(|(since, purpose)| patchriot_protocol::pentests::LiveModelProgress {
+                        purpose, elapsed_seconds: since.elapsed().as_secs().min(3600) as u32,
+                    });
+                    broker.update_progress(progress, live_phase, completed_tools, model_request);
                 }
             }
             n = stderr.read(&mut err), if err_open => {
                 let n = n?;
                 err_open = n != 0;
                 report.output_bytes += n;
-                if report.output_bytes > broker.output_limit() {
+                stderr_bytes += n;
+                retained_output_bytes += n;
+                if retained_output_bytes > broker.output_limit() {
                     report.outcome = "output_limit";
                     break;
                 }
@@ -534,10 +644,6 @@ async fn supervise(
                 let n = n?;
                 out_open = n != 0;
                 report.output_bytes += n;
-                if report.output_bytes > broker.output_limit() {
-                    report.outcome = "output_limit";
-                    break;
-                }
                 pending.extend_from_slice(&out[..n]);
                 while let Some(end) = pending.iter().position(|&b| b == b'\n') {
                     if end > broker.max_frame() {
@@ -547,6 +653,19 @@ async fn supervise(
                     }
                     let wire = serde_json::from_slice::<Wire>(&pending[..end]);
                     pending.drain(..=end);
+                    // Live request frames carry the conversation again on each
+                    // model call. They are bounded by frame size, request count,
+                    // time and spending limits, and are not retained as output.
+                    // Logs and result/tool events still share the output cap.
+                    if matches!(&broker, Bridge::Live(_)) && matches!(&wire, Ok(Wire::Request { .. })) {
+                        request_bytes += end + 1;
+                    } else {
+                        retained_output_bytes += end + 1;
+                    }
+                    if retained_output_bytes > broker.output_limit() {
+                        report.outcome = "output_limit";
+                        break 'running;
+                    }
                     match wire {
                         Ok(Wire::Request { request }) => {
                             report.requests += 1;
@@ -572,9 +691,11 @@ async fn supervise(
                                 }
                                 if let Err(reason) = broker.chat(&request) {
                                     eprintln!("agent request rejected: {reason}");
-                                    report.outcome = "invalid_model_request";
-                                    report.failure_reason = Some(reason);
-                                    break 'running;
+                                    if !matches!(&broker, Bridge::Live(_) if live::recoverable_engine_error(&request, reason)) {
+                                        report.outcome = "invalid_model_request";
+                                        report.failure_reason = Some(reason);
+                                        break 'running;
+                                    }
                                 }
                                 if request.body.as_ref()
                                     .and_then(|body| body["max_tokens"].as_u64())
@@ -583,7 +704,16 @@ async fn supervise(
                                     eprintln!("runtime output request capped at {} tokens", broker.max_tokens());
                                 }
                                 report.inference_calls += 1;
-                                eprintln!("agent requested model attempt {}", report.inference_calls);
+                                let purpose = if request.path == live::ENGINE_CHAT {
+                                    patchriot_protocol::pentests::LiveModelPurpose::Discovery
+                                } else if request.path == live::SUMMARY_CHAT {
+                                    patchriot_protocol::pentests::LiveModelPurpose::Summary
+                                } else {
+                                    patchriot_protocol::pentests::LiveModelPurpose::Investigation
+                                };
+                                active_model = Some((Instant::now(), purpose));
+                                let messages = request.body.as_ref().and_then(|b| b["messages"].as_array()).map_or(0, Vec::len);
+                                eprintln!("agent requested model attempt {} purpose={purpose:?} messages={messages}", report.inference_calls);
                             }
                             if let Some(previous) = task.0.take() {
                                 previous.abort();
@@ -605,7 +735,8 @@ async fn supervise(
                             if event == "phase" && data["name"] == "agent_ready" {
                                 live_phase = patchriot_protocol::pentests::LivePhase::Investigating;
                             }
-                            if event == "live_tool" && report.inference_calls == 0
+                            if event == "live_tool" && live_phase == patchriot_protocol::pentests::LivePhase::ScopedTools
+                                && data["run"]["exit_code"].is_number()
                                 && matches!(&broker, Bridge::Live(b) if b.valid_tool_record(&data["run"])) {
                                 completed_tools = completed_tools.saturating_add(1).min(16);
                             }
@@ -652,6 +783,9 @@ async fn supervise(
                 }
                 if end {
                     active = None;
+                    if let Some((since, purpose)) = active_model.take() {
+                        eprintln!("agent model reply received: purpose={purpose:?} duration_ms={}", since.elapsed().as_millis());
+                    }
                 }
             }
             status = child.wait(), if !exited => {
@@ -679,12 +813,15 @@ async fn supervise(
     // Log only fixed reason codes and counts. Frames may contain credentials,
     // target responses or private model messages and must not enter the log.
     eprintln!(
-        "agent stopped: outcome={} reason={:?} exit_code={:?} requests={} output_bytes={} inference_attempts={} final_event={} duration_ms={}",
+        "agent stopped: outcome={} reason={:?} exit_code={:?} requests={} output_bytes={} retained_output_bytes={} stderr_bytes={} request_bytes={} inference_attempts={} final_event={} duration_ms={}",
         report.outcome,
         report.failure_reason,
         report.exit_code,
         report.requests,
         report.output_bytes,
+        retained_output_bytes,
+        stderr_bytes,
+        request_bytes,
         report.inference_calls,
         final_seen,
         report.duration_ms,
@@ -692,7 +829,19 @@ async fn supervise(
     Ok(report)
 }
 
+#[cfg(test)]
 fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: bool) -> bool {
+    browser_policy(container, image, args, seconds, engine, false)
+}
+
+fn browser_policy(
+    container: &Value,
+    image: &str,
+    args: &[&str],
+    seconds: u64,
+    engine: bool,
+    browser: bool,
+) -> bool {
     let h = &container["HostConfig"];
     let c = &container["Config"];
     container["Image"] == image
@@ -703,11 +852,13 @@ fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: b
         && h["Init"] == true
         && h["CapDrop"] == json!(["ALL"])
         && no_entries(&h["CapAdd"])
-        && h["SecurityOpt"] == json!(["no-new-privileges"])
+        && security_options(&h["SecurityOpt"], browser)
+        && (!browser || container["AppArmorProfile"] == "patchriot-browser-v1")
         && h["Memory"] == 2_147_483_648u64
         && h["MemorySwap"] == 2_147_483_648u64
         && h["NanoCpus"] == 2_000_000_000u64
-        && h["PidsLimit"] == 128
+        && h["PidsLimit"] == if browser { 256 } else { 128 }
+        && (!browser || h["ShmSize"] == 268435456u64)
         && h["CgroupnsMode"] == "private"
         && h["PidMode"] == ""
         && h["IpcMode"] == "private"
@@ -787,13 +938,19 @@ pub fn run(
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
-        || !["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
+        || ![
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+        ]
+        .contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                 .as_str()
                 .unwrap_or(""),
         )
         || website.is_some()
-            && !["2", "3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
+            && ![
+                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+            ]
+            .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -801,14 +958,14 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11")
+                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
             )
         || live
             .as_ref()
             .is_some_and(|task| !task.evidence.context.scope.tools.is_empty())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("7" | "8" | "9" | "10" | "11")
+                Some("7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
             )
         || live.as_ref().is_some_and(|task| {
             task.evidence
@@ -819,17 +976,37 @@ pub fn run(
                 .any(|tool| *tool != patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
         }) && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("8" | "9" | "10" | "11")
+            Some("8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
         )
         || live
             .as_ref()
             .is_some_and(|task| task.evidence.context.scope.session_login.is_some())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("10" | "11")
+                Some("10" | "11" | "12" | "13" | "14" | "15")
             )
+        || live
+            .as_ref()
+            .is_some_and(|task| task.evidence.context.scope.wallet_login.is_some())
+            && !matches!(
+                image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                Some("12" | "13" | "14" | "15")
+            )
+        || live.as_ref().is_some_and(|task| {
+            task.evidence
+                .context
+                .scope
+                .tools
+                .contains(&patchriot_protocol::pentests::LiveToolProfile::ActiveWebV2)
+        }) && !matches!(
+            image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+            Some("12" | "13" | "14" | "15")
+        )
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
-            && !["3", "4", "5", "6", "7", "8", "9", "10", "11"].contains(
+            && ![
+                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+            ]
+            .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
                     .as_str()
                     .unwrap_or(""),
@@ -838,6 +1015,15 @@ pub fn run(
         || !no_entries(&image["Config"]["Healthcheck"])
     {
         return Err("build the pinned agent/Dockerfile image before this check".into());
+    }
+    let browser = live.is_some_and(|task| task.evidence.context.scope.browser_login.is_some());
+    if browser
+        && !matches!(
+            image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+            Some("13" | "14" | "15")
+        )
+    {
+        return Err("browser login requires the inspected adapter 13–15 image".into());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -863,11 +1049,7 @@ pub fn run(
                     })
                     .min(Instant::now() + Duration::from_secs(settings.max_attempt_seconds)),
                 task.evidence.credentials.as_ref(),
-                if task.evidence.context.allows_venice_fallback {
-                    settings.venice_fallback_key_file.as_deref()
-                } else {
-                    None
-                },
+                settings.consented_secondary(&task.evidence.context)?,
             )
         })
         .transpose()?;
@@ -990,6 +1172,26 @@ pub fn run(
             .tools
             .contains(&patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
     });
+    // This is a reviewed profile embedded in the binary, never a page or model
+    // supplied path. Keep its file alive until Docker has read it at creation.
+    let _browser_seccomp = if browser {
+        let mut file = tempfile::NamedTempFile::new()?;
+        std::io::Write::write_all(&mut file, BROWSER_SECCOMP.as_bytes())?;
+        command.extend([
+            "--security-opt".into(),
+            format!("seccomp={}", file.path().display()),
+            "--security-opt=apparmor=patchriot-browser-v1".into(),
+            "--shm-size=256m".into(),
+        ]);
+        let pids = command
+            .iter()
+            .position(|arg| arg == "--pids-limit")
+            .ok_or("missing process limit")?;
+        command[pids + 1] = "256".into();
+        Some(file)
+    } else {
+        None
+    };
     for (path, options) in temporary_storage(engine) {
         command.extend(["--tmpfs".into(), format!("{path}:{options}")]);
     }
@@ -1003,12 +1205,13 @@ pub fn run(
         {
             return Err("agent container creation failed".into());
         }
-        if !policy(
+        if !browser_policy(
             &docker.inspect("container", &owned.name)?,
             &settings.image,
             &args,
             settings.max_attempt_seconds,
             engine,
+            browser,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -1205,6 +1408,8 @@ mod tests {
         Settings {
             live_provider_key_file: None,
             venice_fallback_key_file: None,
+            secondary_model: None,
+            secondary_key_file: None,
             docker_socket: "/var/run/docker.sock".into(),
             image: format!("sha256:{}", "b".repeat(64)),
             model_url: "http://127.0.0.1:11434".into(),
@@ -1408,6 +1613,54 @@ mod tests {
         })
     }
     #[test]
+    fn browser_policy_adds_its_sandbox_without_allowing_host_access() {
+        let mut value = container();
+        value["AppArmorProfile"] = json!("patchriot-browser-v1");
+        value["HostConfig"]["PidsLimit"] = json!(256);
+        value["HostConfig"]["ShmSize"] = json!(268435456);
+        value["HostConfig"]["SecurityOpt"] = json!([
+            "no-new-privileges",
+            "apparmor=patchriot-browser-v1",
+            format!("seccomp={BROWSER_SECCOMP}")
+        ]);
+        assert!(browser_policy(
+            &value,
+            "owned-image",
+            &["owned-model"],
+            600,
+            false,
+            true
+        ));
+        for (path, change) in [
+            ("/AppArmorProfile", json!("unconfined")),
+            (
+                "/HostConfig/SecurityOpt",
+                json!(["no-new-privileges", "seccomp=unconfined"]),
+            ),
+            ("/HostConfig/NetworkMode", json!("host")),
+            ("/HostConfig/IpcMode", json!("host")),
+            ("/HostConfig/Privileged", json!(true)),
+            ("/HostConfig/ReadonlyRootfs", json!(false)),
+            ("/Config/User", json!("root")),
+        ] {
+            let mut changed = value.clone();
+            *changed.pointer_mut(path).unwrap() = change;
+            assert!(
+                !browser_policy(&changed, "owned-image", &["owned-model"], 600, false, true),
+                "{path}"
+            );
+        }
+        value["HostConfig"]["CapAdd"] = json!(["SYS_ADMIN"]);
+        assert!(!browser_policy(
+            &value,
+            "owned-image",
+            &["owned-model"],
+            600,
+            false,
+            true
+        ));
+    }
+    #[test]
     fn docker_configuration_must_preserve_the_execution_boundary() {
         assert!(policy(
             &container(),
@@ -1549,6 +1802,39 @@ mod tests {
     }
 
     #[test]
+    fn secondary_settings_require_an_exact_pair_and_cannot_override_saved_consent() {
+        use patchriot_protocol::pentests::{LiveProvider, PentestContext};
+        for (primary, secondary) in [
+            (LiveProvider::NearDeepSeek, LiveProvider::VeniceDeepSeek),
+            (LiveProvider::VeniceDeepSeek, LiveProvider::NearDeepSeek),
+        ] {
+            let mut settings = settings();
+            settings.model = primary.model().into();
+            settings.live_provider_key_file = Some("/private/primary.key".into());
+            settings.secondary_model = Some(secondary.model().into());
+            assert!(settings.validate_secondary().is_err());
+            settings.secondary_key_file = Some("/private/secondary.key".into());
+            assert!(settings.validate_secondary().is_ok());
+            let mut context: PentestContext = serde_json::from_value(json!({"pentest_id":uuid::Uuid::nil(),"scope":{"origins":["https://example.com"],"methods":["GET"]},"scope_sha256":"a".repeat(64),"reviewers":[],"provider":primary.name()})).unwrap();
+            assert!(
+                settings.consented_secondary(&context).unwrap().is_none(),
+                "a configured key does not grant permission"
+            );
+            context.fallback_model = Some(secondary.model().into());
+            assert_eq!(
+                settings.consented_secondary(&context).unwrap().unwrap().0,
+                secondary
+            );
+            settings.secondary_model = Some(primary.model().into());
+            assert!(settings.validate_secondary().is_err());
+            assert!(settings.consented_secondary(&context).is_err());
+            settings.secondary_model = Some(secondary.model().into());
+            settings.venice_fallback_key_file = Some("/private/legacy.key".into());
+            assert!(settings.validate_secondary().is_err());
+        }
+    }
+
+    #[test]
     fn hosted_model_configuration_requires_the_matching_fixed_provider() {
         use patchriot_protocol::pentests::LiveProvider;
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1558,6 +1844,7 @@ mod tests {
             LiveProvider::Abliteration,
             LiveProvider::Venice,
             LiveProvider::NearDeepSeek,
+            LiveProvider::VeniceDeepSeek,
         ] {
             input["model"] = json!(provider.model());
             input["model_url"] = json!(provider.api_url());

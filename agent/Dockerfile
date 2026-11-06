@@ -16,10 +16,21 @@ RUN /opt/hermes/.venv/bin/python /tmp/install_nuclei.py
 FROM base
 USER root
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    postgresql-17 curl wget jq ripgrep git dnsutils nmap netcat-openbsd ffuf sqlmap \
+    postgresql-17 curl wget jq ripgrep git dnsutils nmap netcat-openbsd ffuf sqlmap chromium \
     && rm -rf /var/lib/apt/lists/* /var/lib/postgresql/17/main \
     && mkdir -p /opt/artex /usr/share/licenses/artex \
     && ln -s /work/artex-auth/jwt.key /opt/artex/jwt.key
+RUN /opt/hermes/.venv/bin/python -m ensurepip --upgrade && \
+    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir playwright==1.60.0
+# Match the pinned Hermes manifest. Install at build time; task containers have
+# no network/package installation and attach only to our scoped Chromium.
+ADD --checksum=sha256:8a48cf4110d7dc2c12c1c4d6d25e0babdfa31604b537f05df0dc835fe2f854bf https://registry.npmjs.org/agent-browser/-/agent-browser-0.26.0.tgz /tmp/agent-browser.tgz
+RUN mkdir -p /opt/agent-browser && \
+    tar -xzf /tmp/agent-browser.tgz -C /opt/agent-browser --strip-components=1 && \
+    case "$(dpkg --print-architecture)" in amd64) browser_arch=x64 ;; arm64) browser_arch=arm64 ;; *) exit 1 ;; esac && \
+    chmod 755 "/opt/agent-browser/bin/agent-browser-linux-${browser_arch}" && \
+    ln -s "/opt/agent-browser/bin/agent-browser-linux-${browser_arch}" /usr/local/bin/agent-browser && \
+    rm /tmp/agent-browser.tgz
 COPY --from=scanner /usr/local/bin/nuclei /usr/local/bin/nuclei
 COPY --from=scanner /usr/share/licenses/nuclei /usr/share/licenses/nuclei
 COPY --from=engine /out/artex /opt/artex/artex
@@ -27,10 +38,12 @@ COPY --from=engine /src/skills /opt/artex/skills
 COPY --from=engine /src/LICENSE /usr/share/licenses/artex/LICENSE
 COPY --from=engine /tmp/artex.tar.gz /usr/share/licenses/artex/corresponding-source.tar.gz
 COPY --from=engine /out/dependency-source.tar.gz /usr/share/licenses/artex/dependency-source.tar.gz
-COPY adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py baseline.py artex.py /patchriot/
+COPY adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py baseline.py artex.py ares_web.py /patchriot/
+COPY ares-LICENSE.txt /usr/share/licenses/ares/LICENSE
+COPY browser_access.py browser_wallet.js test_browser_access.py /patchriot/
 COPY templates /patchriot/templates
 USER 65534:65534
 WORKDIR /work
 ENV HOME=/opt/data HERMES_HOME=/opt/data/hermes PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/hermes TERMINAL_ENV=local TERMINAL_CWD=/work HERMES_API_TIMEOUT=540 NORMA_RIPGREP_NO_INSTALL=1
-LABEL io.patchriot.agent-adapter="11"
+LABEL io.patchriot.agent-adapter="15"
 ENTRYPOINT ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"]

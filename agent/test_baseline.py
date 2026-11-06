@@ -8,6 +8,19 @@ from web_tools import record
 
 
 class BaselineTests(unittest.TestCase):
+    def test_login_redirect_is_proof_only_for_the_declared_same_origin_page(self):
+        scope = {"session_login": {"path": "/login", "format": "discover_form"}}
+        evidence = {"url": "https://owned.example/private", "status": 302, "headers": {"location": "/login?next=%2Fprivate"}}
+        self.assertTrue(baseline.denied_anonymous(scope, evidence))
+        for location in ["https://foreign.example/login", "//foreign.example/login", "/maintenance", "https://user@owned.example/login"]:
+            evidence["headers"]["location"] = location
+            self.assertFalse(baseline.denied_anonymous(scope, evidence))
+        evidence["headers"]["location"] = "/login"
+        evidence["status"] = 200
+        self.assertFalse(baseline.denied_anonymous(scope, evidence))
+        evidence["status"] = 403
+        self.assertTrue(baseline.denied_anonymous(scope, evidence))
+
     def run_fixture(self, vulnerable=False, soft404=False, authenticated=False, broken=False):
         calls = []
         def fetch(method, url, headers=None, authenticated=True):

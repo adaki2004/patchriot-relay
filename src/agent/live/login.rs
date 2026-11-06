@@ -5,9 +5,9 @@ use scraper::{Html, Selector};
 
 impl LiveBroker {
     pub(super) async fn ensure_session(&self) -> Result<(), &'static str> {
-        let Some(login) = &self.scope.session_login else {
+        if self.scope.session_login.is_none() && self.scope.wallet_login.is_none() {
             return Ok(());
-        };
+        }
         let mut outcome = self.login_state.lock().await;
         if let Some(result) = *outcome {
             return result;
@@ -15,7 +15,17 @@ impl LiveBroker {
         // Cancellation or a dropped connection must not trigger more password
         // submissions. A new assessment is needed to try a different account.
         *outcome = Some(Err("login_not_completed"));
-        let result = self.start_session(login).await;
+        let result = if let Some(login) = &self.scope.wallet_login {
+            self.start_wallet_session(login).await
+        } else {
+            self.start_session(
+                self.scope
+                    .session_login
+                    .as_ref()
+                    .ok_or("invalid_login_scope")?,
+            )
+            .await
+        };
         *outcome = Some(result);
         result
     }
@@ -53,7 +63,7 @@ impl LiveBroker {
             if automatic {
                 (resolved, hidden) = discover_form(&page, reply["body"].as_str().unwrap_or(""))?;
                 for value in hidden.values().filter(|value| !value.is_empty()) {
-                    self.access.remember_secret(value.clone());
+                    self.access.remember_secret(value.clone())?;
                 }
             } else if let Some(name) = &login.csrf_field {
                 let submit = public_url(&format!("{origin}{}", login.path))?;
@@ -64,7 +74,7 @@ impl LiveBroker {
                     reply["body"].as_str().unwrap_or(""),
                     name,
                 )?;
-                self.access.remember_secret(token.clone());
+                self.access.remember_secret(token.clone())?;
                 hidden.insert(name.clone(), token);
             }
         }
@@ -401,6 +411,40 @@ mod tests {
             "session_login":{"format":"discover_form","path":"/login"}
         })).unwrap().normalized().unwrap();
         (broker, server)
+    }
+
+    #[tokio::test]
+    async fn patchriot_login_page_is_discovered_without_browser_javascript() {
+        // Exercise the HTML shipped by our sibling core checkout, rather than
+        // an invented form. Core separately tests its session and 401 boundary.
+        let html =
+            std::fs::read_to_string("../patchriot-core/crates/server/src/login_page.html").unwrap();
+        let (mut broker, server) = automatic_fixture(vec![
+            response("200 OK", "", &html),
+            response("303 See Other", "Location: /account\r\nSet-Cookie: __Host-patchriot_session=fixture-account-cookie; Secure; HttpOnly; Path=/\r\n", ""),
+            response("200 OK", "", r#"{"account":{"display_name":"Owned fixture"}}"#),
+            response("401 Unauthorized", "", r#"{"error":"sign_in_required"}"#),
+        ]).await;
+        Arc::get_mut(&mut broker).unwrap().scope.auth_check_path = Some("/api/account".into());
+        let signed = broker
+            .http(json!({"method":"GET","url":"https://owned.example/api/account"}))
+            .await
+            .unwrap();
+        assert_eq!(signed["evidence"]["status"], 200);
+        let anonymous=broker.http(json!({"method":"GET","url":"https://owned.example/api/account","authenticated":false})).await.unwrap();
+        assert_eq!(anonymous["evidence"]["status"], 401);
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /login "));
+        assert!(requests[1].starts_with("POST /login "));
+        assert!(requests[1].contains("username=tester%40example.com"));
+        assert!(requests[1].contains("password=fixture-password-only"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("origin: https://owned.example")
+        );
+        assert!(requests[2].contains("fixture-account-cookie"));
+        assert!(!requests[3].to_ascii_lowercase().contains("cookie:"));
     }
 
     #[tokio::test]

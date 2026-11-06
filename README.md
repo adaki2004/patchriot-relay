@@ -4,14 +4,14 @@
 
 The relay connects a managed Kali machine to Patchriot’s dispatcher, starts Hermes in an isolated container and returns its evidence. It is the connection and supervision layer; Hermes is the agent, and the selected model supplies its inference.
 
-[Patchriot ↗](https://patchriot.tech) · [Core](https://github.com/adaki2004/patchriot-core) · [Agent overview](https://patchriot.tech/#/docs/agents)
+[Patchriot ↗](https://patchriot.net) · [Core](https://github.com/adaki2004/patchriot-core) · [Agent overview](https://patchriot.net/#/docs/agents)
 
 ```mermaid
 flowchart LR
     D[Dispatcher: approved assignment] --> R[Relay]
     R --> H[Isolated Hermes + testing tools]
     H -->|Scoped requests| W[Verified web app]
-    H <-->|Through relay| N[NEAR AI Private TEE]
+    H <-->|Approved provider via relay| N[NEAR AI Private TEE or Venice]
     H -->|Recorded evidence| R
     R --> D
 ```
@@ -22,11 +22,39 @@ flowchart LR
 | --- | --- |
 | **Relay / managed Kali** | Device identity, assignments, time and spending limits, target checks, cancellation and cleanup |
 | **Isolated Hermes container** | Investigates the approved target with the permitted tools |
-| **NEAR AI Private TEE** | Processes encrypted model requests; the relay verifies attestation and signed responses |
+| **Configured model provider** | NEAR AI: encrypted requests, attestation and signed responses. Venice: the selected API model. The request records the allowed routes. |
 
-Only the model step runs inside NEAR’s TEE. The agent host and its approved operator still handle assigned content. A consented Venice backup is reported explicitly and has no verified TEE. Containers receive neither host secrets nor unrestricted network access.
+On the NEAR route, only the model step runs inside its TEE. The agent host and approved operator still handle assigned content. Venice is also supported as primary or backup; that API route has no relay-verified TEE. Reports preserve actual routing. Containers receive neither host secrets nor unrestricted network access.
 
-Scout investigates, Recon checks its leads and a third reviewer challenges serious or uncertain findings. Reports list the tools actually run. A matching answer is not proof of a vulnerability or of independent reviewers.
+Scout investigates, Recon checks its leads and a third reviewer challenges serious or uncertain findings. Reports list the tools actually run. An optional check can fail while the agent still returns useful evidence; that gap stays visible. Successful defenses and ordinary behavior belong in the summary, not the vulnerability list. A matching answer is not proof of a vulnerability or of independent reviewers.
+
+Later roles reuse completed discovery records. When ARTEX reaches a time, request, model or progress limit after saving target responses, the next agent uses those records for targeted checks instead of repeating the broad scan. Coverage stays incomplete. Missing discovery or a failed startup can be retried once; older, truncated receipts retain that recovery path. If a role stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.
+
+Discovery includes **ARES-derived web fingerprints** (`ares-web-surface`): at most 24 anonymous reads per approved origin, checking framework hints, common admin paths and recognizable exposed-file/API responses. Reports name the adapted component and pinned source revision. A login page, public API schema, redirect or access denial is not automatically a vulnerability. Missing-path controls and reviewer checks are required. This does not run the full ARES framework or scan server ports. Deploy the matching core and dispatcher protocol before rebuilding these agent images; old receipts and assignments remain supported.
+
+A provider rate limit during discovery ends that engine attempt and preserves its partial evidence for the reviewer. It does not trigger extra model retries or mark discovery complete. The reviewer still needs available inference to produce its assessment; provider authentication and verification failures stop the role.
+
+Conversations still have a transport size limit. If the HTTP body or its encoded message is too large, the local bridge returns a size error so Hermes can compact its history. That rejected input never reaches the model provider; it is not retried as a network outage.
+
+Repeated model-request history does not consume the retained-output allowance. Each request still has its frame, call, time and spending limits; stderr and tool/result events retain their separate cumulative limit. Stop logs record these byte counts without printing prompts or target responses.
+
+Live conversations start compression at 32,000 tokens within the configured 64,000-token window. Summaries are asked to stay under 1,000 words and retain scope, evidence references and unfinished checks; the model's output and spending limits remain enforced separately. The relay reserves up to ten minutes of a role for its report, capped at one third of the role's time allowance, allowing for slow verified model responses and the consented backup. Saved requests remain available after compression; neither a summary nor an unfinished run counts as a verified finding.
+
+**Slow or stalled providers:** each model attempt has a 90-second reply deadline, including NEAR verification. The existing consented backup can run once; both attempts keep their cost reservations if charges are uncertain. Discovery stops after five minutes without a new recorded target observation. Status heartbeats and identical responses to the same method, URL and body do not reset that timer. Collected evidence is kept for the reviewer, and unfinished coverage is shown in the tool receipt. These bounds can interrupt legitimate slow analysis; they do not guarantee a short assessment or complete coverage. Update the relay and agent image together.
+
+Browser status shows when the login window has expired, even while page requests are busy. Reloading cannot renew it. Agents are instructed to preserve any established session, report missing access and continue reachable checks. Managed bot challenges are access limits; agents are instructed not to solve or reverse-engineer them.
+
+The request selects the login method. Supplied-account tests use that account's form; agents are instructed not to divert into wallet or social login. The broker enforces the selected method independently of those instructions.
+
+ARTEX handoffs contain a complete JSON summary, stop reason, evidence references and shortened finding previews. Full engine details remain in the current role's temporary work directory; they are not a permanent transcript archive. NEAR logs separately time attestation, completion and signature checks, including cancelled phases, without printing prompts or responses.
+
+Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.
+
+The reviewer can inspect the exact saved HTTP records from discovery, browser requests and login comparisons before citing a finding. These working copies contain the relay's redacted evidence, never raw session headers or cookies. Reading them does not repeat the requests. Scanner output remains a lead to check, and a completed report is not proof that every claim is correct. Agents are instructed to establish who owns a record before claiming cross-account access; a single supplied account may leave that check unresolved.
+
+The browser reuses explicitly public, immutable scripts, styles, fonts and images within a role. Pages, APIs, login responses and direct probes remain fresh. When the HTTP allowance is spent, browser polling stops and the agent writes its report from collected evidence, with unfinished checks disclosed.
+
+Completed reports are saved before upload. Temporary delivery failures retry the same report while its lease stays active; they never rerun paid inference. Large report uploads have a separate 30-second timeout. Expired or cancelled work cannot be revived by a retry.
 
 > **DON’T TRUST! VERIFY!** Read this source and its dependencies—or ask your own security agent to review them. Inspect the container, network and permission settings before pairing a machine or sharing private work.
 
@@ -322,7 +350,7 @@ Each role starts with a compact scope and prior-findings overview; full transcri
 **Execution boundaries:** the [November ARTEX audit](https://ctiacademy.io/blog/artex-ai-pentest-framework-security-audit) covers a different fork and identifies scope/approval bypasses, an exposed proxy and update risks. Patchriot does not trust the engine’s blacklist or command approval as its security boundary. The agent has no external network; target traffic crosses the host-side origin/method/IP checks. The recording proxy is explicitly disabled, the admin API binds to container loopback, and the engine binary is read-only. Custom tools can still act inside their disposable container, so no host files, keys or container-management socket are mounted. The real-image smoke test checks non-root execution, loopback-only networking, dropped capabilities, no-new-privileges, binary permissions and the absent proxy alongside the auth regressions. These are bounded checks, not an audit of every engine tool.
 
 
-The selected engine gets a 512 MiB temporary `/work` directory for disposable PostgreSQL, within the same 2 GiB container limit. Its API and database listen only on container loopback, with no published ports or persistent state. Scope-bound GET/HEAD/OPTIONS are the default target methods; explicit web_active_v1 scopes additionally permit bounded JSON or URL-encoded POST. Browser login, general network scans, browser execution and external callbacks are not enabled. Engine startup errors, unavailable tools and unfinished plans stay visible. Partial evidence is saved, but cannot mark the assessment complete. Source and dependency archives and the upstream license are included under `/usr/share/licenses/artex`.
+The selected engine gets a 512 MiB temporary `/work` directory for disposable PostgreSQL, within the same 2 GiB container limit. Its API and database listen only on container loopback, with no published ports or persistent state. Scope-bound GET/HEAD/OPTIONS are the default target methods; explicit web_active_v1 scopes additionally permit bounded JSON or URL-encoded POST. These engine profiles do not provide browser login, general network scans or external callbacks. Adapter 13 adds the separately scoped browser mode below. Engine startup errors, unavailable tools and unfinished plans stay visible. Partial evidence is saved, but cannot mark the assessment complete. Source and dependency archives and the upstream license are included under `/usr/share/licenses/artex`.
 
 **What the agent does:** Hermes gets the approved objective, scope, previous reports and the testing method in `agent/live-review-skill.txt`. Its terminal can analyze files and request live evidence through `live_http.py`. The relay enforces HTTPS origins, public DNS/IPs, the saved scope methods, no automatic redirects and at most two requests per second. Test-account access and POST require the explicit scope options described below. No real purchases, fund transfers or load testing are permitted. Responses are bounded; truncated content is marked.
 
@@ -432,7 +460,27 @@ Original material is [AGPL-3.0-only](LICENSE); attribution is in [NOTICE](NOTICE
 
 Adapter 8 advertises the engine plus `active_web_v1` and `authenticated_http_v1`. Deploy the matching dispatcher and migration 19 before updating agents. Old scopes and signed polls remain compatible. A Basic or bearer account is retrieved only through the assigned lease, held by the relay and excluded from container/model input. The broker adds authorization and ephemeral cookies only after exact-origin and public-IP checks; redirects are never followed automatically. Anonymous controls send neither. Known raw, URL-encoded and JSON-escaped credential/session values are redacted from retained text; this is not a guarantee against every possible encoding. Operators can inspect their own host and must be trusted with the approved access.
 
-POST requires an immutable `web_active_v1` scope and requester consent to change disposable test data. Bodies are limited to 16 KiB of JSON or URL-encoded text. Other methods, file uploads, arbitrary authorization/cookie headers and off-scope targets remain blocked. Browser login, SSO and MFA are unsupported. Each role records `web-checks-v1` coverage, with actual request IDs and explicit gaps, before its model investigation. An account that fails its authenticated/anonymous control leaves coverage incomplete.
+POST requires an immutable `web_active_v1` scope and requester consent to change disposable test data. Bodies are limited to 16 KiB of JSON or URL-encoded text. Other methods, file uploads, arbitrary authorization/cookie headers and off-scope targets remain blocked. These HTTP profiles do not handle browser login, SSO or MFA. Each role records `web-checks-v1` coverage, with actual request IDs and explicit gaps, before its model investigation. An account that fails its authenticated/anonymous control leaves coverage incomplete.
+
+**Browser login (adapter 13):** `browser_login_v1` uses Chromium and Hermes' browser tools to follow the approved website's own frontend. No per-site API adapter is needed. Optional paths are navigation hints. A private controller fills the supplied account, injects Basic/bearer access, or exposes a fresh, unfunded EVM test wallet. Cookies and JavaScript tokens stay in the browser session; HTTP tools can reuse captured cookies. Passwords/session data necessarily reach the isolated browser and remain visible to its operator. Known secrets are redacted before model calls and retained reports; arbitrary encodings are not guaranteed to be caught.
+
+For browser-login scopes, initial engine discovery covers public routes. Hermes then signs in and investigates authenticated routes. Read the saved access comparisons and individual requests to see which private resources were actually tested; an engine receipt alone does not establish authenticated coverage.
+
+The browser helper exposes visible controls inside open shadow roots, used by common wallet pickers. If a picker ignores an unfamiliar EIP-6963 provider, the agent can retry once with the older `window.ethereum` transport; no wallet brand is impersonated. A connected address can be the whole flow on a public dapp; no signature or private login is invented. Pending requests, blocked external origins and relay error codes help distinguish loading from a policy restriction. The helper can wait up to two minutes for page scripts without spending model calls; repeated inspection must not be mistaken for a broken button while scripts are still loading. Before returning the final result, the adapter stops browser requests and drains its bridge so background polling cannot invalidate a completed run.
+
+The agent must request an authenticated/anonymous comparison before claiming access: 2xx versus 401/403, or a JSON account identity matching the supplied username/test wallet and differing anonymously. A public 200 page or successful signature is not enough. Missing proof prevents complete authenticated evidence and appears as a coverage gap in exports. Frames, navigation and login stay on the approved origin. Optional `browser_login.resource_origins` lists up to eight exact HTTPS dependency hosts approved with the request. Only anonymous GET/HEAD reads are allowed there, with no account headers, referrers, request bodies or stored response cookies; the same public-DNS, byte, request and lease limits apply. Ordinary HTTP/scanner tools cannot target these hosts, and they cannot supply login proof. Undeclared dependencies remain blocked. MFA, CAPTCHA, external SSO, WalletConnect-only flows and Solana target wallets are unsupported. Legacy HTTP login scopes continue unchanged.
+
+The browser has one five-minute login window, at most eight same-origin POST steps and four reviewed personal-sign signatures. No transactions, typed-data signing, key export or chain RPC. Custom readable messages still need agent judgment; this is not a guarantee about their meaning. Keys are new per role and must never be funded. Target calls share the existing request/lease limits; responses are bounded to 8 MiB each and 64 MiB per role. Downloads and service workers are disabled.
+
+Before enabling browser capacity on a Linux host with AppArmor, inspect and load the supplied profile:
+
+```sh
+sudo apparmor_parser -r agent/browser-apparmor
+```
+
+Build adapter 13 from `agent/Dockerfile` and pin its inspected image digest in the agent configuration. Deploy matching core, dispatcher/gateway migration 29 and updated relays first. The relay requires `patchriot-browser-v1` plus its embedded seccomp profile and verifies the resulting container policy. Missing host support fails closed. Chromium keeps its own namespace sandbox: no `--no-sandbox`, host networking, host IPC, added capabilities or privileged container. Browser scopes use 256 PIDs and 256 MiB private shared memory within the existing 2 GiB memory limit. The host profile permits Chromium's nested user namespace; it does not change Docker's default profile for other containers.
+
+Owned browser fixtures are in `agent/test_browser_access.py`, enabled only with `PATCHRIOT_BROWSER_FIXTURE=1`. They exercise actual Chromium and the pinned Hermes browser tool without model calls or external targets. Rust tests independently check cryptographic signatures, origin/expiry limits, credential redaction and access evidence. Fixture success does not establish live model quality or universal login compatibility.
 
 **Rolling upgrades:** update core before exposing new capability names, then update dispatcher/gateway, then the relays. Old core versions reject unknown capability names. Advanced options become available only when all selected components support them.
 
@@ -440,7 +488,11 @@ The hosted calibration run uses 3,600 seconds per role (set both the dispatcher�
 
 **Automatic login form detection:** updated relays advertise `form_discovery_v1` with the existing adapter 10/11 images. The owner supplies the login page and protected URL. The trusted broker reads one unambiguous HTML form, validates its same-origin action and submits the account once. It extracts hidden fields as data without executing scripts; ambiguous forms, external actions and unsupported controls stop the login. Secrets and cookies never enter the task container or model prompt. Ordinary agent POST requests still require their own permission. Deploy the updated core and dispatcher migration 26 before these relays; older relays continue handling explicit-login requests.
 
-**Session login (adapter 10):** `session_login_v1` adds a single form or JSON POST to the exact owner-declared login endpoint, optionally preceded by the declared login page for a hidden CSRF token. The relay owns the password and session cookie; the agent never receives them. Login request/response bodies and headers are withheld from evidence. The resulting cookie is used only within the approved origin; anonymous controls send no cookie or account. Login is attempted once per role, including on failure. Redirects are not followed. The protected endpoint must return 2xx with the account and 401/403 without it before authenticated coverage is complete. SSO, MFA, CAPTCHA, JavaScript-driven login and token-only JSON responses are unsupported. Other POST actions still need their separate scope permission. Deploy dispatcher migration 24 and the matching core before upgrading relays.
+**Adapter 12:** adds `active_web_v2`, with explicit permission to change test data and acknowledgement of production disruption risk. Existing `active_web_v1` scopes keep their original test-environment restriction. Rebuild the pinned agent image and deploy core, dispatcher/gateway migration 27, then updated relays. The baseline check accepts same-origin redirects to the declared login page as an anonymous control, without following them.
+
+**Wallet login (updated relay, adapter 12):** `wallet_login_v1` creates an unfunded EVM wallet per role in the Rust broker. It signs one validated SIWE login, bound to the approved origin, address, chain, nonce and a short expiry. Challenge/verification paths and JSON format come from the owner’s scope, not model output. No transactions, imported keys, typed-data signing, delegation resources or chain RPC. Keys are discarded after the attempt; signatures, cookies and login bodies stay outside model input and reports. A session cookie plus a successful protected GET and denied anonymous control are required for authenticated coverage. The target must accept new wallets; no token holdings, admin rights or previous account data are supplied. Use the core README’s wallet API settings. Deploy servers and dispatcher migration 28 first; the existing adapter 12 image can stay pinned.
+
+**Session login (adapter 10):** `session_login_v1` adds a single form or JSON POST to the exact owner-declared login endpoint, optionally preceded by the declared login page for a hidden CSRF token. The relay owns the password and session cookie; the agent never receives them. Login request/response bodies and headers are withheld from evidence. The resulting cookie is used only within the approved origin; anonymous controls send no cookie or account. Login is attempted once per role, including on failure. Redirects are not followed. The protected endpoint must return 2xx with the account. Anonymous access must be refused (401/403), or—on adapter 12—redirect to the declared same-origin login page. A public 200 response is not authenticated coverage. SSO, MFA, CAPTCHA, JavaScript-driven login and token-only JSON responses are unsupported. Other POST actions still need their separate scope permission. Deploy dispatcher migration 24 and the matching core before upgrading relays.
 
 
 **Venice (adapter 11):** use `model_url: "https://api.venice.ai/api/v1"`, `model: "abliteration-abliterated-model-large-v2"` and a private `live_provider_key_file` containing the Venice key. Pair a separate device with that exact model, then obtain approval; do not reuse an identity declared for the direct provider. Both Hermes and ARTEX use the selected route. The relay accepts only the fixed URL/model pairs, disables provider search/scraping and model fallbacks, and leaves keys outside the container. Existing direct-provider devices remain supported.
@@ -453,18 +505,27 @@ This Venice model is marked **anonymized**, not private. Its upstream provider r
 
 The [Private TEE DeepSeek route](https://near.ai/models/deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated) lists $0.30 per million input tokens and $1.20 per million output tokens on 3 November 2026. The relay uses those uncached rates for its cost ceiling; recheck prices before deployment. A small evidence exercise verified compatibility, not a general cybersecurity ranking. Attestation covers the model service, not the Kali host or the accuracy of a finding. Operators still see the plaintext task. Linux releases include the native crypto verifier; the pinned builder links OpenSSL statically.
 
-### Optional Venice recovery
+### Primary model and optional backup
 
-For new live tests, NEAR can recover through Venice’s `deepseek-v4-1-flash-1017-uncensored`. Add `venice_fallback_key_file` to the NEAR agent JSON, pointing to a mode-0600 file owned by the relay user. The key stays on the host. Keep the primary model, device identity and NEAR key unchanged.
+The primary is the device’s paired `model`, matching `model_url` and private `live_provider_key_file`. Both DeepSeek orders are supported:
 
-Update core, dispatcher/gateway and relays together. Only then set `PATCHRIOT_VENICE_FALLBACK_ENABLED=true` on the dispatcher. New checkout consent names Venice; old requests remain NEAR-only. A local key alone cannot authorize sending a requester’s work to another provider.
+| Provider | Model | API URL |
+| --- | --- | --- |
+| NEAR AI | `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` | `https://cloud-api.near.ai/v1` |
+| Venice | `deepseek-v4-1-flash-1017-uncensored` | `https://api.venice.ai/api/v1` |
 
-A temporary NEAR connection failure, rate limit or unavailable verification service permits one Venice attempt before any model response reaches the agent. The role then stays on Venice; the next role starts with NEAR again. Bad credentials, malformed input, invalid signatures, scope denials and exhausted budgets do not trigger recovery. There is no alternating retry loop and no replay of target tools.
+For a backup, set `secondary_model` to the other model and `secondary_key_file` to its private credential file. Configure both or neither. Keys must be mode 0600 and owned by the relay user; they stay outside containers. No provider order or credential belongs in repository deployment files.
+
+Update core, dispatcher/gateway and relay first. Set the dispatcher’s `PATCHRIOT_INFERENCE_PRIMARY_MODEL` to the selected primary and optionally `PATCHRIOT_INFERENCE_SECONDARY_MODEL` to the backup. New checkout selects already approved devices declaring that primary. If none are available, checkout waits; it does not substitute another model. A model change requires a fresh device identity and approval. Keep the previous devices/configuration for queued work. A settings change applies only to new requests, not saved consent.
+
+Legacy configuration remains supported: `venice_fallback_key_file` on a NEAR relay and `PATCHRIOT_VENICE_FALLBACK_ENABLED=true` on dispatcher. Do not combine the old and new configuration fields. Old consent and receipts retain their original bytes; new requests save the exact optional `fallback_model`. Neither a key nor deployment settings grant permission to send a request to an unapproved provider.
+
+A temporary provider failure, rate limit or unavailable NEAR verification service permits one backup attempt before any model output reaches the agent. That role stays on the backup; the next role starts with its own primary. Bad credentials, malformed input, invalid attestation/signatures, scope denials and exhausted budgets never trigger recovery. A NEAR backup uses the same encryption and verification as a NEAR primary. There is no alternating retry loop and no replay of target tools.
 
 **One agent request uses one call allowance, even when it needs both providers.** Both attempts reserve money under the existing $10-per-role limit; an uncertain failed charge is not refunded in the estimate. Time limits and the final-report reserve still apply. The report, exports and retained work receipt record the fallback model, reason and attempt counts.
 
 Venice lists this model as private, with uncached prices of $0.33/M input and $1.32/M output on 4 November 2026. These are provider declarations, not a Patchriot TEE verification. This route uses HTTPS and does not claim NEAR attestation or identical model weights. Recheck the [model catalogue](https://docs.venice.ai/api-reference/endpoint/models/list) and [privacy terms](https://docs.venice.ai/overview/privacy) before enabling it.
 
-A long repeating response can stop Hermes before it writes a report. The relay checks verified NEAR output before delivery and uses the consented backup for `provider_repetition`. It does not retry website tools. A repeating backup response stops the call; the spending and time limits still apply.
+A long repeating response can stop Hermes before it writes a report. The relay checks buffered model output before delivery and can use the consented backup for `provider_repetition`. NEAR verification still has to pass before its output is accepted. It does not retry website tools. A repeating backup response stops the call; the spending and time limits still apply.
 
 </details>

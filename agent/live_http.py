@@ -2,19 +2,47 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+EVIDENCE_DIRECTORY = Path('/work/http-evidence')
 
-def request(method, url, headers=None, data=None, authenticated=True):
+
+def retain_evidence(reply):
+    """Keep the broker's redacted record available after a scanner finishes.
+
+    This working copy helps the agent cite exact requests without repeating
+    them. The relay's own records remain authoritative for the signed report.
+    Do not cache the full response body, which is not the retained evidence.
+    """
+    record = reply.get('evidence')
+    if not isinstance(record, dict) or type(record.get('id')) is not int or record['id'] <= 0:
+        return reply
+    try:
+        EVIDENCE_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = EVIDENCE_DIRECTORY / f"{record['id']}.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as saved:
+            json.dump(record, saved)
+        reply['evidence_file'] = str(path)
+    except OSError:
+        # A cache failure must not lose an already recorded HTTP response.
+        reply['evidence_cache_error'] = 'unavailable'
+    return reply
+
+
+def request(method, url, headers=None, data=None, authenticated=True, *, discovery=False):
     body = json.dumps({"method": method.upper(), "url": url, "headers": headers or {}, "data": data, "authenticated": authenticated}).encode()
-    req = Request(os.environ["PATCHRIOT_BRIDGE_URL"] + "/patchriot/http", data=body,
+    path = "/patchriot/artex/http" if discovery else "/patchriot/http"
+    req = Request(os.environ["PATCHRIOT_BRIDGE_URL"] + path, data=body,
                   headers={"Content-Type": "application/json"})
     try:
         with urlopen(req, timeout=75) as response:
-            return json.loads(response.read(2 * 1024 * 1024))
+            return retain_evidence(json.loads(response.read(2 * 1024 * 1024)))
     except HTTPError as error:
-        return json.loads(error.read(8192))
+        with error:
+            return json.loads(error.read(8192))
 
 
 if __name__ == "__main__":
@@ -31,7 +59,6 @@ if __name__ == "__main__":
     result = request(args.method, args.url, {k.strip(): v.strip() for k, v in headers.items()}, data=args.data, authenticated=not args.anonymous)
     body = result.get("body", "")
     if args.save_body:
-        from pathlib import Path
         path = Path(args.save_body).resolve()
         if not path.is_relative_to("/work"):
             raise SystemExit("Save analysis files under /work")

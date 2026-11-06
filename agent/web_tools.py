@@ -172,6 +172,9 @@ class ScopeMirror:
     def __init__(self, origin, deadline, fetch=request, methods=None):
         self.methods = methods or ["GET", "HEAD", "OPTIONS"]
         self.origin, self.fetch, self.deadline, self.refs = origin, fetch, deadline, []
+        # Count new recorded observations, not polling or repeated identical
+        # replies. Only hashes are retained here; the broker owns the evidence.
+        self.progress_keys = set()
         mirror = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -222,6 +225,9 @@ class ScopeMirror:
                     if evidence.get("id"):
                         mirror.refs.append(evidence["id"])
                     status = evidence.get("status")
+                    if status and evidence.get("id"):
+                        observation = [self.command, origin + self.path, data, status, reply.get("body", "")]
+                        mirror.progress_keys.add(hashlib.sha256(json.dumps(observation).encode()).digest())
                     payload = reply.get("body", "").encode() if status else b"relay request unavailable"
                     self.send_response(status or 502)
                     for name, value in evidence.get("headers", {}).items():
@@ -313,17 +319,25 @@ def fetch_checked_request(method, url, **kwargs):
 
 
 def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator"):
-    from live_review import runs_discovery
+    from live_review import discovery_plan
     deadline = time.monotonic() + 180
-    discovery = runs_discovery(role)
+    plan = discovery_plan(role, scope, previous)
+    selected = {p['tool'] for p in plan if p['action'] in ('run', 'recover')}
     records = []
-    if discovery:
+    if 'patchriot-baseline' in selected:
         import baseline
         initial = baseline.run(scope, deadline, fetch_checked_request, record)
         records.append(initial)
         emit(initial)
     for origin in scope["origins"]:
-        checks = [lambda: crawl(origin, deadline), lambda: scanner(origin, deadline)] if discovery else []
+        checks = []
+        if 'ares-web-surface' in selected:
+            import ares_web
+            checks.append(lambda: ares_web.run(origin, deadline))
+        if 'patchriot-crawl' in selected:
+            checks.append(lambda: crawl(origin, deadline))
+        if 'nuclei' in selected:
+            checks.append(lambda: scanner(origin, deadline))
         checks.append(lambda: controls(origin, deadline, previous, auth_check_path=scope.get("auth_check_path") if scope.get("authentication") else None))
         for check in checks:
             if time.monotonic() >= deadline:
@@ -331,7 +345,7 @@ def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="inv
             result = check()
             records.append(result)
             emit(result)
-    result = {"profile": PROFILE, "role": role, "tool_runs": records,
+    result = {"profile": PROFILE, "role": role, "tool_runs": records, "discovery_plan": plan,
               "limitations": ["Only three curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
                               "The scanner receives selected headers and decoded text through the broker; use recorded target requests as the source of evidence.",
                               "Scanner host/IP and curl snippets describe a loopback mirror, not the target's IP, TLS or exact upstream headers.",

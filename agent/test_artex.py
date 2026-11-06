@@ -12,6 +12,7 @@ import unittest
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import artex
@@ -23,6 +24,33 @@ SCOPE = {'origins': ['https://owned.example'], 'objective': 'Owned fixture only'
 
 
 class EngineTests(unittest.TestCase):
+    def test_oversized_engine_details_leave_a_complete_handoff_and_exact_local_file(self):
+        details = {'engine': 'ARTEX', 'commit': artex.VERSION,
+                   'stop_reason': 'time_budget', 'coverage_complete': False,
+                   'failure': 'incomplete', 'target_mapping': {'https://owned.example': 'http://127.0.0.1:1234'},
+                   'outcome': {str(i): {str(j): '🛡' * 500 for j in range(10)} for i in range(10)},
+                   'findings': [{'summary': 'Owned unverified lead', 'details': 'x' * 40000}],
+                   'commands': {'commands': [{'command': 'long command ' * 10000}]}}
+        class FakeEngine:
+            def __init__(self, *_args): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def assess(self, *_args, **_kwargs): return details.copy()
+        with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine):
+            receipt = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(folder))
+            saved = (Path(folder) / 'artex-results.json').read_text()
+            self.assertEqual(json.loads(saved)['commands'], details['commands'])
+            self.assertGreater(len(saved), 24 * 1024)
+            self.assertFalse(receipt['output_truncated'])
+            summary = json.loads(receipt['output_excerpt'])
+            self.assertEqual(summary['stop_reason'], 'time_budget')
+            self.assertEqual(summary['full_output_sha256'], hashlib.sha256(saved.encode()).hexdigest())
+            self.assertEqual(summary['commands_returned'], 1)
+            self.assertTrue(summary['details_summarized'])
+            self.assertFalse(summary['coverage_complete'])
+            self.assertEqual(receipt['failure'], 'incomplete')
+            self.assertEqual(receipt['output_sha256'], hashlib.sha256(receipt['output_excerpt'].encode()).hexdigest())
+
     def test_exhausted_upstream_planner_stops_even_if_task_is_queued(self):
         self.assertTrue(artex.should_stop({'status': 'queued', 'llm_failover_state': 'chain_exhausted'}))
         self.assertTrue(artex.should_stop({'status': 'completed'}))
@@ -43,16 +71,89 @@ class EngineTests(unittest.TestCase):
             def __init__(self, _directory, _bridge, _deadline, model): models.append(model)
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def assess(self, scope, targets, role):
+            def assess(self, scope, targets, role, stop=lambda: False, progress=lambda: 0):
                 return {'engine': 'ARTEX', 'commit': artex.VERSION, 'stop_reason': 'model_budget',
                         'coverage_complete': False, 'findings': [], 'commands': []}
         with tempfile.TemporaryDirectory() as temp, patch.object(artex, 'Engine', FakeEngine):
-            record = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(temp), model='abliteration-abliterated-model-large-v2')
+            starts = []
+            record = artex.run(SCOPE, 'investigator', time.monotonic() + 2, Path(temp), model='abliteration-abliterated-model-large-v2', emit=starts.append)
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(starts[0]['failure'], 'incomplete')
+            self.assertEqual(starts[0]['started_at'], record['started_at'])
             self.assertEqual(models, ['abliteration-abliterated-model-large-v2'])
             self.assertEqual(record['failure'], 'incomplete')
             self.assertEqual(record['exit_code'], 0)
             self.assertEqual(record['arguments'], ['/opt/artex/artex', 'https://owned.example'])
             self.assertEqual(json.loads(record['output_excerpt'])['stop_reason'], 'model_budget')
+
+    def test_bridge_rejection_stops_discovery_without_waiting_for_the_deadline(self):
+        calls = []
+        class FakeClient:
+            def call(self, path, body=None):
+                calls.append((path, body))
+                if path == '/api/tasks': return {'id': 7}
+                if path == '/api/tasks/7': return {'status': 'running'}
+                return {}
+        engine = object.__new__(artex.Engine)
+        engine.client, engine.deadline, engine.profile_id = FakeClient(), time.monotonic() + 600, 1
+        result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator', stop=lambda: True)
+        self.assertEqual(result['stop_reason'], 'model_request_rejected')
+        self.assertFalse(result['coverage_complete'])
+        self.assertIn(('/api/tasks/7/control', {'action': 'pause'}), calls)
+        result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator',
+                               stop=lambda: 'target_request_budget')
+        self.assertEqual(result['stop_reason'], 'target_request_budget')
+        self.assertFalse(result['coverage_complete'])
+
+    def test_watchdog_ignores_heartbeats_preserves_leads_and_yields_to_completion(self):
+        # A fake clock exercises the five-minute wait without sleeping. A new
+        # observation at minute four extends it; task heartbeats alone do not.
+        for progress_at, completed_at, expected_time, expected_reason in [
+            (None, None, 300, 'no_target_progress'),
+            (240, None, 540, 'no_target_progress'),
+            (None, 300, 300, 'completed'),
+        ]:
+            with self.subTest(progress_at=progress_at, completed_at=completed_at), tempfile.TemporaryDirectory() as temp:
+                clock, calls = [0.0], []
+                class FakeClient:
+                    def call(self, path, body=None):
+                        calls.append((path, body))
+                        if path == '/api/tasks': return {'id': 7}
+                        if path == '/api/tasks/7':
+                            return {'status': 'completed' if completed_at is not None and clock[0] >= completed_at else 'running',
+                                    'heartbeat': clock[0]}
+                        if path.startswith('/api/exploration/findings'):
+                            return [{'title': 'Owned fixture lead', 'verified': False}]
+                        return {}
+                def tick(_seconds): clock[0] += 60
+                engine = object.__new__(artex.Engine)
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 900, 1
+                engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
+                (engine.directory / 'process.log').write_text('')
+                with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
+                    result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator',
+                        progress=lambda: int(progress_at is not None and clock[0] >= progress_at))
+                self.assertEqual(clock[0], expected_time)
+                self.assertEqual(result['stop_reason'], expected_reason)
+                self.assertEqual(result['coverage_complete'], completed_at is not None)
+                self.assertEqual(result['findings'], [{'title': 'Owned fixture lead', 'verified': False}])
+                self.assertEqual(('/api/tasks/7/control', {'action':'pause'}) in calls, completed_at is None)
+
+    def test_engine_http_uses_the_discovery_route_and_other_probes_keep_their_route(self):
+        import live_http
+        seen = []
+        class Reply:
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self, _limit): return b'{"evidence":{"status":200}}'
+        def capture(request, **kwargs):
+            seen.append(request.full_url)
+            return Reply()
+        with patch.dict(os.environ, {'PATCHRIOT_BRIDGE_URL':'http://127.0.0.1:8080'}), patch.object(live_http, 'urlopen', capture):
+            live_http.request('GET', 'https://owned.example', discovery=True)
+            live_http.request('GET', 'https://owned.example')
+        self.assertEqual(seen, ['http://127.0.0.1:8080/patchriot/artex/http',
+                                'http://127.0.0.1:8080/patchriot/http'])
 
     def test_engine_cannot_point_its_model_bridge_outside_container_loopback(self):
         for url in ['https://external.example', 'http://127.0.0.1:8/path', 'http://user@127.0.0.1:8',

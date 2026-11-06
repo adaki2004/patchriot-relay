@@ -3,8 +3,33 @@ import json
 import re
 import secrets
 import time
+from urllib.parse import urljoin, urlsplit
 
 VERSION = "web-checks-v1"
+
+
+def denied_anonymous(scope, evidence):
+    if evidence.get("authenticated") or evidence.get("error"):
+        return False
+    if evidence.get("status") in (401, 403):
+        return True
+    if evidence.get("status") not in (302, 303, 307, 308):
+        return False
+    login = scope.get("session_login") or {}
+    location = evidence.get("headers", {}).get("location")
+    if not login or not location:
+        return False
+    try:
+        base = urlsplit(evidence["url"])
+        destination = urlsplit(urljoin(evidence["url"], location))
+        return (
+            (destination.scheme, destination.hostname, destination.port or 443)
+            == (base.scheme, base.hostname, base.port or 443)
+            and not destination.username and not destination.password
+            and destination.path == login.get("page_path", login.get("path"))
+        )
+    except (ValueError, KeyError):
+        return False
 
 
 def run(scope, deadline, fetch, record):
@@ -71,12 +96,14 @@ def run(scope, deadline, fetch, record):
             "The marker was reflected. Context and browser execution need review; reflection alone is not XSS." if reflected else
             "The marker was not reflected in the retained homepage response." if usable(reflection) else "The probe did not complete.", [reflection, root])
 
-        if scope.get("authentication"):
+        if scope.get("browser_login") is not None:
+            add(origin, "test-account", "Test-account access", "skipped", "Browser login and the protected-access comparison run during the agent investigation. See the separate authenticated-access proof; public baseline checks do not prove login.")
+        elif scope.get("authentication"):
             path = scope["auth_check_path"]
             anonymous = get(origin, path, authenticated=False)
             signed = get(origin, path)
             ae, se = anonymous.get("evidence", {}), signed.get("evidence", {})
-            confirmed = usable(anonymous) and usable(signed) and ae.get("status") in (401, 403) and 200 <= se.get("status", 0) < 300 and se.get("authenticated") is True
+            confirmed = usable(anonymous) and usable(signed) and denied_anonymous(scope, ae) and 200 <= se.get("status", 0) < 300 and se.get("authenticated") is True
             add(origin, "test-account", "Test-account access and anonymous control", "completed" if confirmed else "inconclusive",
                 "The supplied account reached the protected URL; the anonymous control was denied." if confirmed else
                 "Could not prove authenticated access. Check the protected URL and test account; this is a coverage gap, not a vulnerability finding.", [anonymous, signed])
@@ -84,7 +111,8 @@ def run(scope, deadline, fetch, record):
             add(origin, "test-account", "Test-account access", "skipped", "No test account was supplied.")
         add(origin, "forms", "Form and state-changing tests", "inconclusive" if "POST" in scope["methods"] else "skipped",
             "POST is permitted. Inspect the agents' actual requests and findings; permission alone does not prove a form was tested." if "POST" in scope["methods"] else "This request permits read-only methods; no forms are submitted.")
-        add(origin, "browser", "Browser login, SSO and client-side execution", "unsupported", "This runner does not drive a browser or complete interactive login challenges.")
+        if scope.get("browser_login") is None:
+            add(origin, "browser", "Browser login, SSO and client-side execution", "unsupported", "This runner does not drive a browser or complete interactive login challenges.")
 
     complete = all(c["status"] != "inconclusive" for c in checks)
     return record("patchriot-baseline", VERSION, ["--profile", VERSION], started, observed, refs,

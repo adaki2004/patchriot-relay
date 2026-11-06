@@ -2,6 +2,7 @@
 import http.client
 import io
 import json
+import os
 import hashlib
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import adapter
@@ -17,7 +19,182 @@ import inspect_source
 import live_review
 
 
+@unittest.skipUnless(os.environ.get('PATCHRIOT_HERMES_SMOKE') == '1', 'requires the pinned isolated Hermes image')
+class CompressionRuntimeTests(unittest.TestCase):
+    def test_pinned_hermes_classifies_bridge_size_errors_for_compression(self):
+        wire = io.StringIO()
+        server = ThreadingHTTPServer(('127.0.0.1', 0), adapter.Bridge)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        script = '''import sys
+from openai import OpenAI, APIStatusError
+from agent.error_classifier import classify_api_error
+client=OpenAI(api_key='local-bridge',base_url=sys.argv[1]+'/v1',max_retries=0)
+try:
+    client.chat.completions.create(model='owned-fixture',messages=[{'role':'user','content':'x'*5000}],max_tokens=10)
+except APIStatusError as error:
+    assert error.status_code==413
+    verdict=classify_api_error(error)
+    assert verdict.should_compress
+    assert verdict.reason.value=='payload_too_large'
+else:
+    raise AssertionError('Oversized input unexpectedly reached a model')
+'''
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch.object(adapter, 'MAX_REQUEST', 1024), patch.object(adapter, 'wire_out', wire):
+                env={'PATH':os.environ['PATH'],'HOME':temp,'HERMES_HOME':temp,
+                     'PYTHONPATH':'/opt/hermes','PYTHONDONTWRITEBYTECODE':'1'}
+                result=subprocess.run([sys.executable,'-c',script,f'http://127.0.0.1:{server.server_port}'],
+                    env=env,capture_output=True,text=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr[-2000:])
+                self.assertEqual(wire.getvalue(),'')
+        finally:
+            server.shutdown();server.server_close();thread.join(timeout=2)
+
+    def test_real_compressor_uses_the_summary_route_without_provider_credentials(self):
+        seen = []
+        class Model(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                seen.append((self.path, body['model']))
+                content = 'Owned fixture summary: the local check finished and no external request was made.'
+                response = {'id':'owned-summary','object':'chat.completion','created':1,
+                    'model':body['model'],'choices':[{'index':0,'message':{'role':'assistant','content':content},'finish_reason':'stop'}],
+                    'usage':{'prompt_tokens':10,'completion_tokens':20,'total_tokens':30}}
+                if body.get('stream'):
+                    response['object'] = 'chat.completion.chunk'
+                    response['choices'][0]['delta'] = response['choices'][0].pop('message')
+                    wire = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                    content_type = 'text/event-stream'
+                else:
+                    wire, content_type = json.dumps(response).encode(), 'application/json'
+                self.send_response(200)
+                self.send_header('Content-Type',content_type)
+                self.send_header('Content-Length',str(len(wire)))
+                self.end_headers(); self.wfile.write(wire)
+        server = ThreadingHTTPServer(('127.0.0.1',0),Model)
+        thread = threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                home=Path(temp); (home/'config.yaml').write_text('model:\n  context_length: 64000\n')
+                bridge=f'http://127.0.0.1:{server.server_port}'
+                adapter.configure_compression(home,'owned-fixture',bridge)
+                script = '''import sys
+from run_agent import AIAgent
+agent=AIAgent(model='owned-fixture',provider='custom',api_mode='chat_completions',
+    base_url=sys.argv[1]+'/v1',api_key='local-bridge',enabled_toolsets=[],
+    max_tokens=8192,quiet_mode=True,skip_context_files=True,skip_memory=True,
+    skip_background_review=True,checkpoints_enabled=False)
+try:
+    c=agent.context_compressor
+    assert c.context_length==64000
+    assert c.threshold_tokens==32000, c.threshold_tokens
+    assert c.should_compress(35000)
+    messages=[{'role':'system','content':'Review only owned fixture evidence.'},
+              {'role':'user','content':'Retain the assessment objective and inspect saved evidence.'}]
+    for i in range(60):
+        messages.append({'role':'assistant' if i%2 else 'user',
+                         'content':f'Owned fixture record {i}: '+('bounded observation. '*200)})
+    original=[dict(m) for m in messages]
+    compacted=c.compress(messages,current_tokens=60000,force=True)
+    assert len(str(compacted)) < len(str(original))/2
+    assert 'Owned fixture summary' in str(compacted)
+    assert messages==original, 'Exact working evidence must not be rewritten'
+finally:
+    agent.close()
+'''
+                env={'PATH':os.environ['PATH'],'HOME':temp,'HERMES_HOME':temp,
+                     'PYTHONPATH':'/opt/hermes','PYTHONDONTWRITEBYTECODE':'1'}
+                result=subprocess.run([sys.executable,'-c',script,bridge],env=env,
+                    capture_output=True,text=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr[-3000:])
+                self.assertEqual(seen,[('/patchriot/summary/v1/chat/completions','owned-fixture')])
+        finally:
+            server.shutdown();server.server_close();thread.join(timeout=2)
+
+
 class LiveOverviewTests(unittest.TestCase):
+    def test_limited_scan_hands_evidence_to_targeted_review_without_broad_rescan(self):
+        import artex
+        import copy
+        scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
+        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress'):
+            with self.subTest(reason=reason):
+                detail = {'engine': 'ARTEX', 'stop_reason': reason, 'coverage_complete': False,
+                          'failure': 'incomplete'}
+                record = {'tool': 'artex-engine', 'exit_code': 0, 'failure': 'incomplete',
+                          'output_truncated': False, 'evidence_ids': [7],
+                          'output_excerpt': artex.receipt_summary(detail, json.dumps(detail))}
+                first = {'role': 'investigator', 'assessment': None, 'tool_runs': [record],
+                         'evidence': [{'id': 7, 'url': 'https://owned.example/api', 'status': 403}]}
+                saved = copy.deepcopy(first)
+                for role, previous in [('reproducer', [first]), ('challenger', [first, {'role': 'reproducer', 'tool_runs': []}])]:
+                    plan = live_review.discovery_plan(role, scope, previous)[-1]
+                    self.assertEqual(plan, {'tool':'artex-engine','action':'reuse_partial',
+                        'source_role':'investigator','coverage_complete':False,'stop_reason':reason})
+                self.assertEqual(first, saved, 'Original incomplete receipt and evidence must stay intact')
+                self.assertIn('coverage remains incomplete', live_review.prompt('reproducer'))
+
+    def test_partial_scan_without_usable_evidence_or_known_stop_still_recovers(self):
+        import copy
+        base = {'role': 'investigator', 'tool_runs': [{'tool': 'artex-engine', 'exit_code': 0,
+            'failure': 'incomplete', 'output_truncated': False, 'evidence_ids': [7],
+            'output_excerpt': json.dumps({'receipt_schema':1,'engine':'ARTEX','stop_reason':'time_budget',
+                                         'coverage_complete':False,'failure':'incomplete'})}],
+            'evidence': [{'id':7,'url':'https://owned.example/','status':200}]}
+        variants = []
+        for key, value in [('exit_code',None), ('failure','timeout'), ('output_truncated',True),
+                           ('evidence_ids',[]), ('output_excerpt','{"stop_reason":"time_budget",'),
+                           ('output_excerpt','[]')]:
+            record=copy.deepcopy(base);record['tool_runs'][0][key]=value;variants.append(record)
+        for key, value in [('status',None),('status',True),('error','request_error'),('id',8),('url','https://other.example/')]:
+            record=copy.deepcopy(base);record['evidence'][0][key]=value;variants.append(record)
+        for reason in ['interrupted','unavailable','model_request_rejected','provider_rate_limited']:
+            record=copy.deepcopy(base);detail=json.loads(record['tool_runs'][0]['output_excerpt'])
+            detail['stop_reason']=reason;record['tool_runs'][0]['output_excerpt']=json.dumps(detail);variants.append(record)
+        for record in variants:
+            with self.subTest(record=record):
+                plan=live_review.discovery_plan('reproducer',{'origins':['https://owned.example'],'tools':['artex_engine_v1']},[record])
+                self.assertEqual(plan[-1]['action'],'recover')
+
+    def test_missing_discovery_is_recovered_once_without_repeating_finished_tools(self):
+        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        first = {'role':'investigator', 'assessment':None, 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None}
+            for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}
+        plan = live_review.discovery_plan('reproducer', scope, [first])
+        self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['artex-engine'])
+        self.assertEqual([p['action'] for p in plan[:3]], ['reuse'] * 3)
+        second = {'role':'reproducer', 'tool_runs':[{'tool':'artex-engine','exit_code':None,'failure':'incomplete'}]}
+        plan = live_review.discovery_plan('challenger', scope, [first, second])
+        self.assertEqual(plan[-1]['action'], 'unavailable')
+        second['tool_runs'][0].update(exit_code=0, failure=None)
+        plan = live_review.discovery_plan('challenger', scope, [first, second])
+        self.assertEqual(plan[-1]['action'], 'reuse')
+        self.assertEqual(plan[-1]['source_role'], 'reproducer')
+
+    def test_ares_discovery_from_older_runner_is_added_once_and_then_reused(self):
+        scope = {'origins':['https://owned.example'], 'tools':[]}
+        first = {'role':'investigator', 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None}
+            for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}
+        plan = live_review.discovery_plan('reproducer', scope, [first])
+        self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['ares-web-surface'])
+        second = {'role':'reproducer', 'tool_runs':[{'tool':'ares-web-surface','exit_code':0,'failure':None}]}
+        self.assertEqual(live_review.discovery_plan('challenger', scope, [first,second])[-1],
+                         {'tool':'ares-web-surface','action':'reuse','source_role':'reproducer'})
+        scope['origins'].append('https://other-owned.example')
+        self.assertEqual(live_review.discovery_plan('challenger', scope, [first,second])[-1]['action'], 'unavailable')
+
+    def test_failed_or_absent_scout_does_not_prevent_followup_discovery(self):
+        scope = {'origins':['https://owned.example'], 'tools':[]}
+        for previous in [[], [{'role':'investigator','tool_runs':[]}],
+                         [{'role':'investigator','tool_runs':[{'tool':'nuclei','exit_code':1,'failure':'timeout'}]}]]:
+            plan = live_review.discovery_plan('reproducer', scope, previous)
+            self.assertTrue(all(p['action']=='recover' for p in plan))
+            self.assertNotIn('artex-engine', [p['tool'] for p in plan])
+
     def test_two_large_role_reports_reach_the_runner_without_truncation(self):
         previous = [{"role": role, "evidence": [{"id": 1, "body_excerpt": "x" * (4 * 1024 * 1024 - 4096)}]}
                     for role in ("investigator", "reproducer")]
@@ -65,6 +242,73 @@ class LiveOverviewTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def setUp(self):
+        adapter.bridge_stopping.clear()
+        adapter.engine_stopping.clear()
+        adapter.engine_stop_reason = None
+
+    def tearDown(self):
+        adapter.bridge_stopping.clear()
+        adapter.engine_stopping.clear()
+
+    def test_finished_discovery_rejects_queued_calls_but_allows_the_reviewer(self):
+        adapter.engine_stopping.set()
+        for path in ['/patchriot/artex/v1/chat/completions', '/patchriot/artex/http']:
+            result, requests = self.exchange([], 'POST', path, '{}')
+            self.assertEqual(result[0], 429)
+            self.assertEqual(requests, [])
+        frames = [{'type':'start','id':1,'status':200,'content_type':'application/json'},
+                  {'type':'chunk','id':1,'hex':b'{}'.hex()}, {'type':'end','id':1}]
+        result, requests = self.exchange(frames, 'POST', '/v1/chat/completions', '{}')
+        self.assertEqual(result[0], 200)
+        self.assertEqual(len(requests), 1)
+
+    def test_discovery_distinguishes_budget_stop_from_provider_failure(self):
+        for reason, expected in [('engine_budget_reached', 'model_budget'),
+                                 ('provider_rate_limited', 'model_request_rejected'),
+                                 ('near_verification_timeout', 'model_request_rejected')]:
+            with self.subTest(reason=reason):
+                adapter.engine_stopping.clear()
+                payload=json.dumps({'error':reason}).encode()
+                frames=[{'type':'start','id':1,'status':429,'content_type':'application/json'},
+                        {'type':'chunk','id':1,'hex':payload[:10].hex()},
+                        {'type':'chunk','id':1,'hex':payload[10:].hex()}, {'type':'end','id':1}]
+                result, requests=self.exchange(frames,'POST','/patchriot/artex/v1/chat/completions','{}')
+                self.assertEqual(result[0],429)
+                self.assertTrue(adapter.engine_stopping.is_set())
+                self.assertEqual(adapter.engine_stop_reason,expected)
+                self.assertEqual(len(requests),1)
+
+    def test_final_result_waits_for_the_active_response_and_rejects_late_browser_requests(self):
+        wire = io.StringIO()
+        with patch.object(adapter, 'wire_out', wire):
+            with adapter.transaction_lock:
+                finishing = threading.Thread(target=adapter.finish_result, kwargs={'completed':True})
+                finishing.start()
+                self.assertTrue(adapter.bridge_stopping.wait(timeout=2))
+                result, requests = self.exchange([], 'POST', '/patchriot/browser/status', '{}')
+                self.assertEqual(result[0], 503)
+                self.assertEqual(requests, [])
+                self.assertEqual(wire.getvalue(), '')
+            finishing.join(timeout=2)
+            self.assertFalse(finishing.is_alive())
+        self.assertEqual(json.loads(wire.getvalue()), {'type':'event','event':'result','data':{'completed':True}})
+        result, requests = self.exchange([], 'GET', '/v1/models')
+        self.assertEqual(result[0], 503)
+        self.assertEqual(requests, [])
+
+    def test_failed_browser_cleanup_retains_the_report_without_claiming_completion(self):
+        class StuckBrowser:
+            def close(self):
+                raise TimeoutError('synthetic stuck browser')
+        wire = io.StringIO()
+        with patch.object(adapter, 'wire_out', wire):
+            adapter.finish_result(StuckBrowser(), completed=True, final_response='partial owned observation')
+        result = json.loads(wire.getvalue())['data']
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['final_response'], 'partial owned observation')
+        self.assertEqual(result['cleanup_error'], 'browser_cleanup_unconfirmed')
+
     def test_execution_budget_is_explicit_bounded_and_not_model_controlled(self):
         for value in ["600", "1200", "1800", "3600"]:
             self.assertEqual(adapter.execution_budget(value), int(value))
@@ -153,8 +397,78 @@ class BridgeTests(unittest.TestCase):
 
     def test_oversized_http_body_never_enters_the_pipe(self):
         result, wire = self.exchange([], "POST", "/v1/chat/completions", headers={"Content-Length": str(adapter.MAX_REQUEST + 1)})
-        self.assertEqual(result[0], 400)
+        self.assertEqual(result[0], 413)
+        self.assertEqual(json.loads(result[2])['error']['code'], 'request_too_large')
         self.assertEqual(wire, [])
+
+    def test_encoded_conversation_overflow_returns_a_compressible_error_without_a_model_call(self):
+        # UTF-8 fits on HTTP, but the pipe's ASCII JSON escapes do not. The
+        # envelope can also push an otherwise fitting plain-text body over.
+        for content in ('é' * (adapter.MAX_REQUEST // 3), 'x' * (adapter.MAX_REQUEST - 100)):
+            body = json.dumps({'messages':[{'role':'user','content':content}]}, ensure_ascii=False).encode()
+            self.assertLess(len(body), adapter.MAX_REQUEST)
+            result, wire = self.exchange([], 'POST', '/v1/chat/completions', body)
+            self.assertIsNotNone(result, 'A size rejection must not look like a lost connection')
+            self.assertEqual(result[0], 413)
+            self.assertEqual(json.loads(result[2])['error']['code'], 'request_too_large')
+            self.assertEqual(wire, [], 'Rejected input must not spend provider allowance')
+            self.assertFalse(adapter.bridge_stopping.is_set())
+
+        frames = [{'type':'start','id':1,'status':200,'content_type':'application/json'},
+                  {'type':'chunk','id':1,'hex':b'{}'.hex()}, {'type':'end','id':1}]
+        result, wire = self.exchange(frames, 'POST', '/v1/chat/completions', '{"messages":[]}')
+        self.assertEqual(result[0], 200, 'A smaller retry must still reach the broker')
+        self.assertEqual(len(wire), 1)
+
+    def test_oversized_engine_input_ends_discovery_without_stopping_the_reviewer(self):
+        result, wire = self.exchange([], 'POST', '/patchriot/artex/v1/chat/completions',
+            headers={'Content-Length':str(adapter.MAX_REQUEST + 1)})
+        self.assertEqual(result[0], 413)
+        self.assertEqual(wire, [])
+        self.assertTrue(adapter.engine_stopping.is_set())
+        self.assertEqual(adapter.engine_stop_reason, 'model_request_rejected')
+        self.assertFalse(adapter.bridge_stopping.is_set())
+
+    def test_discovery_budget_stops_only_the_engine_and_keeps_the_bridge_open(self):
+        frames = [
+            {'type':'start','id':1,'status':429,'content_type':'application/json'},
+            {'type':'chunk','id':1,'hex':b'{"error":"engine_http_budget_reached"}'.hex()},
+            {'type':'end','id':1},
+        ]
+        result, _ = self.exchange(frames, 'POST', '/patchriot/artex/http', '{}')
+        self.assertEqual(result[0], 429)
+        self.assertTrue(adapter.engine_stopping.is_set())
+        self.assertEqual(adapter.engine_stop_reason, 'target_request_budget')
+        self.assertFalse(adapter.bridge_stopping.is_set())
+        frames[0]['status'] = 200
+        result, wire = self.exchange(frames, 'POST', '/patchriot/http', '{}')
+        self.assertEqual(result[0], 200)
+        self.assertEqual(wire[0]['request']['path'], '/patchriot/http')
+
+    def test_an_invalid_discovery_probe_does_not_end_all_discovery(self):
+        frames = [{'type':'start','id':1,'status':400,'content_type':'application/json'},
+                  {'type':'end','id':1}]
+        result, _ = self.exchange(frames, 'POST', '/patchriot/artex/http', '{}')
+        self.assertEqual(result[0], 400)
+        self.assertFalse(adapter.engine_stopping.is_set())
+
+    def test_provider_rate_limit_ends_discovery_without_replaying_or_closing_the_reviewer(self):
+        frames = [
+            {'type':'start','id':1,'status':429,'content_type':'application/json'},
+            {'type':'chunk','id':1,'hex':b'{"error":"provider_rate_limited"}'.hex()},
+            {'type':'end','id':1},
+        ]
+        result, wire = self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+        self.assertEqual(result[0], 429)
+        self.assertEqual(json.loads(result[2])['error'], 'provider_rate_limited')
+        self.assertEqual(len(wire), 1, 'Do not replay a paid request')
+        self.assertTrue(adapter.engine_stopping.is_set())
+        self.assertFalse(adapter.bridge_stopping.is_set())
+        frames[0]['status'] = 200
+        frames[1]['hex'] = b'{"choices":[]}'.hex()
+        result, wire = self.exchange(frames, 'POST', '/v1/chat/completions', '{}')
+        self.assertEqual(result[0], 200)
+        self.assertEqual(wire[0]['request']['path'], '/v1/chat/completions')
 
     def test_phase_name_is_data_and_events_remain_bounded(self):
         wire = io.StringIO()

@@ -3,7 +3,46 @@
 use futures_util::StreamExt;
 use nearai_inference_sdk::*;
 use serde_json::{Value, json};
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
+
+// The legacy near_verification_timeout code covers this whole verified route,
+// including model generation. Keep the wire code compatible with saved receipts;
+// these phase timings identify the wait without printing private input/output.
+async fn timed_phase<T>(
+    name: &'static str,
+    operation: impl Future<Output = Result<T, &'static str>>,
+) -> Result<T, &'static str> {
+    struct Timing {
+        name: &'static str,
+        started: Instant,
+        outcome: &'static str,
+    }
+    impl Drop for Timing {
+        fn drop(&mut self) {
+            eprintln!(
+                "NEAR phase: name={} outcome={} duration_ms={}",
+                self.name,
+                self.outcome,
+                self.started.elapsed().as_millis()
+            );
+        }
+    }
+    let mut timing = Timing {
+        name,
+        started: Instant::now(),
+        outcome: "cancelled",
+    };
+    let result = operation.await;
+    timing.outcome = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    result
+}
 
 /// Keep JSON-array tool output as text when it crosses the encrypted route.
 /// A literal `[]` was rejected in live requests; a text label preserves the
@@ -118,59 +157,70 @@ pub(super) async fn complete(
         .remove("stream_options");
     let model = body["model"].as_str().ok_or("wrong_model")?.to_string();
     let operation = async {
-        let preflight = retry_preflight(|| client.verify(&model)).await?;
+        let preflight =
+            timed_phase("attestation", retry_preflight(|| client.verify(&model))).await?;
         if preflight.models.is_empty() {
             return Err("near_model_attestation_required");
         }
         let request = client
             .chat_request(body)
             .map_err(|_| "invalid_model_request")?;
-        let response = client
-            .send(request)
-            .await
-            .map_err(|_| "provider_unavailable")?;
-        let completion = completion_body(response).await?;
+        let completion = timed_phase("completion", async {
+            let response = client
+                .send(request)
+                .await
+                .map_err(|_| "provider_unavailable")?;
+            completion_body(response).await
+        })
+        .await?;
         let id = completion["id"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 256)
-            .ok_or("provider_missing_completion_id")?;
+            .ok_or("provider_missing_completion_id")?
+            .to_owned();
         if completion["model"] != model {
             return Err("wrong_provider_model");
         }
-        for attempt in 0..3 {
-            match client.verify_response(id).await {
-                Ok(receipt)
-                    if receipt.signature_kind() == CompletionSignatureKind::ProviderTee
-                        && matches!(
-                            receipt.attestation,
-                            VerifiedCompletionAttestation::Model(_)
-                        ) =>
-                {
-                    super::routing::check_repetition(&completion)?;
-                    return Ok(completion);
-                }
-                Ok(_) => return Err("near_model_signature_required"),
-                Err(e) if e.retryable() && attempt < 2 => {
-                    tokio::time::sleep(Duration::from_secs(2)).await
-                }
-                Err(e) => {
-                    return Err(if e.retryable() {
-                        "near_signature_unavailable"
-                    } else {
-                        "near_signature_invalid"
-                    });
+        timed_phase("signature", async {
+            for attempt in 0..3 {
+                match client.verify_response(&id).await {
+                    Ok(receipt)
+                        if receipt.signature_kind() == CompletionSignatureKind::ProviderTee
+                            && matches!(
+                                receipt.attestation,
+                                VerifiedCompletionAttestation::Model(_)
+                            ) =>
+                    {
+                        super::routing::check_repetition(&completion)?;
+                        return Ok(completion);
+                    }
+                    Ok(_) => return Err("near_model_signature_required"),
+                    Err(e) if e.retryable() && attempt < 2 => {
+                        tokio::time::sleep(Duration::from_secs(2)).await
+                    }
+                    Err(e) => {
+                        return Err(if e.retryable() {
+                            "near_signature_unavailable"
+                        } else {
+                            "near_signature_invalid"
+                        });
+                    }
                 }
             }
-        }
-        Err("near_signature_unavailable")
-    };
-    let result = tokio::time::timeout(Duration::from_secs(180), operation)
+            Err("near_signature_unavailable")
+        })
         .await
-        .map_err(|_| "near_verification_timeout");
+    };
+    let result = super::await_model_reply(
+        operation,
+        super::MODEL_REPLY_TIMEOUT,
+        "near_verification_timeout",
+    )
+    .await;
     // Neither conversations nor signed response bodies need to accumulate in
     // the broker between calls. Keep the short-lived attestation cache only.
     client.clear_response_cache().await;
-    result?
+    result
 }
 
 pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>, &'static str> {

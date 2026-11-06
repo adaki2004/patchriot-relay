@@ -247,13 +247,10 @@ impl std::fmt::Display for RemoteError {
 impl std::error::Error for RemoteError {}
 
 #[derive(Debug)]
-struct DispatcherConnectionError;
+struct DispatcherConnectionError(&'static str);
 impl std::fmt::Display for DispatcherConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "dispatcher connection interrupted; check connectivity and TLS"
-        )
+        write!(f, "dispatcher {}", self.0)
     }
 }
 impl std::error::Error for DispatcherConnectionError {}
@@ -289,11 +286,23 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         .try_into()?;
     let request = sign(key, &config.audience, path, signed_at, payload)?;
     let url = validate_url(&config.dispatcher)?.join(path)?;
-    let response = client
-        .post(url)
-        .json(&request)
-        .send()
-        .map_err(|_| DispatcherConnectionError)?;
+    let outgoing = client.post(url).json(&request);
+    // A completed live report may contain 4 MiB of evidence. Keep the short
+    // heartbeat timeout, but allow its upload more time while leases renew.
+    let outgoing = if path.ends_with("/work/complete") {
+        outgoing.timeout(Duration::from_secs(30))
+    } else {
+        outgoing
+    };
+    let response = outgoing.send().map_err(|error| {
+        DispatcherConnectionError(if error.is_timeout() {
+            "request timed out"
+        } else if error.is_connect() {
+            "connection failed"
+        } else {
+            "request failed"
+        })
+    })?;
     if !response.status().is_success() {
         return Err(Box::new(RemoteError {
             status: response.status().as_u16(),
@@ -304,7 +313,7 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
     response
         .take(maximum + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| DispatcherConnectionError)?;
+        .map_err(|_| DispatcherConnectionError("response read failed"))?;
     if bytes.len() as u64 > maximum {
         return Err("dispatcher response exceeded limit".into());
     }
@@ -541,6 +550,30 @@ fn send_result(directory: &Path, client: &reqwest::blocking::Client) -> Result<(
     Ok(())
 }
 
+fn send_result_while_active(
+    directory: &Path,
+    client: &reqwest::blocking::Client,
+    active: impl Fn() -> bool,
+) -> Result<(), Error> {
+    loop {
+        match send_result(directory, client) {
+            Err(error) if retryable_dispatcher_error(&error) && active() => {
+                // Stay inside agent_work's lease-monitor scope. Returning to
+                // connect's outer backoff used to stop renewal and lose an
+                // already completed report when the upload failed briefly.
+                eprintln!("saved result delivery retry pending: {error}");
+                for _ in 0..20 {
+                    if !active() {
+                        return Err(error);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
 fn work_tick(
     directory: &Path,
     client: &reqwest::blocking::Client,
@@ -550,6 +583,23 @@ fn work_tick(
     source_reviews: bool,
     live_tests: bool,
 ) -> Result<(), Error> {
+    // A restarted relay can have a completed outbox but no running monitor.
+    // Refresh its existing lease before a potentially large upload. A completed
+    // server lease may reject renewal yet still accept an idempotent replay.
+    let saved = read_config(directory)?;
+    if let Some(result) = &saved.pending_result
+        && !saved.paused
+        && saved.active_assignment.as_ref().map(|a| a.lease_id) == Some(result.lease_id)
+    {
+        match renew(directory, client, result.lease_id, None) {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteError>()
+                    .is_some_and(|e| [404, 409].contains(&e.status)) => {}
+            Err(error) => return Err(error),
+        }
+    }
     send_result(directory, client)?;
     let (config, key) = {
         let _lock = state_lock(directory)?;
@@ -985,7 +1035,11 @@ fn agent_work(
                     "diagnostic trace could not be saved; result remains queued for delivery"
                 );
             }
-            send_result(directory, client)
+            send_result_while_active(directory, client, || {
+                !stop.load(Ordering::Relaxed)
+                    && !window.stopped_at(Instant::now())
+                    && locally_ready(directory, assignment.lease_id)
+            })
         })();
         drop(stop_monitor);
         if monitor.join().is_err() {
@@ -1430,7 +1484,7 @@ mod tests {
         write_config(&state, &config).unwrap();
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for status in [503, 200] {
+            for status in [503, 503, 503, 200] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1462,21 +1516,37 @@ mod tests {
                 let body = if status == 503 {
                     "{}"
                 } else {
+                    // Completion uploads override a short heartbeat timeout.
+                    std::thread::sleep(Duration::from_millis(300));
                     "{\"accepted\":true,\"fixture_matches\":false,\"evidence_complete\":false,\"replayed\":true}"
                 };
                 write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).unwrap();
             }
             requests
         });
-        let client = client().unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
         assert!(retryable_dispatcher_error(
             &send_result(&state, &client).unwrap_err()
         ));
         assert!(read_config(&state).unwrap().pending_result.is_some());
-        send_result(&state, &client).unwrap();
+        // A stopped lease must not keep retrying. The unchanged outbox remains
+        // available for authoritative replay/cancellation handling.
+        assert!(send_result_while_active(&state, &client, || false).is_err());
+        assert!(read_config(&state).unwrap().pending_result.is_some());
+        let active_checks = std::sync::atomic::AtomicUsize::new(0);
+        send_result_while_active(&state, &client, || {
+            active_checks.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+        .unwrap();
+        assert!(active_checks.load(Ordering::Relaxed) > 1);
         assert!(read_config(&state).unwrap().pending_result.is_none());
         let requests = server.join().unwrap();
-        assert_eq!(requests, vec![serde_json::to_value(&expected).unwrap(); 2]);
+        assert_eq!(requests, vec![serde_json::to_value(&expected).unwrap(); 4]);
     }
 
     #[test]
