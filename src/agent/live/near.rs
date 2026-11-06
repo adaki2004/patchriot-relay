@@ -164,13 +164,16 @@ pub(super) async fn complete(
         }
         Err("near_signature_unavailable")
     };
-    let result = tokio::time::timeout(Duration::from_secs(180), operation)
-        .await
-        .map_err(|_| "near_verification_timeout");
+    let result = super::await_model_reply(
+        operation,
+        super::MODEL_REPLY_TIMEOUT,
+        "near_verification_timeout",
+    )
+    .await;
     // Neither conversations nor signed response bodies need to accumulate in
     // the broker between calls. Keep the short-lived attestation cache only.
     client.clear_response_cache().await;
-    result?
+    result
 }
 
 pub(super) fn response_bytes(completion: &Value, stream: bool) -> Result<Vec<u8>, &'static str> {

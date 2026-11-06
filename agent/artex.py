@@ -21,6 +21,7 @@ API_LIMIT = 512 * 1024
 API = 'http://127.0.0.1:8787'
 POSTGRES = '/usr/lib/postgresql/17/bin/'
 TERMINAL = {'completed', 'done', 'failed', 'paused', 'stopped', 'timed_out', 'timeout', 'unavailable'}
+NO_TARGET_PROGRESS_SECONDS = 300
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -168,7 +169,7 @@ class Engine:
             self.__exit__(None, None, None)
             raise
 
-    def assess(self, scope, targets, role, stop=lambda: False):
+    def assess(self, scope, targets, role, stop=lambda: False, progress=lambda: 0):
         seconds = max(1, int(self.deadline - time.monotonic()))
         body = task_body(scope, targets, seconds, role)
         body['llm_profile_ids'] = [self.profile_id]
@@ -177,6 +178,7 @@ class Engine:
         if not identifier.isascii() or not identifier.isdecimal():
             raise ValueError('invalid engine task id')
         reason = 'time_budget'
+        observed, last_progress = progress(), time.monotonic()
         while time.monotonic() < self.deadline:
             task = self.client.call('/api/tasks/' + identifier)
             interrupted = stop()
@@ -185,6 +187,12 @@ class Engine:
                 break
             if should_stop(task):
                 reason = 'model_budget' if task.get('llm_failover_state') == 'chain_exhausted' else task['status']
+                break
+            current = progress()
+            if current > observed:
+                observed, last_progress = current, time.monotonic()
+            if time.monotonic() - last_progress >= NO_TARGET_PROGRESS_SECONDS:
+                reason = 'no_target_progress'
                 break
             if self.process.poll() is not None:
                 raise RuntimeError('engine exited before collection')
@@ -201,6 +209,8 @@ class Engine:
         return {
             'engine': 'ARTEX', 'commit': VERSION, 'stop_reason': reason,
             'coverage_complete': reason in ('completed', 'done'),
+            'distinct_target_observations': observed,
+            'seconds_without_target_progress': int(time.monotonic() - last_progress),
             'target_mapping': dict(zip(scope['origins'], targets)),
             'outcome': self.client.call('/api/tasks/' + identifier + '/outcome'),
             'findings': self.client.call('/api/exploration/findings?task=' + identifier),
@@ -237,7 +247,8 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
             mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or partial(request, discovery=True), methods=scope['methods'])) for origin in scope['origins']]
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
             try:
-                result = engine.assess(scope, [mirror.url for mirror in mirrors], role, stop=stop)
+                result = engine.assess(scope, [mirror.url for mirror in mirrors], role, stop=stop,
+                                      progress=lambda: sum(len(m.progress_keys) for m in mirrors))
                 code = 0
                 if not result['coverage_complete']:
                     failure = 'incomplete'
@@ -255,11 +266,13 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         'Only recorded broker requests establish that a target was contacted. Engine findings and command counts are not independent verification.',
         'Only the methods and test-account access declared in scope were allowed. Browser login, network discovery, external callbacks and unrestricted egress are unsupported. Missing binaries and blocked tests are coverage gaps.',
         'A budget-limited run may contain useful findings while leaving goals unfinished. Review its stop reason and the later agents’ control requests.',
+        'Discovery stops after five minutes without a new recorded target observation. Planning, status polling and identical repeated replies do not reset that timer. This can interrupt slow analysis; it is not proof of complete coverage.',
     ]
     # Keep coverage and stop information ahead of potentially long transcripts
     # in the display excerpt. The full file remains available for the review.
     output = json.dumps({key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
+        'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'outcome', 'findings', 'commands'
     ) if key in result}, ensure_ascii=True)
     (directory / 'artex-results.json').write_text(output)

@@ -196,6 +196,11 @@ class Bridge(BaseHTTPRequestHandler):
             with transaction_lock:
                 if bridge_stopping.is_set():
                     return self.send_error(503)
+                if self.path.startswith('/patchriot/artex/') and engine_stopping.is_set():
+                    # A queued engine call must not spend the reviewer's time
+                    # after discovery has stopped. Drain any in-flight reply
+                    # normally; never let the next caller consume its frames.
+                    return self.send_error(429)
                 request_id += 1
                 request = {"id": request_id, "method": self.command, "path": self.path, "body": body}
                 try:
@@ -301,9 +306,12 @@ def main():
             # also shares the relay's total model and target-request allowances.
             event("phase", name="artex_engine")
             engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
-            result = artex.run(scope, role, engine_deadline, model=model,
-                               stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
-                               emit=lambda result: event("live_tool", run=result))
+            try:
+                result = artex.run(scope, role, engine_deadline, model=model,
+                                   stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
+                                   emit=lambda result: event("live_tool", run=result))
+            finally:
+                engine_stopping.set()
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)

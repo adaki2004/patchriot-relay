@@ -369,6 +369,92 @@ mod tests {
     fn reply() -> Value {
         json!({"model":VENICE_FALLBACK_MODEL,"choices":[{"message":{"role":"assistant","content":"fixture"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100}})
     }
+    #[tokio::test]
+    async fn stalled_primary_is_dropped_before_one_backup_with_no_budget_refund() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let broker = broker();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut routes = Vec::new();
+        let result = broker
+            .route_completion(request(), true, |route, _| {
+                routes.push(route);
+                let dropped = dropped.clone();
+                async move {
+                    if route == Route::Venice {
+                        assert!(dropped.load(Ordering::SeqCst));
+                        return Ok(reply());
+                    }
+                    await_model_reply(
+                        async move {
+                            let _guard = Dropped(dropped);
+                            std::future::pending::<Result<Value, &'static str>>().await
+                        },
+                        Duration::from_millis(1),
+                        "near_verification_timeout",
+                    )
+                    .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, reply());
+        assert_eq!(routes, vec![Route::Near, Route::Venice]);
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(count.calls, 1);
+        let reservation = token_cost(
+            LiveProvider::NearDeepSeek,
+            serde_json::to_vec(&request()).unwrap().len() as u64 + 4096,
+            8192,
+        )
+        .unwrap();
+        assert_eq!(
+            count.reserved,
+            reservation + fallback_cost(1000, 100).unwrap()
+        );
+        assert_eq!(
+            count.fallback.as_ref().unwrap().reason,
+            "near_verification_timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_stalled_providers_stop_discovery_without_a_retry_loop() {
+        let broker = broker();
+        let mut routes = Vec::new();
+        let error = broker
+            .route_completion(request(), true, |route, _| {
+                routes.push(route);
+                await_model_reply(
+                    std::future::pending::<Result<Value, &'static str>>(),
+                    Duration::from_millis(1),
+                    if route == Route::Near {
+                        "near_verification_timeout"
+                    } else {
+                        "provider_unavailable"
+                    },
+                )
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(routes, vec![Route::Near, Route::Venice]);
+        let request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: ENGINE_CHAT.into(),
+            body: None,
+        };
+        assert!(recoverable_engine_error(&request, error));
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(count.calls, 1);
+        assert!(count.reserved > 0);
+        assert_eq!(count.fallback.as_ref().unwrap().fallback_completed, 0);
+    }
     #[test]
     fn repetition_guard_covers_reasoning_and_preserves_short_or_distinct_output() {
         let looped = "Reconsidering the same finding without any new evidence. ".repeat(400);

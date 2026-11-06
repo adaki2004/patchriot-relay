@@ -17,6 +17,21 @@ import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_new_evidence_ids_and_repeated_replies_do_not_fake_target_progress(self):
+        calls = []
+        def fixture(method, url, headers, **kwargs):
+            calls.append(url)
+            if url.endswith('/unavailable'): return {'error':'request_error'}
+            return {'body':'changed' if len(calls) == 3 else 'same',
+                    'evidence':{'id':len(calls), 'status':200, 'headers':{'x-request-id':str(len(calls))}}}
+        with tools.ScopeMirror('https://owned.example', time.monotonic()+5, fixture) as mirror:
+            for path, expected in [('/',1),('/',1),('/',2),('/other',3),('/unavailable',3)]:
+                client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+                client.request('GET', path)
+                response = client.getresponse(); response.read(); client.close()
+                self.assertEqual(len(mirror.progress_keys), expected)
+            self.assertEqual(mirror.refs, [1,2,3,4], 'Repeated evidence must remain available to the reviewer')
+
     def test_discovery_keeps_exact_redacted_records_after_the_http_budget_is_used(self):
         records = [
             {'id':25, 'method':'GET', 'url':'https://owned.example/private', 'status':401,

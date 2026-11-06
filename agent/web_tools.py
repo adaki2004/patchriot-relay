@@ -172,6 +172,9 @@ class ScopeMirror:
     def __init__(self, origin, deadline, fetch=request, methods=None):
         self.methods = methods or ["GET", "HEAD", "OPTIONS"]
         self.origin, self.fetch, self.deadline, self.refs = origin, fetch, deadline, []
+        # Count new recorded observations, not polling or repeated identical
+        # replies. Only hashes are retained here; the broker owns the evidence.
+        self.progress_keys = set()
         mirror = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -222,6 +225,9 @@ class ScopeMirror:
                     if evidence.get("id"):
                         mirror.refs.append(evidence["id"])
                     status = evidence.get("status")
+                    if status and evidence.get("id"):
+                        observation = [self.command, origin + self.path, data, status, reply.get("body", "")]
+                        mirror.progress_keys.add(hashlib.sha256(json.dumps(observation).encode()).digest())
                     payload = reply.get("body", "").encode() if status else b"relay request unavailable"
                     self.send_response(status or 502)
                     for name, value in evidence.get("headers", {}).items():

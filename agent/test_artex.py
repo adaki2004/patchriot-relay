@@ -12,6 +12,7 @@ import unittest
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import artex
@@ -43,7 +44,7 @@ class EngineTests(unittest.TestCase):
             def __init__(self, _directory, _bridge, _deadline, model): models.append(model)
             def __enter__(self): return self
             def __exit__(self, *_): pass
-            def assess(self, scope, targets, role, stop=lambda: False):
+            def assess(self, scope, targets, role, stop=lambda: False, progress=lambda: 0):
                 return {'engine': 'ARTEX', 'commit': artex.VERSION, 'stop_reason': 'model_budget',
                         'coverage_complete': False, 'findings': [], 'commands': []}
         with tempfile.TemporaryDirectory() as temp, patch.object(artex, 'Engine', FakeEngine):
@@ -76,6 +77,40 @@ class EngineTests(unittest.TestCase):
                                stop=lambda: 'target_request_budget')
         self.assertEqual(result['stop_reason'], 'target_request_budget')
         self.assertFalse(result['coverage_complete'])
+
+    def test_watchdog_ignores_heartbeats_preserves_leads_and_yields_to_completion(self):
+        # A fake clock exercises the five-minute wait without sleeping. A new
+        # observation at minute four extends it; task heartbeats alone do not.
+        for progress_at, completed_at, expected_time, expected_reason in [
+            (None, None, 300, 'no_target_progress'),
+            (240, None, 540, 'no_target_progress'),
+            (None, 300, 300, 'completed'),
+        ]:
+            with self.subTest(progress_at=progress_at, completed_at=completed_at), tempfile.TemporaryDirectory() as temp:
+                clock, calls = [0.0], []
+                class FakeClient:
+                    def call(self, path, body=None):
+                        calls.append((path, body))
+                        if path == '/api/tasks': return {'id': 7}
+                        if path == '/api/tasks/7':
+                            return {'status': 'completed' if completed_at is not None and clock[0] >= completed_at else 'running',
+                                    'heartbeat': clock[0]}
+                        if path.startswith('/api/exploration/findings'):
+                            return [{'title': 'Owned fixture lead', 'verified': False}]
+                        return {}
+                def tick(_seconds): clock[0] += 60
+                engine = object.__new__(artex.Engine)
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 900, 1
+                engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
+                (engine.directory / 'process.log').write_text('')
+                with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
+                    result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator',
+                        progress=lambda: int(progress_at is not None and clock[0] >= progress_at))
+                self.assertEqual(clock[0], expected_time)
+                self.assertEqual(result['stop_reason'], expected_reason)
+                self.assertEqual(result['coverage_complete'], completed_at is not None)
+                self.assertEqual(result['findings'], [{'title': 'Owned fixture lead', 'verified': False}])
+                self.assertEqual(('/api/tasks/7/control', {'action':'pause'}) in calls, completed_at is None)
 
     def test_engine_http_uses_the_discovery_route_and_other_probes_keep_their_route(self):
         import live_http

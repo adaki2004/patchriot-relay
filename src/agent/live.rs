@@ -20,13 +20,33 @@ pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
 // addition to the byte limit without cutting a valid 200-call role in half.
 const MAX_MODEL_MESSAGES: usize = 1024;
+// Live pilot calls normally returned within a minute. Bound the whole reply,
+// including NEAR verification, so one provider cannot hold the worker for three
+// minutes before the consented backup gets a turn. No unverified reply is used.
+const MODEL_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
+
+async fn await_model_reply<T>(
+    operation: impl std::future::Future<Output = Result<T, &'static str>>,
+    timeout: Duration,
+    reason: &'static str,
+) -> Result<T, &'static str> {
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| {
+            eprintln!(
+                "model reply stopped: reason={reason} wait_ms={}",
+                timeout.as_millis()
+            );
+            reason
+        })?
+}
 pub fn is_chat_path(path: &str) -> bool {
     path == "/v1/chat/completions" || path == ENGINE_CHAT || path == SUMMARY_CHAT
 }
 /// A rejected discovery request must stop that engine, not discard the later
 /// reviewer's chance to report the saved evidence. Local input errors send no
-/// model request; a provider rate limit keeps its attempt and cost reservation.
-/// Neither is retried here. Authentication, attestation and scope failures stop
+/// model request; transient provider failures keep their attempt and cost
+/// reservation. None is retried here. Authentication, attestation and scope failures stop
 /// the role.
 pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool {
     request.path == ENGINE_CHAT
@@ -34,6 +54,9 @@ pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool 
             reason,
             "engine_budget_reached"
                 | "provider_rate_limited"
+                | "provider_unavailable"
+                | "provider_stream_interrupted"
+                | "near_verification_timeout"
                 | "model_history_limit"
                 | "model_messages_empty"
                 | "model_message_role"
@@ -281,7 +304,7 @@ impl LiveBroker {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(180))
+            .timeout(MODEL_REPLY_TIMEOUT)
             .build()?;
         let access = access::Access::new(&scope, credentials)?;
         let near = if provider == LiveProvider::NearDeepSeek {
@@ -1316,7 +1339,6 @@ mod tests {
             "engine_not_selected",
             "near_signature_invalid",
             "provider_authentication_failed",
-            "provider_unavailable",
             "wrong_provider_model",
         ] {
             assert!(!recoverable_engine_error(&request, reason));

@@ -206,6 +206,19 @@ class BridgeTests(unittest.TestCase):
 
     def tearDown(self):
         adapter.bridge_stopping.clear()
+        adapter.engine_stopping.clear()
+
+    def test_finished_discovery_rejects_queued_calls_but_allows_the_reviewer(self):
+        adapter.engine_stopping.set()
+        for path in ['/patchriot/artex/v1/chat/completions', '/patchriot/artex/http']:
+            result, requests = self.exchange([], 'POST', path, '{}')
+            self.assertEqual(result[0], 429)
+            self.assertEqual(requests, [])
+        frames = [{'type':'start','id':1,'status':200,'content_type':'application/json'},
+                  {'type':'chunk','id':1,'hex':b'{}'.hex()}, {'type':'end','id':1}]
+        result, requests = self.exchange(frames, 'POST', '/v1/chat/completions', '{}')
+        self.assertEqual(result[0], 200)
+        self.assertEqual(len(requests), 1)
 
     def test_final_result_waits_for_the_active_response_and_rejects_late_browser_requests(self):
         wire = io.StringIO()
