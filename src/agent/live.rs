@@ -18,12 +18,12 @@ pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
 const ENGINE_HTTP: &str = "/patchriot/artex/http";
 pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
-// addition to the byte limit without cutting a valid 200-call role in half.
+// addition to the byte limit without cutting the expanded role allowance in half.
 const MAX_MODEL_MESSAGES: usize = 4096;
-// Live pilot calls normally returned within a minute. Bound the whole reply,
-// including NEAR verification, so one provider cannot hold the worker for three
-// minutes before the consented backup gets a turn. No unverified reply is used.
-const MODEL_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
+// Long reasoning calls can exceed ninety seconds. Bound the whole reply,
+// including NEAR verification, while allowing three minutes within the existing
+// role deadline and spend cap. No unverified reply is used.
+const MODEL_REPLY_TIMEOUT: Duration = Duration::from_secs(180);
 
 async fn await_model_reply<T>(
     operation: impl std::future::Future<Output = Result<T, &'static str>>,
