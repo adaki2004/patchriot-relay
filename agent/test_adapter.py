@@ -119,7 +119,7 @@ class LiveOverviewTests(unittest.TestCase):
         scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
         first = {'role':'investigator', 'assessment':None, 'tool_runs':[
             {'tool':name, 'exit_code':0, 'failure':None}
-            for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}
+            for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}
         plan = live_review.discovery_plan('reproducer', scope, [first])
         self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['artex-engine'])
         self.assertEqual([p['action'] for p in plan[:3]], ['reuse'] * 3)
@@ -130,6 +130,19 @@ class LiveOverviewTests(unittest.TestCase):
         plan = live_review.discovery_plan('challenger', scope, [first, second])
         self.assertEqual(plan[-1]['action'], 'reuse')
         self.assertEqual(plan[-1]['source_role'], 'reproducer')
+
+    def test_ares_discovery_from_older_runner_is_added_once_and_then_reused(self):
+        scope = {'origins':['https://owned.example'], 'tools':[]}
+        first = {'role':'investigator', 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None}
+            for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}
+        plan = live_review.discovery_plan('reproducer', scope, [first])
+        self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['ares-web-surface'])
+        second = {'role':'reproducer', 'tool_runs':[{'tool':'ares-web-surface','exit_code':0,'failure':None}]}
+        self.assertEqual(live_review.discovery_plan('challenger', scope, [first,second])[-1],
+                         {'tool':'ares-web-surface','action':'reuse','source_role':'reproducer'})
+        scope['origins'].append('https://other-owned.example')
+        self.assertEqual(live_review.discovery_plan('challenger', scope, [first,second])[-1]['action'], 'unavailable')
 
     def test_failed_or_absent_scout_does_not_prevent_followup_discovery(self):
         scope = {'origins':['https://owned.example'], 'tools':[]}

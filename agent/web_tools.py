@@ -325,6 +325,9 @@ def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="inv
         emit(initial)
     for origin in scope["origins"]:
         checks = []
+        if 'ares-web-surface' in selected:
+            import ares_web
+            checks.append(lambda: ares_web.run(origin, deadline))
         if 'patchriot-crawl' in selected:
             checks.append(lambda: crawl(origin, deadline))
         if 'nuclei' in selected:

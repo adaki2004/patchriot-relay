@@ -13,6 +13,7 @@ from urllib.error import URLError
 
 import web_tools as tools
 import live_http
+import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
@@ -158,17 +159,18 @@ class WebToolsTests(unittest.TestCase):
         scope = {'origins': ['https://owned.example'], 'methods': ['GET', 'HEAD', 'OPTIONS']}
         previous = [{'role':'investigator', 'tool_runs':[
             {'tool':name, 'exit_code':0, 'failure':None}
-            for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}]
+            for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}]
         for role in ['investigator', 'reproducer', 'challenger']:
             with tempfile.TemporaryDirectory() as temp, patch('baseline.run', return_value={'tool': 'baseline'}) as baseline, \
                     patch.object(tools, 'crawl', return_value={'tool': 'crawl'}) as crawl, \
+                    patch.object(ares_web, 'run', return_value={'tool':'ares-web-surface'}) as surface, \
                     patch.object(tools, 'scanner', return_value={'tool': 'nuclei'}) as scanner, \
                     patch.object(tools, 'controls', return_value={'tool': 'controls'}) as controls:
                 emitted = []
                 result = tools.run(scope, previous, Path(temp), emitted.append, role=role)
                 self.assertEqual(result['tool_runs'], emitted)
                 self.assertEqual(controls.call_count, 1)
-                for tool in (baseline, crawl, scanner):
+                for tool in (baseline, crawl, scanner, surface):
                     self.assertEqual(tool.call_count, int(role == 'investigator'))
                 self.assertEqual(json.loads((Path(temp) / 'tool-results.json').read_text())['role'], role)
 

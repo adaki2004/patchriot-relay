@@ -30,6 +30,8 @@ Scout investigates, Recon checks its leads and a third reviewer challenges serio
 
 Later roles reuse completed discovery records. A missing or failed discovery tool may be retried once; unfinished coverage remains visible. If a run stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.
 
+Discovery includes **ARES-derived web fingerprints** (`ares-web-surface`): at most 24 anonymous reads per approved origin, checking framework hints, common admin paths and recognizable exposed-file/API responses. Reports name the adapted component and pinned source revision. A login page, public API schema, redirect or access denial is not automatically a vulnerability. Missing-path controls and reviewer checks are required. This does not run the full ARES framework or scan server ports. Deploy the matching core and dispatcher protocol before rebuilding these agent images; old receipts and assignments remain supported.
+
 A provider rate limit during discovery ends that engine attempt and preserves its partial evidence for the reviewer. It does not trigger extra model retries or mark discovery complete. The reviewer still needs available inference to produce its assessment; provider authentication and verification failures stop the role.
 
 Conversations still have a transport size limit. If the HTTP body or its encoded message is too large, the local bridge returns a size error so Hermes can compact its history. That rejected input never reaches the model provider; it is not retried as a network outage.
