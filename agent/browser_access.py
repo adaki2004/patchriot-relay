@@ -11,12 +11,72 @@ import os
 import re
 import secrets
 import sys
+import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
 MAX_CONTROL = 32768
+
+
+class StaticAssetCache:
+    """Per-role cache for explicitly public, immutable browser assets only.
+
+    APIs, documents, login responses and direct testing tools stay uncached.
+    Entries never leave the disposable browser and never create evidence IDs.
+    """
+    def __init__(self, max_bytes=16 * 1024 * 1024, max_entries=128):
+        self.entries = OrderedDict()
+        self.bytes = 0
+        self.max_bytes, self.max_entries = max_bytes, max_entries
+        self.hits = 0
+
+    @staticmethod
+    def allowed(method, kind, headers):
+        control = headers.get('cache-control', '').lower()
+        return (method == 'GET' and kind in ('script', 'stylesheet', 'image', 'font')
+                and 'authorization' not in headers and 'range' not in headers
+                and not any(v in control for v in ('no-cache', 'no-store', 'max-age=0'))
+                and 'no-cache' not in headers.get('pragma', '').lower())
+
+    def get(self, url, method, kind, headers):
+        if not self.allowed(method, kind, headers): return None
+        entry = self.entries.get(url)
+        if not entry: return None
+        if entry['until'] <= time.monotonic():
+            self.bytes -= len(self.entries.pop(url)['body'])
+            return None
+        if any(headers.get(k, '') != v for k, v in entry['vary'].items()): return None
+        self.entries.move_to_end(url)
+        self.hits += 1
+        return entry
+
+    def put(self, url, method, kind, request_headers, status, headers, body):
+        old = self.entries.pop(url, None)
+        if old: self.bytes -= len(old['body'])
+        if not self.allowed(method, kind, request_headers) or status != 200: return
+        control = {p.strip().lower() for p in headers.get('cache-control', '').split(',')}
+        if not {'public', 'immutable'} <= control or control & {'private', 'no-cache', 'no-store'}: return
+        if 'set-cookie' in headers or len(body) > min(self.max_bytes, 2 * 1024 * 1024): return
+        vary = {v.strip().lower() for v in headers.get('vary', '').split(',') if v.strip()}
+        if '*' in vary: return
+        ages = [v.split('=', 1)[1] for v in control if v.startswith('max-age=')]
+        try:
+            if len(ages) != 1: return
+            age = max(0, int(headers.get('age', '0')))
+            if 'date' in headers:
+                age = max(age, time.time() - parsedate_to_datetime(headers['date']).timestamp())
+            ttl = int(ages[0]) - age
+            if ttl <= 0: return
+        except (ValueError, TypeError, OverflowError):
+            return
+        while self.entries and (self.bytes + len(body) > self.max_bytes or len(self.entries) >= self.max_entries):
+            self.bytes -= len(self.entries.popitem(last=False)[1]['body'])
+        self.entries[url] = {'until':time.monotonic() + ttl, 'vary':{k:request_headers.get(k, '') for k in vary}, 'headers':headers, 'body':body}
+        self.bytes += len(body)
 
 
 def rpc(base, path, body):
@@ -67,6 +127,10 @@ class BrowserAccess:
         self.errors = []
         self.inflight = 0
         self.http_slots = asyncio.Semaphore(4)
+        self.http_exhausted = False
+        self.assets = StaticAssetCache()
+        self.wallet_account = None
+        self.wallet_lock = asyncio.Lock()
         self.blocked_origins = set()
         self.directory, self.executable = Path(directory), executable
 
@@ -118,10 +182,20 @@ class BrowserAccess:
                 await route.abort('blockedbyclient')
                 return
             headers = await request.all_headers()
+            cached = self.assets.get(request.url, request.method, request.resource_type, headers)
+            if cached:
+                await route.fulfill(status=200, headers=cached['headers'], body=cached['body'])
+                return
             login = not resource and request.method == 'POST' and not self.verified
             # A split JS bundle can queue hundreds of files. Bound bridge
             # callers so queued assets do not start their RPC timeout at once.
             async with self.http_slots:
+                # Background polling must not exhaust the wire-message allowance
+                # after the target allowance has already closed. Keep local
+                # browser status and final report generation available.
+                if self.http_exhausted:
+                    await route.abort('blockedbyclient')
+                    return
                 reply = await self.call('http', {'method':request.method, 'url':request.url,
                     'headers':headers, 'data':request.post_data, 'authenticated':not resource, 'login':login})
             evidence = reply['evidence']
@@ -141,7 +215,9 @@ class BrowserAccess:
                 key = key.lower()
                 separator = '\n' if key == 'set-cookie' else ', '
                 response_headers[key] = response_headers[key] + separator + value if key in response_headers else value
-            await route.fulfill(status=evidence['status'], headers=response_headers, body=base64.b64decode(reply['body_base64']))
+            body = base64.b64decode(reply['body_base64'])
+            self.assets.put(request.url, request.method, request.resource_type, headers, evidence['status'], response_headers, body)
+            await route.fulfill(status=evidence['status'], headers=response_headers, body=body)
         except Exception as error:
             # Relay policy failures are short codes. Preserve them so an agent
             # can distinguish a spent request budget from a broken website;
@@ -149,6 +225,8 @@ class BrowserAccess:
             code = str(error) if isinstance(error, ValueError) else ''
             if not re.fullmatch(r'[a-z][a-z0-9_]{1,79}', code):
                 code = 'browser_request_failed'
+            if code == 'target_request_budget_reached':
+                self.http_exhausted = True
             self.errors = (self.errors + [code])[-12:]
             await route.abort('failed')
         finally:
@@ -172,13 +250,13 @@ class BrowserAccess:
                 self.unsupported_wallet_methods.add(name)
             return {'recorded':True}
         if request.get('method') == 'eth_accounts':
-            return await self.call('wallet', {'origin':self.origin,'method':'eth_accounts'})
+            return await self.account()
         if request.get('method') != 'personal_sign':
             raise ValueError('Unsupported wallet method')
         params = request.get('params', [])
         if len(params) != 2 or not all(isinstance(p,str) for p in params):
             raise ValueError('Invalid signing parameters')
-        account = (await self.call('wallet', {'origin':self.origin,'method':'eth_accounts'}))['address']
+        account = (await self.account())['address']
         message, address = params
         if message.lower() == account.lower(): address, message = message, address
         if address.lower() != account.lower(): raise ValueError('Wrong signing account')
@@ -194,6 +272,14 @@ class BrowserAccess:
             return await asyncio.wait_for(future, timeout=180)
         finally:
             self.pending.pop(identifier, None)
+
+    async def account(self):
+        # The disposable address is fixed for this role. Repeated connection
+        # requests need no relay lookup; every signature still goes to it.
+        async with self.wallet_lock:
+            if self.wallet_account is None:
+                self.wallet_account = await self.call('wallet', {'origin':self.origin,'method':'eth_accounts'})
+            return self.wallet_account.copy()
 
     def page(self):
         pages = [p for p in self.context.pages if origin(p.url) == self.origin]
@@ -242,6 +328,7 @@ class BrowserAccess:
                 'unsupported_wallet_methods':sorted(self.unsupported_wallet_methods),
                 'pending_signatures':[{'id':key, **{k:v for k,v in item.items() if k in ('message','address','origin')}} for key,item in self.pending.items()],
                 'request_errors':self.errors[-5:], 'pending_requests':self.inflight,
+                'request_budget_exhausted':self.http_exhausted, 'static_asset_cache_hits':self.assets.hits,
                 'blocked_origins':sorted(self.blocked_origins), 'visible_controls':await self.visible_controls()}
         if command == 'legacy':
             if self.scope.get('authentication') != 'wallet' or self.verified or self.pending:

@@ -10,11 +10,52 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlsplit
-from browser_access import BrowserAccess, configure_hermes_browser
+from browser_access import BrowserAccess, StaticAssetCache, configure_hermes_browser
 
 ORIGIN = 'https://owned.example'
 ADDRESS = '0x1111111111111111111111111111111111111111'
+
+
+class StaticAssetTests(unittest.TestCase):
+    def test_only_public_immutable_assets_are_cached_and_vary_expiry_are_respected(self):
+        cache = StaticAssetCache()
+        headers = {'cache-control':'public, max-age=30, immutable', 'vary':'Accept-Language'}
+        request = {'accept-language':'en'}
+        with patch('browser_access.time.monotonic', return_value=100):
+            cache.put('/app.js', 'GET', 'script', request, 200, headers, b'public asset')
+            self.assertEqual(cache.get('/app.js', 'GET', 'script', request)['body'], b'public asset')
+            self.assertIsNone(cache.get('/app.js', 'GET', 'script', {'accept-language':'fr'}))
+            for extra in ({'authorization':'Bearer private'}, {'cache-control':'no-cache'}, {'range':'bytes=0-1'}):
+                self.assertIsNone(cache.get('/app.js', 'GET', 'script', {**request, **extra}))
+            self.assertIsNone(cache.get('/app.js', 'GET', 'fetch', request))
+            self.assertIsNone(cache.get('/app.js', 'POST', 'script', request))
+        with patch('browser_access.time.monotonic', return_value=131):
+            self.assertIsNone(cache.get('/app.js', 'GET', 'script', request))
+            self.assertEqual(cache.bytes, 0)
+        for response in (
+            {'cache-control':'public, max-age=30'},
+            {**headers, 'set-cookie':'private=session'},
+            {**headers, 'cache-control':'private, max-age=30, immutable'},
+            {**headers, 'cache-control':'public, no-store, max-age=30, immutable'},
+            {**headers, 'vary':'*'}, {**headers, 'age':'31'},
+            {**headers, 'date':'Thu, 01 Jan 1970 00:00:00 GMT'},
+        ):
+            cache.put('/app.js', 'GET', 'script', request, 200, response, b'not cached')
+            self.assertEqual(cache.bytes, 0, response)
+
+    def test_cache_is_bounded_and_a_fresh_uncacheable_response_invalidates_old_asset(self):
+        cache = StaticAssetCache(max_bytes=5, max_entries=2)
+        headers = {'cache-control':'public, immutable, max-age=60'}
+        for name in ('a', 'b', 'c'):
+            cache.put(name, 'GET', 'script', {}, 200, headers, b'ab')
+        self.assertEqual(list(cache.entries), ['b', 'c'])
+        self.assertEqual(cache.bytes, 4)
+        cache.put('c', 'GET', 'script', {}, 200, {'cache-control':'no-store'}, b'new')
+        self.assertIsNone(cache.get('c', 'GET', 'script', {}))
+        cache.put('large', 'GET', 'script', {}, 200, headers, b'123456')
+        self.assertLessEqual(cache.bytes, 5)
 
 PASSWORD_PAGE = '''<!doctype html><html><body>
 <a href="/sign-in">Member sign in</a>
@@ -268,11 +309,62 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
                 raise ValueError('target_request_budget_reached')
             raise ValueError('Authorization: Bearer private-value')
         self.browser.call=denied
-        for path in ('/budget','/private-error'):
+        for path in ('/private-error','/budget'):
             await page.evaluate("async path=>{try{await fetch(path)}catch{}}",path)
         status=await self.browser.operation({'command':'status'})
-        self.assertEqual(status['request_errors'],['target_request_budget_reached','browser_request_failed'])
+        self.assertEqual(status['request_errors'],['browser_request_failed','target_request_budget_reached'])
+        self.assertTrue(status['request_budget_exhausted'])
         self.assertNotIn('private-value',json.dumps(status))
+
+    async def test_spent_http_budget_stops_background_requests_but_status_still_works(self):
+        page = await self.start('session')
+        calls = []
+        async def exhausted(path, data):
+            calls.append(path)
+            raise ValueError('target_request_budget_reached')
+        self.browser.call = exhausted
+        await page.evaluate("async()=>{for(let i=0;i<120;i++){try{await fetch('/poll?i='+i)}catch{}}}")
+        self.assertEqual(calls, ['http'])
+        status = await self.browser.operation({'command':'status'})
+        self.assertTrue(status['request_budget_exhausted'])
+        self.assertEqual(status['pending_requests'], 0)
+        self.assertFalse(status['verified'])
+
+    async def test_repeated_wallet_connections_use_one_role_address_lookup(self):
+        page = await self.start('wallet')
+        calls = []
+        original = self.browser.call
+        async def counted(path, data):
+            calls.append((path, data.get('method')))
+            return await original(path, data)
+        self.browser.call = counted
+        result = await page.evaluate("async()=>Promise.all(Array.from({length:120},()=>ethereum.request({method:'eth_requestAccounts'})))")
+        self.assertEqual(result, [[ADDRESS]] * 120)
+        self.assertEqual(calls, [('wallet', 'eth_accounts')])
+
+    async def test_repeated_public_assets_reuse_cache_while_account_api_stays_fresh(self):
+        page = await self.start('session')
+        original, assets = self.browser.call, []
+        async def served(path, data):
+            if path == 'http' and data['url'].endswith('/app.immutable.js'):
+                assets.append(data)
+                return {'evidence':{'id':100,'status':200,'error':None},
+                    'headers':[['content-type','application/javascript'],['cache-control','public, max-age=600, immutable']],
+                    'body_base64':base64.b64encode(b'window.assetLoaded=(window.assetLoaded||0)+1').decode()}
+            return await original(path, data)
+        self.browser.call = served
+        for _ in range(2):
+            # A new document avoids Chromium's in-document script reuse and
+            # exercises the intercepted request path used during navigation.
+            await page.goto(ORIGIN + '/sign-in')
+            await page.evaluate("()=>new Promise((ok,fail)=>{const s=document.createElement('script');s.src='/app.immutable.js';s.onload=ok;s.onerror=fail;document.head.append(s)})")
+            await page.evaluate("async()=>await fetch('/account-data')")
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(await page.evaluate('window.assetLoaded'), 1)
+        self.assertEqual(len([c for c in self.browser.calls if c['url'].endswith('/account-data')]), 2)
+        status = await self.browser.operation({'command':'status'})
+        self.assertEqual(status['static_asset_cache_hits'], 1)
+        self.assertFalse(status['verified'])
 
     async def test_repeated_response_headers_allow_navigation_and_keep_separate_cookies(self):
         page=await self.start('session')

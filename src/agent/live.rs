@@ -562,6 +562,8 @@ impl LiveBroker {
         )
         .ok_or("provider_budget_reached")?;
         if count.calls >= FINAL_REPORT_CALL
+            || count.evidence.len() >= MAX_HTTP_REQUESTS
+            || count.evidence_bytes + HTTP_RECORD_RESERVE > HTTP_EVIDENCE_BUDGET
             || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180)
             || MAX_SPEND.saturating_sub(count.reserved) < next.saturating_mul(2) + 150_000
         {
@@ -576,7 +578,7 @@ impl LiveBroker {
             if self.provider != LiveProvider::NearDeepSeek {
                 body["response_format"] = assessment_format();
             }
-            body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
+            body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report because a request, evidence, time or model allowance is exhausted or nearly spent. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
         }
         Ok(())
     }
@@ -1683,6 +1685,38 @@ mod tests {
         }
         request.body.as_mut().unwrap()["model"] = json!(LiveProvider::Abliteration.model());
         assert_eq!(broker.chat(&request), Err("wrong_model"));
+    }
+    #[test]
+    fn spent_target_allowance_closes_tools_before_the_final_report() {
+        for evidence_limit in [false, true] {
+            let broker = broker();
+            {
+                let mut count = broker.counters.lock().unwrap();
+                if evidence_limit {
+                    count.evidence_bytes = HTTP_EVIDENCE_BUDGET;
+                } else {
+                    let record = serde_json::from_value::<HttpEvidence>(json!({
+                        "id":1,"url":"https://owned.example/","method":"GET",
+                        "status":200,"headers":{},"request_headers":{},"body_excerpt":"fixture",
+                        "body_sha256":"0".repeat(64),"truncated":false,"observed_at":1
+                    }))
+                    .unwrap();
+                    count.evidence.resize(MAX_HTTP_REQUESTS, record);
+                }
+            }
+            let mut body = json!({"messages":[{"role":"user","content":"Finish the owned fixture"}],
+                "tools":[{"type":"function","function":{"name":"terminal"}}]});
+            broker.finish_before_limit(&mut body).unwrap();
+            assert!(body.get("tools").is_none());
+            assert_eq!(body["tool_choice"], "none");
+            assert!(
+                body["messages"][1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unfinished checks")
+            );
+            assert_eq!(broker.counters.lock().unwrap().calls, 0);
+        }
     }
     #[test]
     fn near_uses_its_pinned_model_and_closes_tools_without_unsupported_schema() {
