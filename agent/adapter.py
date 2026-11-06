@@ -321,10 +321,11 @@ def main():
         if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
                for p in tools['discovery_plan']):
             import artex
-            # Keep at least four minutes for the review and final report. ARTEX
+            # Give discovery half the role while reserving the other half for
+            # verification and reporting. The broker owns the shared limits.
             # also shares the relay's total model and target-request allowances.
             event("phase", name="artex_engine")
-            engine_deadline = min(started + budget - 240, time.monotonic() + budget / 3)
+            engine_deadline = min(started + budget - min(600, budget / 2), time.monotonic() + budget / 2)
             workflow.begin("artex-engine")
             try:
                 result = artex.run(public_scope(scope), role, engine_deadline, model=model,
@@ -352,10 +353,10 @@ def main():
         agent = AIAgent(
             model=model, provider="custom", api_mode="chat_completions",
             base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-            # The relay asks for the final report before its 200-call ceiling.
+            # The relay asks for the final report before its 600-call ceiling.
             # A smaller Hermes turn limit can interrupt that handoff and emit a
             # failed partial summary. Time, HTTP and money limits stay in Rust.
-            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=200 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=600 if live else 3, max_tokens=8192 if live else (512 if role else 192),
             reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
             request_overrides={} if live else {"reasoning_effort": "none"},
             quiet_mode=True, skip_context_files=True, skip_memory=True,
@@ -376,6 +377,10 @@ def main():
         if live:
             prompt = live_review.prompt(role, browser=browser is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
+        if live:
+            import report_finish
+            result = report_finish.finish(agent, result, started + budget - 30,
+                emit=lambda **details: event('report_validation', **details))
         regression = False
         for args in observed:
             if len(args) < 4 or args[1] != "terminal":

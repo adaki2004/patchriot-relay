@@ -24,6 +24,16 @@ SCOPE = {'origins': ['https://owned.example'], 'objective': 'Owned fixture only'
 
 
 class EngineTests(unittest.TestCase):
+    def test_planner_gets_numeric_budget_finish_reserve_and_neutral_identity(self):
+        body = artex.task_body(SCOPE, ['http://127.0.0.1:1234'], 1800, 'investigator',
+                               {'engine_http_remaining': 1457, 'engine_model_calls_remaining': 400})
+        self.assertIn('1457', body['goal'])
+        self.assertIn('1800 seconds', body['goal'])
+        self.assertIn('final 10 percent', body['goal'])
+        self.assertIn('security-test@example.com', body['goal'])
+        self.assertIn('at most one successful test per endpoint', body['goal'])
+        self.assertNotIn('artex.test@', body['goal'])
+
     def test_oversized_engine_details_leave_a_complete_handoff_and_exact_local_file(self):
         details = {'engine': 'ARTEX', 'commit': artex.VERSION,
                    'stop_reason': 'time_budget', 'coverage_complete': False,

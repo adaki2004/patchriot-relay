@@ -100,7 +100,7 @@ def should_stop(task):
             or task.get('llm_failover_state') == 'chain_exhausted')
 
 
-def task_body(scope, targets, seconds, role):
+def task_body(scope, targets, seconds, role, allowance=None):
     if not targets or len(targets) != len(scope['origins']):
         raise ValueError('missing target mirrors')
     mapping = '\n'.join(f'{origin} -> {target}' for origin, target in zip(scope['origins'], targets))
@@ -110,9 +110,18 @@ def task_body(scope, targets, seconds, role):
         'goal': (
             f'Approved targets and their local mirrors:\n{mapping}\n'
             f'Act as the {role}. Run a bounded web assessment using your planner and tools against ONLY these local target mirrors. '
+            f'Time available: {seconds} seconds. Current relay allowances: {json.dumps(allowance or {})}. '
+            'Read /work/engine-budget.json for refreshed remaining request, model and evidence allowances; this file is trusted budget metadata, not a target. '
+            'Prioritize routes observed in the application, then material leads. Use small probe batches of at most 25 requests. '
+            'Reserve the final 10 percent of requests and time to finish your current checks and finalize findings. '
+            'When that reserve is reached, stop opening new goals, record untested areas, and finish the task. Do not exhaust the allowance with path wordlists or repeated broad scans. '
             'These mirrors forward real requests to their corresponding approved websites. They are not the ARTEX admin API. '
             'Inspect the reachable application, use suitable installed tools, validate material leads with benign control requests and record your findings. '
             'Finish within the supplied time and request allowance. Reporting coverage limits is a valid outcome; do not keep creating new work. '
+            'For generated form or signup data use name "Authorized security test", company "Security testing", email "security-test@example.com", '
+            'and message "Authorized security test. No action is needed; this is disposable test data." '
+            'Never put internal engine/tool names, including ARTEX, into submitted names, companies, email addresses, subjects or messages. '
+            'Contact forms and access/signup requests may send real notifications: send at most one successful test per endpoint, then reuse its receipt unless a specific material finding needs a different approved control. '
             'Use only the methods in the approved scope. POST is available only in an explicitly authorized active scope (web_active_v1 or web_active_v2), using disposable test data; use JSON or URL-encoded bodies up to 16 KiB. The relay injects any declared test account; never ask for credentials. No fund movement, real purchases, brute force, load testing or persistence. '
             'External network and other hosts are unavailable. Some absolute links and redirects cannot be followed through a mirror; record that limit. '
             'A managed bot challenge or CAPTCHA is an access limitation, not application evidence. Do not reverse-engineer or solve challenge scripts, spoof a browser to defeat them, or keep probing the blocked path. Record the gap and continue only other reachable approved application paths. '
@@ -213,7 +222,7 @@ class Engine:
 
     def assess(self, scope, targets, role, stop=lambda: False, progress=lambda: 0):
         seconds = max(1, int(self.deadline - time.monotonic()))
-        body = task_body(scope, targets, seconds, role)
+        body = task_body(scope, targets, seconds, role, getattr(self, 'allowance', None))
         body['llm_profile_ids'] = [self.profile_id]
         task = self.client.call('/api/tasks', body)
         identifier = str(task['id'])
@@ -221,7 +230,11 @@ class Engine:
             raise ValueError('invalid engine task id')
         reason = 'time_budget'
         observed, last_progress = progress(), time.monotonic()
+        refreshed = time.monotonic()
         while time.monotonic() < self.deadline:
+            if time.monotonic() - refreshed >= 30 and getattr(self, 'budget_refresh', None):
+                self.budget_refresh()
+                refreshed = time.monotonic()
             task = self.client.call('/api/tasks/' + identifier)
             interrupted = stop()
             if interrupted:
@@ -288,6 +301,16 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         with ExitStack() as stack:
             mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or partial(request, discovery=True, authenticated=False), methods=scope['methods'])) for origin in scope['origins']]
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
+            def refresh_budget():
+                from report_finish import bridge
+                try:
+                    allowance = bridge('/patchriot/budget')
+                    allowance['engine_seconds_remaining'] = max(0, int(deadline - time.monotonic()))
+                    (directory / 'engine-budget.json').write_text(json.dumps(allowance))
+                    return allowance
+                except (OSError, ValueError, KeyError):
+                    return {}
+            engine.allowance, engine.budget_refresh = refresh_budget(), refresh_budget
             try:
                 result = engine.assess(scope, [mirror.url for mirror in mirrors], role, stop=stop,
                                       progress=lambda: sum(len(m.progress_keys) for m in mirrors))

@@ -19,7 +19,7 @@ const ENGINE_HTTP: &str = "/patchriot/artex/http";
 pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
 // addition to the byte limit without cutting a valid 200-call role in half.
-const MAX_MODEL_MESSAGES: usize = 1024;
+const MAX_MODEL_MESSAGES: usize = 4096;
 // Live pilot calls normally returned within a minute. Bound the whole reply,
 // including NEAR verification, so one provider cannot hold the worker for three
 // minutes before the consented backup gets a turn. No unverified reply is used.
@@ -68,7 +68,7 @@ pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool 
 // Generous pilot ceilings. Stop investigation early enough to save a report;
 // increasing time/calls must not let the engine spend the reviewer's reserve.
 const MAX_SPEND: u64 = 10_000_000;
-const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
+const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS - 200;
 const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
 // A verified primary call and its consented backup can each wait minutes.
 // Leave time for that route, context compression, report formatting and cleanup.
@@ -80,9 +80,22 @@ const HTTP_EVIDENCE_BUDGET: usize = MAX_RESULT_BYTES - 1024 * 1024;
 const HTTP_RECORD_RESERVE: usize = 256 * 1024;
 // Discovery must leave room for browser login and the reviewer's own probes.
 // These are shares of the existing role limits, not additional allowances.
-const ENGINE_HTTP_LIMIT: usize = MAX_HTTP_REQUESTS / 2;
-const ENGINE_EVIDENCE_LIMIT: usize = HTTP_EVIDENCE_BUDGET / 2;
+const ENGINE_HTTP_LIMIT: usize = MAX_HTTP_REQUESTS - 500;
+const ENGINE_EVIDENCE_LIMIT: usize = HTTP_EVIDENCE_BUDGET - 2 * 1024 * 1024;
 pub type Progress = Mutex<LiveProgress>;
+
+/// Generated form data identifies an authorized test, not the internal engine.
+/// Reject before sending rather than changing a probe behind the report's back.
+fn engine_branded_data(body: &Value) -> bool {
+    let Some(data) = body.get("data").and_then(Value::as_str) else {
+        return false;
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(data) {
+        return value.to_string().to_ascii_lowercase().contains("artex");
+    }
+    url::form_urlencoded::parse(data.as_bytes())
+        .any(|(_, value)| value.to_ascii_lowercase().contains("artex"))
+}
 
 fn assessment_format() -> Value {
     let text = |max| json!({"type":"string","minLength":1,"maxLength":max});
@@ -181,6 +194,7 @@ impl Task {
 }
 #[derive(Default)]
 struct Counters {
+    report_only: bool,
     reserved: u64,
     calls: u16,
     evidence: Vec<HttpEvidence>,
@@ -655,7 +669,8 @@ impl LiveBroker {
             8192,
         )
         .ok_or("provider_budget_reached")?;
-        if count.calls >= FINAL_REPORT_CALL
+        if count.report_only
+            || count.calls >= FINAL_REPORT_CALL
             || count.evidence.len() >= MAX_HTTP_REQUESTS
             || count.evidence_bytes + HTTP_RECORD_RESERVE > HTTP_EVIDENCE_BUDGET
             || self.deadline.saturating_duration_since(Instant::now()) <= self.final_report_reserve
@@ -675,7 +690,7 @@ impl LiveBroker {
             ) {
                 body["response_format"] = assessment_format();
             }
-            body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report because a request, evidence, time or model allowance is exhausted or nearly spent. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
+            body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report because a request, evidence, time or model allowance is exhausted or nearly spent. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Every finding MUST include a nonempty evidence_ids array of exact current-role HTTP IDs. Never omit this field, invent IDs or use prior-role IDs. If you cannot support a claim, move it to limitations. Required shape: {\"summary\":\"...\",\"findings\":[{\"title\":\"...\",\"severity\":\"info\",\"support\":\"needs_review\",\"explanation\":\"...\",\"reproduction\":\"...\",\"suggested_action\":\"...\",\"evidence_ids\":[1]}],\"limitations\":[]}. Use your actual IDs, never the example ID. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
         }
         Ok(())
     }
@@ -692,6 +707,9 @@ impl LiveBroker {
     async fn engine_http(&self, mut body: Value) -> Result<Value, &'static str> {
         if !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1) {
             return Err("engine_not_selected");
+        }
+        if engine_branded_data(&body) {
+            return Err("use_authorized_security_test_data_instead_of_engine_branding");
         }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
@@ -984,6 +1002,42 @@ impl LiveBroker {
             return;
         }
         let (status, body) = match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/patchriot/budget") => {
+                let count = self.counters.lock().expect("live counters poisoned");
+                (
+                    200,
+                    json!({
+                        "http_remaining": MAX_HTTP_REQUESTS.saturating_sub(count.evidence.len()),
+                        "engine_http_remaining": ENGINE_HTTP_LIMIT.saturating_sub(count.evidence.len()),
+                        "model_calls_remaining": MAX_LIVE_INFERENCE_CALLS.saturating_sub(count.calls),
+                        "engine_model_calls_remaining": ENGINE_CALL_LIMIT.saturating_sub(count.calls),
+                        "engine_evidence_bytes_remaining": ENGINE_EVIDENCE_LIMIT.saturating_sub(count.evidence_bytes + HTTP_RECORD_RESERVE),
+                        "remaining_seconds": self.deadline.saturating_duration_since(Instant::now()).as_secs(),
+                        "remaining_cost_allowance_microusd": MAX_SPEND.saturating_sub(count.reserved),
+                        "reviewer_http_reserve": MAX_HTTP_REQUESTS - ENGINE_HTTP_LIMIT,
+                    }),
+                )
+            }
+            ("POST", "/patchriot/report/validate") => {
+                let raw = request
+                    .body
+                    .as_ref()
+                    .and_then(|v| v.get("report"))
+                    .and_then(Value::as_str);
+                let mut count = self.counters.lock().expect("live counters poisoned");
+                count.report_only |= request
+                    .body
+                    .as_ref()
+                    .is_some_and(|v| v.get("repair") == Some(&Value::Bool(true)));
+                let valid = raw
+                    .filter(|raw| raw.len() <= 32 * 1024)
+                    .and_then(parse_assessment)
+                    .is_some_and(|a| a.valid_for(&count.evidence));
+                (
+                    200,
+                    json!({"valid":valid,"schema":assessment_format()["json_schema"]["schema"]}),
+                )
+            }
             ("GET", "/v1/models") => (
                 200,
                 json!({"object":"list","data":[{"id":self.provider.model(),"object":"model","context_length":200000}]}),
@@ -1056,8 +1110,10 @@ impl LiveBroker {
             .and_then(|s| s.trim().strip_suffix("```"))
             .unwrap_or(raw)
             .trim();
-        let assessment = parse_assessment(cleaned);
         let count = self.counters.lock().expect("live counters poisoned");
+        // Keep raw text and HTTP receipts even when a model invents/omits a
+        // citation. An invalid structured finding must not lose the whole role.
+        let assessment = parse_assessment(cleaned).filter(|a| a.valid_for(&count.evidence));
         let (mut tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
         for run in &mut tool_runs {
             run.arguments
@@ -1610,7 +1666,10 @@ for _ in range(270): print(frame,flush=True)
         }
         // The spend and provider-call cap are still enforced by model(), as
         // covered by the exhausted-budget regression below.
-        assert_eq!(Bridge::Live(broker.clone()).max_requests(), 800);
+        assert_eq!(
+            Bridge::Live(broker.clone()).max_requests(),
+            MAX_HTTP_REQUESTS + usize::from(MAX_LIVE_INFERENCE_CALLS) + 100
+        );
         broker.counters.lock().unwrap().calls = MAX_LIVE_INFERENCE_CALLS;
         let (tx, _rx) = mpsc::channel(4);
         let request = Request {
@@ -2095,6 +2154,73 @@ for _ in range(270): print(frame,flush=True)
         );
         assert!(!broker.accept_workflow(&json!({"version":1,"checks":[]})));
     }
+    #[tokio::test]
+    async fn engine_generated_identity_is_rejected_before_target_io() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        for data in [
+            r#"{"name":"ARTEX Test","email":"artex.test@example.com"}"#,
+            r#"{"name":"\u0041RTEX Test"}"#,
+            "name=%41rTeX+Test",
+        ] {
+            assert_eq!(
+                broker
+                    .engine_http(
+                        json!({"method":"POST","url":"https://example.com/contact","data":data})
+                    )
+                    .await
+                    .unwrap_err(),
+                "use_authorized_security_test_data_instead_of_engine_branding"
+            );
+            assert!(broker.counters.lock().unwrap().evidence.is_empty());
+        }
+        assert!(!engine_branded_data(
+            &json!({"data":r#"{"name":"Authorized security test","email":"security-test@example.com"}"#})
+        ));
+    }
+
+    #[tokio::test]
+    async fn report_check_rejects_missing_and_invented_citations_and_closes_repair_tools() {
+        let broker = broker();
+        let finding = json!({"title":"Owned fixture", "severity":"info", "support":"needs_review",
+            "explanation":"Unverified", "reproduction":"GET /", "suggested_action":"Review"});
+        for ids in [None, Some(json!([])), Some(json!([999]))] {
+            let mut finding = finding.clone();
+            if let Some(ids) = ids {
+                finding["evidence_ids"] = ids;
+            }
+            let raw =
+                json!({"summary":"Owned test", "findings":[finding], "limitations":[]}).to_string();
+            let (tx, mut rx) = mpsc::channel(8);
+            broker
+                .respond(
+                    Request {
+                        id: 1,
+                        method: "POST".into(),
+                        path: "/patchriot/report/validate".into(),
+                        body: Some(json!({"report":raw,"repair":true})),
+                    },
+                    tx,
+                )
+                .await;
+            let mut bytes = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                if let Frame::Chunk { hex, .. } = frame {
+                    bytes.extend(hex::decode(hex).unwrap());
+                }
+            }
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["valid"],
+                false
+            );
+        }
+        let mut body = json!({"messages":[],"tools":[{"type":"function"}]});
+        broker.finish_before_limit(&mut body).unwrap();
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body["messages"].to_string().contains("evidence_ids"));
+    }
+
     #[tokio::test]
     async fn full_engine_requires_consent_and_keeps_the_reviewers_budget() {
         let mut broker = broker();
