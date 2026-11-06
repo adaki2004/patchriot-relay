@@ -179,8 +179,9 @@ class Engine:
         reason = 'time_budget'
         while time.monotonic() < self.deadline:
             task = self.client.call('/api/tasks/' + identifier)
-            if stop():
-                reason = 'model_request_rejected'
+            interrupted = stop()
+            if interrupted:
+                reason = interrupted if isinstance(interrupted, str) else 'model_request_rejected'
                 break
             if should_stop(task):
                 reason = 'model_budget' if task.get('llm_failover_state') == 'chain_exhausted' else task['status']
@@ -219,6 +220,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         stop=lambda: False, emit=lambda _: None):
     from web_tools import ScopeMirror, record
     from live_http import request
+    from functools import partial
     started, timestamp = time.monotonic(), int(time.time())
     refs, failure, code = [], None, None
     result = {'engine': 'ARTEX', 'commit': VERSION, 'coverage_complete': False}
@@ -232,7 +234,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         if time.monotonic() >= deadline:
             raise TimeoutError('no engine time remaining')
         with ExitStack() as stack:
-            mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or request, methods=scope['methods'])) for origin in scope['origins']]
+            mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or partial(request, discovery=True), methods=scope['methods'])) for origin in scope['origins']]
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
             try:
                 result = engine.assess(scope, [mirror.url for mirror in mirrors], role, stop=stop)

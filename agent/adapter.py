@@ -20,6 +20,7 @@ wire_lock = threading.Lock()
 transaction_lock = threading.Lock()
 bridge_stopping = threading.Event()
 engine_stopping = threading.Event()
+engine_stop_reason = None
 request_id = 0
 
 
@@ -154,7 +155,7 @@ class Bridge(BaseHTTPRequestHandler):
         self.exchange()
 
     def exchange(self):
-        global request_id
+        global request_id, engine_stop_reason
         self.close_connection = True
         try:
             if bridge_stopping.is_set():
@@ -181,6 +182,10 @@ class Bridge(BaseHTTPRequestHandler):
                         if frame["type"] == "start":
                             status, content_type = frame["status"], frame["content_type"]
                             if self.path == '/patchriot/artex/v1/chat/completions' and status >= 400:
+                                engine_stop_reason = 'model_request_rejected'
+                                engine_stopping.set()
+                            elif self.path == '/patchriot/artex/http' and status == 429:
+                                engine_stop_reason = 'target_request_budget'
                                 engine_stopping.set()
                             if not disconnected:
                                 self.send_response(status)
@@ -263,7 +268,7 @@ def main():
             event("phase", name="artex_engine")
             engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
             result = artex.run(scope, role, engine_deadline, model=model,
-                               stop=engine_stopping.is_set,
+                               stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
                                emit=lambda result: event("live_tool", run=result))
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))

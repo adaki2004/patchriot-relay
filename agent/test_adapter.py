@@ -141,6 +141,7 @@ class BridgeTests(unittest.TestCase):
     def setUp(self):
         adapter.bridge_stopping.clear()
         adapter.engine_stopping.clear()
+        adapter.engine_stop_reason = None
 
     def tearDown(self):
         adapter.bridge_stopping.clear()
@@ -265,6 +266,29 @@ class BridgeTests(unittest.TestCase):
         result, wire = self.exchange([], "POST", "/v1/chat/completions", headers={"Content-Length": str(adapter.MAX_REQUEST + 1)})
         self.assertEqual(result[0], 400)
         self.assertEqual(wire, [])
+
+    def test_discovery_budget_stops_only_the_engine_and_keeps_the_bridge_open(self):
+        frames = [
+            {'type':'start','id':1,'status':429,'content_type':'application/json'},
+            {'type':'chunk','id':1,'hex':b'{"error":"engine_http_budget_reached"}'.hex()},
+            {'type':'end','id':1},
+        ]
+        result, _ = self.exchange(frames, 'POST', '/patchriot/artex/http', '{}')
+        self.assertEqual(result[0], 429)
+        self.assertTrue(adapter.engine_stopping.is_set())
+        self.assertEqual(adapter.engine_stop_reason, 'target_request_budget')
+        self.assertFalse(adapter.bridge_stopping.is_set())
+        frames[0]['status'] = 200
+        result, wire = self.exchange(frames, 'POST', '/patchriot/http', '{}')
+        self.assertEqual(result[0], 200)
+        self.assertEqual(wire[0]['request']['path'], '/patchriot/http')
+
+    def test_an_invalid_discovery_probe_does_not_end_all_discovery(self):
+        frames = [{'type':'start','id':1,'status':400,'content_type':'application/json'},
+                  {'type':'end','id':1}]
+        result, _ = self.exchange(frames, 'POST', '/patchriot/artex/http', '{}')
+        self.assertEqual(result[0], 400)
+        self.assertFalse(adapter.engine_stopping.is_set())
 
     def test_phase_name_is_data_and_events_remain_bounded(self):
         wire = io.StringIO()

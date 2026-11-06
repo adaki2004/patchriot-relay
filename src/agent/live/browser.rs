@@ -814,10 +814,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_cookie_login_continues_with_proven_access_and_preserves_anonymous_controls() {
+    async fn discovery_http_reserve_keeps_browser_login_and_anonymous_controls() {
         let (address, server) = target().await;
         let mut broker = broker("session");
-        Arc::get_mut(&mut broker).unwrap().test_target = Some(address);
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.test_target = Some(address);
+        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        let public = json!({"method":"GET","url":"https://owned.example/public"});
+        broker.engine_http(public.clone()).await.unwrap();
+        let saved_bytes = broker.counters.lock().unwrap().evidence_bytes;
+        broker.counters.lock().unwrap().evidence_bytes = ENGINE_EVIDENCE_LIMIT;
+        assert_eq!(
+            broker.engine_http(public.clone()).await.unwrap_err(),
+            "engine_http_budget_reached"
+        );
+        {
+            let mut count = broker.counters.lock().unwrap();
+            count.evidence_bytes = saved_bytes;
+            let sample = count.evidence[0].clone();
+            for id in 2..=ENGINE_HTTP_LIMIT {
+                let mut record = sample.clone();
+                record.id = id as u32;
+                count.evidence.push(record);
+            }
+        }
+        let (tx, mut rx) = mpsc::channel(4);
+        broker
+            .respond(
+                Request {
+                    id: 1,
+                    method: "POST".into(),
+                    path: ENGINE_HTTP.into(),
+                    body: Some(public.clone()),
+                },
+                tx,
+            )
+            .await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Frame::Start { status: 429, .. })
+        ));
+        assert_eq!(
+            broker.counters.lock().unwrap().evidence.len(),
+            ENGINE_HTTP_LIMIT
+        );
+        // The same hard role limit still allows independent probes and a real
+        // browser login after discovery has consumed its smaller allowance.
+        assert_eq!(
+            broker.http(public).await.unwrap()["evidence"]["status"],
+            200
+        );
         let post = json!({"method":"POST","url":"https://owned.example/different/session","headers":{"content-type":"application/json"},
             "data":json!({"login":"fixture@example.com","secret":"only-synthetic-password"}).to_string(),"login":true});
         assert_eq!(

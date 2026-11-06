@@ -72,6 +72,26 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result['stop_reason'], 'model_request_rejected')
         self.assertFalse(result['coverage_complete'])
         self.assertIn(('/api/tasks/7/control', {'action': 'pause'}), calls)
+        result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator',
+                               stop=lambda: 'target_request_budget')
+        self.assertEqual(result['stop_reason'], 'target_request_budget')
+        self.assertFalse(result['coverage_complete'])
+
+    def test_engine_http_uses_the_discovery_route_and_other_probes_keep_their_route(self):
+        import live_http
+        seen = []
+        class Reply:
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self, _limit): return b'{"evidence":{"status":200}}'
+        def capture(request, **kwargs):
+            seen.append(request.full_url)
+            return Reply()
+        with patch.dict(os.environ, {'PATCHRIOT_BRIDGE_URL':'http://127.0.0.1:8080'}), patch.object(live_http, 'urlopen', capture):
+            live_http.request('GET', 'https://owned.example', discovery=True)
+            live_http.request('GET', 'https://owned.example')
+        self.assertEqual(seen, ['http://127.0.0.1:8080/patchriot/artex/http',
+                                'http://127.0.0.1:8080/patchriot/http'])
 
     def test_engine_cannot_point_its_model_bridge_outside_container_loopback(self):
         for url in ['https://external.example', 'http://127.0.0.1:8/path', 'http://user@127.0.0.1:8',

@@ -15,6 +15,7 @@ mod wallet;
 pub const MODEL: &str = LiveProvider::MODELS[0];
 pub const MAX_FRAME: usize = 512 * 1024;
 pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
+const ENGINE_HTTP: &str = "/patchriot/artex/http";
 pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
 // addition to the byte limit without cutting a valid 200-call role in half.
@@ -48,6 +49,10 @@ const REVIEWER_RESERVE: u64 = 1_500_000;
 // Refuse a new probe before sending it instead of dropping already cited evidence.
 const HTTP_EVIDENCE_BUDGET: usize = MAX_RESULT_BYTES - 1024 * 1024;
 const HTTP_RECORD_RESERVE: usize = 256 * 1024;
+// Discovery must leave room for browser login and the reviewer's own probes.
+// These are shares of the existing role limits, not additional allowances.
+const ENGINE_HTTP_LIMIT: usize = MAX_HTTP_REQUESTS / 2;
+const ENGINE_EVIDENCE_LIMIT: usize = HTTP_EVIDENCE_BUDGET / 2;
 pub type Progress = Mutex<LiveProgress>;
 
 fn assessment_format() -> Value {
@@ -585,6 +590,21 @@ impl LiveBroker {
         self.exchange(probe, false).await
     }
 
+    async fn engine_http(&self, body: Value) -> Result<Value, &'static str> {
+        if !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1) {
+            return Err("engine_not_selected");
+        }
+        {
+            let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+            if count.evidence.len() >= ENGINE_HTTP_LIMIT
+                || count.evidence_bytes + HTTP_RECORD_RESERVE > ENGINE_EVIDENCE_LIMIT
+            {
+                return Err("engine_http_budget_reached");
+            }
+        }
+        self.http(body).await
+    }
+
     fn probe_url(&self, probe: &Probe, login: bool) -> Result<url::Url, &'static str> {
         let url = if login && self.scope.permits_login(&probe.method, &probe.url) {
             public_url(&probe.url)?
@@ -864,6 +884,15 @@ impl LiveBroker {
             ("POST", "/patchriot/http") => {
                 match self.http(request.body.unwrap_or(Value::Null)).await {
                     Ok(v) => (200, v),
+                    Err(e) => (400, json!({"error":e})),
+                }
+            }
+            ("POST", ENGINE_HTTP) => {
+                match self.engine_http(request.body.unwrap_or(Value::Null)).await {
+                    Ok(v) => (200, v),
+                    Err("engine_http_budget_reached") => {
+                        (429, json!({"error":"engine_http_budget_reached"}))
+                    }
                     Err(e) => (400, json!({"error":e})),
                 }
             }
@@ -1760,6 +1789,13 @@ mod tests {
     #[tokio::test]
     async fn full_engine_requires_consent_and_keeps_the_reviewers_budget() {
         let mut broker = broker();
+        assert_eq!(
+            broker
+                .engine_http(json!({"method":"GET","url":"https://example.com/"}))
+                .await
+                .unwrap_err(),
+            "engine_not_selected"
+        );
         let mut request = Request {
             id: 1,
             method: "POST".into(),
@@ -1771,6 +1807,13 @@ mod tests {
         };
         assert_eq!(broker.chat(&request).unwrap_err(), "engine_not_selected");
         Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        assert_eq!(
+            broker
+                .engine_http(json!({"method":"GET","url":"https://outside.example/"}))
+                .await
+                .unwrap_err(),
+            "outside_approved_scope"
+        );
         let prepared = broker.chat(&request).unwrap();
         assert_eq!(prepared["tools"].as_array().unwrap().len(), 31);
         assert!(prepared.get("response_format").is_none());

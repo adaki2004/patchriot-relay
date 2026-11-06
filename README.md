@@ -30,6 +30,8 @@ Scout investigates, Recon checks its leads and a third reviewer challenges serio
 
 Later roles reuse completed discovery records. A missing or failed discovery tool may be retried once; unfinished coverage remains visible. If a run stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.
 
+Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.
+
 > **DON’T TRUST! VERIFY!** Read this source and its dependencies—or ask your own security agent to review them. Inspect the container, network and permission settings before pairing a machine or sharing private work.
 
 ## Joining the managed service

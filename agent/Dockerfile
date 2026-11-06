@@ -44,5 +44,5 @@ COPY templates /patchriot/templates
 USER 65534:65534
 WORKDIR /work
 ENV HOME=/opt/data HERMES_HOME=/opt/data/hermes PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/hermes TERMINAL_ENV=local TERMINAL_CWD=/work HERMES_API_TIMEOUT=540 NORMA_RIPGREP_NO_INSTALL=1
-LABEL io.patchriot.agent-adapter="14"
+LABEL io.patchriot.agent-adapter="15"
 ENTRYPOINT ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"]

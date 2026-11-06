@@ -6,9 +6,10 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 
-def request(method, url, headers=None, data=None, authenticated=True):
+def request(method, url, headers=None, data=None, authenticated=True, *, discovery=False):
     body = json.dumps({"method": method.upper(), "url": url, "headers": headers or {}, "data": data, "authenticated": authenticated}).encode()
-    req = Request(os.environ["PATCHRIOT_BRIDGE_URL"] + "/patchriot/http", data=body,
+    path = "/patchriot/artex/http" if discovery else "/patchriot/http"
+    req = Request(os.environ["PATCHRIOT_BRIDGE_URL"] + path, data=body,
                   headers={"Content-Type": "application/json"})
     try:
         with urlopen(req, timeout=75) as response:
