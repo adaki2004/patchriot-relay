@@ -23,6 +23,7 @@ API = 'http://127.0.0.1:8787'
 POSTGRES = '/usr/lib/postgresql/17/bin/'
 TERMINAL = {'completed', 'done', 'failed', 'paused', 'stopped', 'timed_out', 'timeout', 'unavailable'}
 NO_TARGET_PROGRESS_SECONDS = 300
+SETTLEMENT_RESERVE_SECONDS = 300
 
 
 def receipt_summary(result, full_output):
@@ -221,7 +222,12 @@ class Engine:
             raise
 
     def assess(self, scope, targets, role, stop=lambda: False, progress=lambda: 0):
-        seconds = max(1, int(self.deadline - time.monotonic()))
+        available = max(1, int(self.deadline - time.monotonic()))
+        # The upstream timeout starts settlement, including a worker drain and
+        # final planner round. It must precede our hard process cutoff.
+        reserve = min(SETTLEMENT_RESERVE_SECONDS, available // 3)
+        seconds = available - reserve
+        self.exploration_deadline = time.monotonic() + seconds
         body = task_body(scope, targets, seconds, role, getattr(self, 'allowance', None))
         body['llm_profile_ids'] = [self.profile_id]
         task = self.client.call('/api/tasks', body)
@@ -255,7 +261,7 @@ class Engine:
                 reason = 'log_limit'
                 break
             time.sleep(.5)
-        if task.get('status') not in ('completed', 'done', 'failed'):
+        if task.get('status') not in TERMINAL:
             try:
                 self.client.call('/api/tasks/' + identifier + '/control', {'action': 'pause'})
             except urllib.error.HTTPError as error:
@@ -306,6 +312,8 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
                 try:
                     allowance = bridge('/patchriot/budget')
                     allowance['engine_seconds_remaining'] = max(0, int(deadline - time.monotonic()))
+                    allowance['engine_exploration_seconds_remaining'] = max(
+                        0, int(getattr(engine, 'exploration_deadline', deadline) - time.monotonic()))
                     (directory / 'engine-budget.json').write_text(json.dumps(allowance))
                     return allowance
                 except (OSError, ValueError, KeyError):

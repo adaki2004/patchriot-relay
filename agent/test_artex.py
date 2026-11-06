@@ -149,6 +149,37 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(result['findings'], [{'title': 'Owned fixture lead', 'verified': False}])
                 self.assertEqual(('/api/tasks/7/control', {'action':'pause'}) in calls, completed_at is None)
 
+    def test_upstream_can_settle_before_hard_cutoff_without_upgrading_timeout(self):
+        for terminal in ['done', 'timeout', None]:
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as temp:
+                clock, calls, timeout = [0.0], [], []
+                class FakeClient:
+                    def call(self, path, body=None):
+                        calls.append((path, body))
+                        if path == '/api/tasks':
+                            timeout.append(body['timeout_seconds'])
+                            # Delayed startup plus a two-minute settlement pass.
+                            clock[0] += 45
+                            return {'id': 7}
+                        if path == '/api/tasks/7':
+                            settled = clock[0] >= 45 + timeout[0] + 120
+                            return {'status': terminal if terminal and settled else 'running'}
+                        return {}
+                def tick(_seconds): clock[0] += 15
+                engine = object.__new__(artex.Engine)
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 1800, 1
+                engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
+                (engine.directory / 'process.log').write_text('')
+                with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
+                    result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator',
+                                           progress=lambda: int(clock[0]))
+                self.assertEqual(timeout, [1500])
+                self.assertEqual(engine.deadline, 1800)
+                self.assertEqual(result['stop_reason'], terminal or 'time_budget')
+                self.assertEqual(result['coverage_complete'], terminal == 'done')
+                self.assertEqual(clock[0], 1665 if terminal else 1800)
+                self.assertEqual(('/api/tasks/7/control', {'action': 'pause'}) in calls, terminal is None)
+
     def test_engine_http_uses_the_discovery_route_and_other_probes_keep_their_route(self):
         import live_http
         seen = []
