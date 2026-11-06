@@ -298,6 +298,21 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await page.evaluate('navigator.onLine'))
         self.assertFalse((await self.browser.operation({'command':'status'}))['verified'])
 
+    async def test_installed_wallet_snapshot_receives_discovery_during_the_request_event(self):
+        page=await self.start('wallet')
+        await page.evaluate("window.__patchriot_wallet_rpc({method:'wallet_mode'})")
+        installed=await page.evaluate("""() => {
+            const providers=[];
+            const listener=event=>providers.push(event.detail.info.rdns);
+            window.addEventListener('eip6963:announceProvider',listener);
+            window.dispatchEvent(new Event('eip6963:requestProvider'));
+            window.removeEventListener('eip6963:announceProvider',listener);
+            return providers;
+        }""")
+        self.assertEqual(installed,['tech.patchriot.testwallet'])
+        self.assertFalse(await page.evaluate('!!ethereum.isMetaMask'))
+        self.assertFalse((await self.browser.operation({'command':'status'}))['verified'])
+
     async def test_legacy_wallet_retry_uses_injected_rpc_without_impersonating_a_wallet_brand(self):
         page=await self.start('wallet')
         await self.browser.operation({'command':'legacy'})

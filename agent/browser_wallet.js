@@ -58,10 +58,16 @@
   // Some older pickers suppress their generic injected option as soon as any
   // EIP-6963 provider appears, then ignore unfamiliar provider names. The agent
   // can retry the standard window.ethereum transport, without posing as a brand.
-  const mode = window.__patchriot_wallet_rpc({method:'wallet_mode'});
-  const announce = () => mode.then(value => {
-    if (!value.legacy) window.dispatchEvent(new CustomEvent('eip6963:announceProvider', {detail:Object.freeze({info,provider})}));
-  }).catch(() => {});
+  let legacy;
+  const announce = () => {
+    // Once the local mode is known, discovery must reply during the request
+    // event. Some consumers snapshot installed providers before a Promise's
+    // microtask runs; deferring every announcement loses that initial list.
+    if (legacy === false) window.dispatchEvent(new CustomEvent('eip6963:announceProvider', {detail:Object.freeze({info,provider})}));
+  };
   window.addEventListener('eip6963:requestProvider', announce);
-  announce();
+  window.__patchriot_wallet_rpc({method:'wallet_mode'}).then(value => {
+    legacy = value.legacy;
+    announce();
+  }).catch(() => {});
 })();
