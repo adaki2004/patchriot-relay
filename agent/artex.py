@@ -22,7 +22,7 @@ API_LIMIT = 512 * 1024
 API = 'http://127.0.0.1:8787'
 POSTGRES = '/usr/lib/postgresql/17/bin/'
 TERMINAL = {'completed', 'done', 'failed', 'paused', 'stopped', 'timed_out', 'timeout', 'unavailable'}
-NO_TARGET_PROGRESS_SECONDS = 300
+NO_ENGINE_PROGRESS_SECONDS = 300
 SETTLEMENT_RESERVE_SECONDS = 300
 
 
@@ -99,6 +99,24 @@ def should_stop(task):
     """An exhausted model chain must not sit idle until its entire lease expires."""
     return (task.get('status') in TERMINAL
             or task.get('llm_failover_state') == 'chain_exhausted')
+
+
+def command_observations(reply):
+    """Distinct successful tool results are activity, not target evidence.
+
+    Offline analysis can legitimately outlast the network watchdog. Task
+    heartbeats, errors and repeated command/output pairs do not extend it.
+    The hard time, request and spending boundaries still apply.
+    """
+    entries = reply.get('commands', []) if isinstance(reply, dict) else []
+    if not isinstance(entries, list):
+        return set()
+    return {hashlib.sha256(json.dumps([entry['tool'], entry['command'], entry['output']],
+                                     sort_keys=True).encode()).hexdigest()
+            for entry in entries if isinstance(entry, dict)
+            and entry.get('is_error') is False
+            and all(isinstance(entry.get(key), str) and entry[key].strip()
+                    for key in ('tool', 'command', 'output'))}
 
 
 def task_body(scope, targets, seconds, role, allowance=None):
@@ -236,6 +254,8 @@ class Engine:
             raise ValueError('invalid engine task id')
         reason = 'time_budget'
         observed, last_progress = progress(), time.monotonic()
+        last_target_progress = last_progress
+        seen_commands, checked_commands = set(), last_progress
         refreshed = time.monotonic()
         while time.monotonic() < self.deadline:
             if time.monotonic() - refreshed >= 30 and getattr(self, 'budget_refresh', None):
@@ -252,8 +272,18 @@ class Engine:
             current = progress()
             if current > observed:
                 observed, last_progress = current, time.monotonic()
-            if time.monotonic() - last_progress >= NO_TARGET_PROGRESS_SECONDS:
-                reason = 'no_target_progress'
+                last_target_progress = last_progress
+            if time.monotonic() - checked_commands >= 30:
+                checked_commands = time.monotonic()
+                try:
+                    commands = command_observations(self.client.call('/api/commands?task=' + identifier + '&size=25'))
+                    if len(seen_commands) < 4096 and commands - seen_commands:
+                        last_progress = time.monotonic()
+                        seen_commands.update(commands)
+                except (OSError, ValueError):
+                    pass  # Unavailable activity metadata cannot extend the watchdog.
+            if time.monotonic() - last_progress >= NO_ENGINE_PROGRESS_SECONDS:
+                reason = 'no_engine_progress'
                 break
             if self.process.poll() is not None:
                 raise RuntimeError('engine exited before collection')
@@ -271,7 +301,7 @@ class Engine:
             'engine': 'ARTEX', 'commit': VERSION, 'stop_reason': reason,
             'coverage_complete': reason in ('completed', 'done'),
             'distinct_target_observations': observed,
-            'seconds_without_target_progress': int(time.monotonic() - last_progress),
+            'seconds_without_target_progress': int(time.monotonic() - last_target_progress),
             'target_mapping': dict(zip(scope['origins'], targets)),
             'outcome': self.client.call('/api/tasks/' + identifier + '/outcome'),
             'findings': self.client.call('/api/exploration/findings?task=' + identifier),
@@ -339,7 +369,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         'Only recorded broker requests establish that a target was contacted. Engine findings and command counts are not independent verification.',
         'Only the methods and test-account access declared in scope were allowed. Browser login, network discovery, external callbacks and unrestricted egress are unsupported. Missing binaries and blocked tests are coverage gaps.',
         'A budget-limited run may contain useful findings while leaving goals unfinished. Review its stop reason and the later agents’ control requests.',
-        'Discovery stops after five minutes without a new recorded target observation. Planning, status polling and identical repeated replies do not reset that timer. This can interrupt slow analysis; it is not proof of complete coverage.',
+        'Discovery stops after five minutes without a new target observation or distinct successful tool result. Heartbeats, tool errors and repeated command/output pairs do not reset that timer. Local analysis is activity, not proof of target coverage; the hard time and spending limits still apply.',
     ]
     # The full file is for this role. Its handoff must remain valid JSON even
     # when upstream commands include long scripts or page responses.

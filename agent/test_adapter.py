@@ -119,7 +119,7 @@ class LiveOverviewTests(unittest.TestCase):
         import artex
         import copy
         scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
-        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress'):
+        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress'):
             with self.subTest(reason=reason):
                 detail = {'engine': 'ARTEX', 'stop_reason': reason, 'coverage_complete': False,
                           'failure': 'incomplete'}

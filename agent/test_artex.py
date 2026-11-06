@@ -119,8 +119,8 @@ class EngineTests(unittest.TestCase):
         # A fake clock exercises the five-minute wait without sleeping. A new
         # observation at minute four extends it; task heartbeats alone do not.
         for progress_at, completed_at, expected_time, expected_reason in [
-            (None, None, 300, 'no_target_progress'),
-            (240, None, 540, 'no_target_progress'),
+            (None, None, 300, 'no_engine_progress'),
+            (240, None, 540, 'no_engine_progress'),
             (None, 300, 300, 'completed'),
         ]:
             with self.subTest(progress_at=progress_at, completed_at=completed_at), tempfile.TemporaryDirectory() as temp:
@@ -148,6 +148,37 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(result['coverage_complete'], completed_at is not None)
                 self.assertEqual(result['findings'], [{'title': 'Owned fixture lead', 'verified': False}])
                 self.assertEqual(('/api/tasks/7/control', {'action':'pause'}) in calls, completed_at is None)
+
+    def test_offline_analysis_extends_watchdog_but_repeats_and_errors_do_not(self):
+        for mode, expected_time, reason in [('analysis', 780, 'done'),
+                                            ('repeated', 540, 'no_engine_progress'),
+                                            ('error', 300, 'no_engine_progress')]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                clock = [0.0]
+                class FakeClient:
+                    def call(self, path, body=None):
+                        if path == '/api/tasks': return {'id': 7}
+                        if path == '/api/tasks/7':
+                            return {'status': 'done' if clock[0] >= 780 else 'running'}
+                        if path.startswith('/api/commands'):
+                            batch = int(clock[0] // 240) if mode == 'analysis' else 1
+                            return {'commands': [] if clock[0] < 240 else [{
+                                'id': clock[0], 'tool': 'Bash', 'command': 'inspect saved application files',
+                                'output': 'analysis of file ' + str(batch), 'is_error': mode == 'error'}]}
+                        return {}
+                def tick(_seconds): clock[0] += 30
+                engine = object.__new__(artex.Engine)
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 900, 1
+                engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
+                (engine.directory / 'process.log').write_text('')
+                with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
+                    result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator')
+                self.assertEqual(clock[0], expected_time)
+                self.assertEqual(result['stop_reason'], reason)
+                self.assertEqual(result['distinct_target_observations'], 0)
+                self.assertEqual(result['seconds_without_target_progress'], expected_time)
+                self.assertEqual(result['coverage_complete'], mode == 'analysis')
+        self.assertEqual(artex.command_observations({'commands': None}), set())
 
     def test_upstream_can_settle_before_hard_cutoff_without_upgrading_timeout(self):
         for terminal in ['done', 'timeout', None]:

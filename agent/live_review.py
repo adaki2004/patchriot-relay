@@ -23,7 +23,7 @@ def reusable_partial(record, report, scope):
     if (not isinstance(detail, dict) or detail.get('receipt_schema') != 1
             or detail.get('engine') != 'ARTEX' or detail.get('coverage_complete') is not False
             or detail.get('failure') != 'incomplete'
-            or detail.get('stop_reason') not in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress')):
+            or detail.get('stop_reason') not in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress')):
         return None
     refs = record.get('evidence_ids', [])
     for evidence in report.get('evidence', []):
