@@ -21,6 +21,36 @@ import live_review
 
 @unittest.skipUnless(os.environ.get('PATCHRIOT_HERMES_SMOKE') == '1', 'requires the pinned isolated Hermes image')
 class CompressionRuntimeTests(unittest.TestCase):
+    def test_pinned_hermes_classifies_bridge_size_errors_for_compression(self):
+        wire = io.StringIO()
+        server = ThreadingHTTPServer(('127.0.0.1', 0), adapter.Bridge)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        script = '''import sys
+from openai import OpenAI, APIStatusError
+from agent.error_classifier import classify_api_error
+client=OpenAI(api_key='local-bridge',base_url=sys.argv[1]+'/v1',max_retries=0)
+try:
+    client.chat.completions.create(model='owned-fixture',messages=[{'role':'user','content':'x'*5000}],max_tokens=10)
+except APIStatusError as error:
+    assert error.status_code==413
+    verdict=classify_api_error(error)
+    assert verdict.should_compress
+    assert verdict.reason.value=='payload_too_large'
+else:
+    raise AssertionError('Oversized input unexpectedly reached a model')
+'''
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch.object(adapter, 'MAX_REQUEST', 1024), patch.object(adapter, 'wire_out', wire):
+                env={'PATH':os.environ['PATH'],'HOME':temp,'HERMES_HOME':temp,
+                     'PYTHONPATH':'/opt/hermes','PYTHONDONTWRITEBYTECODE':'1'}
+                result=subprocess.run([sys.executable,'-c',script,f'http://127.0.0.1:{server.server_port}'],
+                    env=env,capture_output=True,text=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr[-2000:])
+                self.assertEqual(wire.getvalue(),'')
+        finally:
+            server.shutdown();server.server_close();thread.join(timeout=2)
+
     def test_real_compressor_uses_the_summary_route_without_provider_credentials(self):
         seen = []
         class Model(BaseHTTPRequestHandler):
@@ -264,8 +294,37 @@ class BridgeTests(unittest.TestCase):
 
     def test_oversized_http_body_never_enters_the_pipe(self):
         result, wire = self.exchange([], "POST", "/v1/chat/completions", headers={"Content-Length": str(adapter.MAX_REQUEST + 1)})
-        self.assertEqual(result[0], 400)
+        self.assertEqual(result[0], 413)
+        self.assertEqual(json.loads(result[2])['error']['code'], 'request_too_large')
         self.assertEqual(wire, [])
+
+    def test_encoded_conversation_overflow_returns_a_compressible_error_without_a_model_call(self):
+        # UTF-8 fits on HTTP, but the pipe's ASCII JSON escapes do not. The
+        # envelope can also push an otherwise fitting plain-text body over.
+        for content in ('é' * (adapter.MAX_REQUEST // 3), 'x' * (adapter.MAX_REQUEST - 100)):
+            body = json.dumps({'messages':[{'role':'user','content':content}]}, ensure_ascii=False).encode()
+            self.assertLess(len(body), adapter.MAX_REQUEST)
+            result, wire = self.exchange([], 'POST', '/v1/chat/completions', body)
+            self.assertIsNotNone(result, 'A size rejection must not look like a lost connection')
+            self.assertEqual(result[0], 413)
+            self.assertEqual(json.loads(result[2])['error']['code'], 'request_too_large')
+            self.assertEqual(wire, [], 'Rejected input must not spend provider allowance')
+            self.assertFalse(adapter.bridge_stopping.is_set())
+
+        frames = [{'type':'start','id':1,'status':200,'content_type':'application/json'},
+                  {'type':'chunk','id':1,'hex':b'{}'.hex()}, {'type':'end','id':1}]
+        result, wire = self.exchange(frames, 'POST', '/v1/chat/completions', '{"messages":[]}')
+        self.assertEqual(result[0], 200, 'A smaller retry must still reach the broker')
+        self.assertEqual(len(wire), 1)
+
+    def test_oversized_engine_input_ends_discovery_without_stopping_the_reviewer(self):
+        result, wire = self.exchange([], 'POST', '/patchriot/artex/v1/chat/completions',
+            headers={'Content-Length':str(adapter.MAX_REQUEST + 1)})
+        self.assertEqual(result[0], 413)
+        self.assertEqual(wire, [])
+        self.assertTrue(adapter.engine_stopping.is_set())
+        self.assertEqual(adapter.engine_stop_reason, 'model_request_rejected')
+        self.assertFalse(adapter.bridge_stopping.is_set())
 
     def test_discovery_budget_stops_only_the_engine_and_keeps_the_bridge_open(self):
         frames = [

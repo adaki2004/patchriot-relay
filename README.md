@@ -30,6 +30,8 @@ Scout investigates, Recon checks its leads and a third reviewer challenges serio
 
 Later roles reuse completed discovery records. A missing or failed discovery tool may be retried once; unfinished coverage remains visible. If a run stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.
 
+Conversations still have a transport size limit. If the HTTP body or its encoded message is too large, the local bridge returns a size error so Hermes can compact its history. That rejected input never reaches the model provider; it is not retried as a network outage.
+
 Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.
 
 The reviewer can inspect the exact saved HTTP records from discovery before citing a finding. Reading those records does not repeat the requests. Scanner output remains a lead to check, and a completed report is not proof that every claim is correct.

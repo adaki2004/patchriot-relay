@@ -24,6 +24,10 @@ engine_stop_reason = None
 request_id = 0
 
 
+class MessageTooLarge(RuntimeError):
+    """The request is valid JSON but exceeds the local transport allowance."""
+
+
 def website_input(stream, directory, source=False):
     line = stream.readline(6 * 1024 * 1024 + 1)
     if not line or len(line) > 6 * 1024 * 1024 or not line.endswith(b"\n"):
@@ -112,7 +116,7 @@ def inspect_website(source=False):
 def send(value):
     encoded = json.dumps(value, ensure_ascii=True)
     if len(encoded.encode()) > MAX_REQUEST:
-        raise RuntimeError("adapter message exceeds its limit")
+        raise MessageTooLarge("adapter message exceeds its limit")
     with wire_lock:
         wire_out.write(encoded + "\n")
         wire_out.flush()
@@ -154,6 +158,25 @@ class Bridge(BaseHTTPRequestHandler):
     def do_POST(self):
         self.exchange()
 
+    def size_error(self):
+        """Let Hermes compact oversized input instead of retrying an outage.
+
+        This reply precedes any pipe write or model call. The byte ceiling is
+        unchanged, and no prompt text is included in the error.
+        """
+        global engine_stop_reason
+        if self.path == '/patchriot/artex/v1/chat/completions':
+            engine_stop_reason = 'model_request_rejected'
+            engine_stopping.set()
+        body = json.dumps({'error':{'type':'invalid_request_error', 'code':'request_too_large',
+            'message':'Request exceeds the bridge size limit. Compact the conversation before retrying.'}}).encode()
+        self.send_response(413)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+
     def exchange(self):
         global request_id, engine_stop_reason
         self.close_connection = True
@@ -161,15 +184,22 @@ class Bridge(BaseHTTPRequestHandler):
             if bridge_stopping.is_set():
                 return self.send_error(503)
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > MAX_REQUEST or self.headers.get("Transfer-Encoding"):
+            if length < 0 or self.headers.get("Transfer-Encoding"):
                 return self.send_error(400)
+            if length > MAX_REQUEST:
+                return self.size_error()
             body = json.loads(self.rfile.read(length)) if length else None
             with transaction_lock:
                 if bridge_stopping.is_set():
                     return self.send_error(503)
                 request_id += 1
                 request = {"id": request_id, "method": self.command, "path": self.path, "body": body}
-                send({"type": "request", "request": request})
+                try:
+                    send({"type": "request", "request": request})
+                except MessageTooLarge:
+                    # HTTP bytes fit, but JSON escaping and the wire envelope
+                    # can be larger. Nothing has entered the broker yet.
+                    return self.size_error()
                 disconnected = False
                 while True:
                     line = sys.stdin.buffer.readline(MAX_REQUEST + 1)
