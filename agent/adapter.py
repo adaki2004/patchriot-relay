@@ -312,6 +312,8 @@ def main():
         scope = json.loads(Path("/work/scope.json").read_text())["scope"]
         tools = web_tools.run(scope, json.loads(Path("/work/previous.json").read_text()),
                               emit=lambda result: event("live_tool", run=result), role=role)
+        # Browser sign-in happens in Hermes below. This initial engine pass has
+        # public-route coverage for browser-login scopes, not a signed-in session.
         if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
                for p in tools['discovery_plan']):
             import artex
