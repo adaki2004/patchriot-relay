@@ -66,8 +66,14 @@ class RepairRuntimeTests(unittest.TestCase):
                 reply = {'id': 'owned-fixture', 'object': 'chat.completion', 'created': 1, 'model': 'owned-fixture',
                     'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': content}, 'finish_reason': 'stop'}],
                     'usage': {'prompt_tokens': 10, 'completion_tokens': 20, 'total_tokens': 30}}
-                raw = json.dumps(reply).encode()
-                self.send_response(200); self.send_header('Content-Type', 'application/json')
+                if body.get('stream'):
+                    reply['object'] = 'chat.completion.chunk'
+                    reply['choices'][0]['delta'] = reply['choices'][0].pop('message')
+                    raw = ('data: ' + json.dumps(reply) + '\n\ndata: [DONE]\n\n').encode()
+                    content_type = 'text/event-stream'
+                else:
+                    raw, content_type = json.dumps(reply).encode(), 'application/json'
+                self.send_response(200); self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(raw))); self.end_headers(); self.wfile.write(raw)
         server = ThreadingHTTPServer(('127.0.0.1', 0), Model)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
