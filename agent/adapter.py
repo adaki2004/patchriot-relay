@@ -46,9 +46,13 @@ def website_input(stream, directory, source=False):
 
 
 def configure_compression(home, model, bridge):
-    """Keep summaries on the same scoped broker, with a separate purpose."""
+    """Compress before large tool results fill the 64K conversation window."""
     with (home / 'config.yaml').open('a') as config:
-        config.write('auxiliary:\n  compression:\n    provider: custom\n    model: '
+        # Hermes raises percentage-only thresholds for smaller models. An
+        # absolute trigger leaves room for tool results and the final answer.
+        # Exact evidence stays in the task files; summaries are not citations.
+        config.write('compression:\n  enabled: true\n  threshold_tokens: 32000\n'
+                     'auxiliary:\n  compression:\n    provider: custom\n    model: '
                      + json.dumps(model) + '\n    base_url: '
                      + json.dumps(bridge + '/patchriot/summary/v1')
                      + '\n    api_key: local-bridge\n    reasoning_effort: low\n')
@@ -265,7 +269,7 @@ def main():
     # The pilot has only a small local toolset. Expose those schemas directly;
     # an extra discovery/wrapper tool confused CPU models in the owned checks.
     (home / "config.yaml").write_text(
-        'model:\n  ollama_num_ctx: 64000\ntools:\n  tool_search:\n    enabled: "off"\n'
+        'model:\n  context_length: 64000\n  ollama_num_ctx: 64000\ntools:\n  tool_search:\n    enabled: "off"\n'
     )
     if role:
         # The snapshot is already collected. Generic model-specific instructions

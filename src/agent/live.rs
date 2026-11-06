@@ -44,6 +44,9 @@ pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool 
 const MAX_SPEND: u64 = 10_000_000;
 const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
 const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
+// A verified primary call and its consented backup can each wait minutes.
+// Leave time for that route, context compression, report formatting and cleanup.
+const FINAL_REPORT_SECONDS: u64 = 600;
 const REVIEWER_RESERVE: u64 = 1_500_000;
 // Leave space for the next bounded HTTP record, tool transcripts and findings.
 // Refuse a new probe before sending it instead of dropping already cited evidence.
@@ -210,6 +213,7 @@ pub struct LiveBroker {
     fallback_key: Option<zeroize::Zeroizing<String>>,
     scope: LiveScope,
     deadline: Instant,
+    final_report_reserve: Duration,
     counters: Mutex<Counters>,
     access: access::Access,
     login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
@@ -290,6 +294,8 @@ impl LiveBroker {
             fallback_key,
             scope,
             deadline,
+            final_report_reserve: (deadline.saturating_duration_since(Instant::now()) / 3)
+                .min(Duration::from_secs(FINAL_REPORT_SECONDS)),
             counters: Mutex::new(Counters::default()),
             access,
             login_state: tokio::sync::Mutex::new(None),
@@ -564,7 +570,7 @@ impl LiveBroker {
         if count.calls >= FINAL_REPORT_CALL
             || count.evidence.len() >= MAX_HTTP_REQUESTS
             || count.evidence_bytes + HTTP_RECORD_RESERVE > HTTP_EVIDENCE_BUDGET
-            || self.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180)
+            || self.deadline.saturating_duration_since(Instant::now()) <= self.final_report_reserve
             || MAX_SPEND.saturating_sub(count.reserved) < next.saturating_mul(2) + 150_000
         {
             body.as_object_mut()
@@ -1993,5 +1999,30 @@ mod tests {
         assert_eq!(body["tool_choice"], "none");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(broker.counters.lock().unwrap().calls, 0);
+    }
+    #[test]
+    fn report_time_reserve_allows_slow_routes_without_consuming_short_roles() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "fixture-provider-credential-not-real").unwrap();
+        for (allowance, report_at) in [(3600, 599), (600, 199)] {
+            let mut runner = LiveBroker::new(
+                file.path(),
+                broker().scope.clone(),
+                Instant::now() + Duration::from_secs(allowance),
+            )
+            .unwrap();
+            let initial = json!({"messages":[{"role":"user","content":"Owned fixture"}],
+                "tools":[{"type":"function","function":{"name":"terminal"}}]});
+            let mut ongoing = initial.clone();
+            runner.finish_before_limit(&mut ongoing).unwrap();
+            assert_eq!(ongoing, initial, "A new short role must still investigate");
+            Arc::get_mut(&mut runner).unwrap().deadline =
+                Instant::now() + Duration::from_secs(report_at);
+            runner.finish_before_limit(&mut ongoing).unwrap();
+            assert!(ongoing.get("tools").is_none());
+            assert_eq!(ongoing["reasoning_effort"], "low");
+            assert_eq!(ongoing["messages"].as_array().unwrap().len(), 2);
+            assert_eq!(runner.counters.lock().unwrap().calls, 0);
+        }
     }
 }

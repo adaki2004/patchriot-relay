@@ -77,14 +77,32 @@ else:
         thread = threading.Thread(target=server.serve_forever,daemon=True); thread.start()
         try:
             with tempfile.TemporaryDirectory() as temp:
-                home=Path(temp); (home/'config.yaml').write_text('')
+                home=Path(temp); (home/'config.yaml').write_text('model:\n  context_length: 64000\n')
                 bridge=f'http://127.0.0.1:{server.server_port}'
                 adapter.configure_compression(home,'owned-fixture',bridge)
-                script = '''import sys,time
-from agent.context_compressor import ContextCompressor
-c=ContextCompressor(model='owned-fixture',provider='custom',base_url=sys.argv[1]+'/v1',api_key='local-bridge',config_context_length=64000)
-summary=c._call_summary_llm('Summarize this owned fixture.',time.monotonic())
-assert 'Owned fixture summary' in summary
+                script = '''import sys
+from run_agent import AIAgent
+agent=AIAgent(model='owned-fixture',provider='custom',api_mode='chat_completions',
+    base_url=sys.argv[1]+'/v1',api_key='local-bridge',enabled_toolsets=[],
+    max_tokens=8192,quiet_mode=True,skip_context_files=True,skip_memory=True,
+    skip_background_review=True,checkpoints_enabled=False)
+try:
+    c=agent.context_compressor
+    assert c.context_length==64000
+    assert c.threshold_tokens==32000, c.threshold_tokens
+    assert c.should_compress(35000)
+    messages=[{'role':'system','content':'Review only owned fixture evidence.'},
+              {'role':'user','content':'Retain the assessment objective and inspect saved evidence.'}]
+    for i in range(60):
+        messages.append({'role':'assistant' if i%2 else 'user',
+                         'content':f'Owned fixture record {i}: '+('bounded observation. '*200)})
+    original=[dict(m) for m in messages]
+    compacted=c.compress(messages,current_tokens=60000,force=True)
+    assert len(str(compacted)) < len(str(original))/2
+    assert 'Owned fixture summary' in str(compacted)
+    assert messages==original, 'Exact working evidence must not be rewritten'
+finally:
+    agent.close()
 '''
                 env={'PATH':os.environ['PATH'],'HOME':temp,'HERMES_HOME':temp,
                      'PYTHONPATH':'/opt/hermes','PYTHONDONTWRITEBYTECODE':'1'}
