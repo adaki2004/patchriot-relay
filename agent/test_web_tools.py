@@ -17,6 +17,25 @@ import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_password_control_uses_private_replay_and_retains_evidence(self):
+        reply = {'evidence': {'id': 42, 'status': 200}, 'body': '{"ok":true}'}
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.dict('os.environ', {'PATCHRIOT_BRIDGE_URL': 'http://127.0.0.1:1234'}), \
+                patch.object(live_http, 'default_account', return_value='testing'), \
+                patch.object(live_http, 'EVIDENCE_DIRECTORY', Path(folder)), \
+                patch.object(live_http, 'urlopen', return_value=io.BytesIO(json.dumps(reply).encode())) as upstream:
+            result = live_http.verify_changed_password()
+            request = upstream.call_args.args[0]
+            self.assertEqual(request.full_url, 'http://127.0.0.1:1234/patchriot/password/verify')
+            self.assertEqual(request.data, b'{}')
+            self.assertEqual(json.loads((Path(folder) / '42.json').read_text()), reply['evidence'])
+            self.assertEqual(result['evidence']['id'], 42)
+        with patch.object(live_http, 'default_account', return_value='reference'), \
+                patch.object(live_http, 'urlopen') as upstream:
+            with self.assertRaises(ValueError):
+                live_http.verify_changed_password()
+            upstream.assert_not_called()
+
     def test_mirror_distinguishes_partial_bodies_and_broker_denials_from_target_responses(self):
         def fixture(method, url, headers, **kwargs):
             if url.endswith('/blocked'):

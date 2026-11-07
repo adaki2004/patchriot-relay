@@ -22,6 +22,8 @@ pub(super) struct BrowserState {
     // engine or model; the relay injects it for this exact origin only.
     pub(super) verified_authorization: Option<Zeroizing<String>>,
     pub(super) verified_origin: Option<String>,
+    pub(super) password_login: Option<accounts::PasswordLogin>,
+    pub(super) password_login_attempted: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -426,6 +428,22 @@ impl LiveBroker {
                 body.clear();
                 headers.clear();
             }
+        }
+        if input.login
+            && evidence.error.is_none()
+            && evidence.status.is_some_and(|s| (200..300).contains(&s))
+            && let Some(login) = accounts::PasswordLogin::learn(
+                &self.access,
+                &evidence.method,
+                &input.url,
+                &input.headers,
+                input.data.as_deref(),
+            )
+        {
+            self.browser
+                .lock()
+                .map_err(|_| "browser_unavailable")?
+                .password_login = Some(login);
         }
         if !input.login {
             if let Some(data) = input.data {
@@ -905,6 +923,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
+            let mut changed_password: Option<String> = None;
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
@@ -938,12 +957,20 @@ mod tests {
                 let (status, cookie, body) = if head.starts_with("POST /different/session ") {
                     assert_eq!(
                         serde_json::from_str::<Value>(&body).unwrap(),
-                        json!({"login":"fixture@example.com","secret":"only-synthetic-password"})
+                        json!({"login":"fixture@example.com","secret":changed_password.as_deref().unwrap_or("only-synthetic-password")})
                     );
+                    if changed_password.is_some() {
+                        assert!(!head.contains("authorization:"));
+                        assert!(!head.contains("cookie:"));
+                    }
                     (
                         200,
-                        "Set-Cookie: session=synthetic-session; Path=/; Secure; HttpOnly\r\n",
-                        json!({"ok":true}).to_string(),
+                        if changed_password.is_some() {
+                            "Set-Cookie: session=synthetic-new-session; Path=/; Secure; HttpOnly\r\n"
+                        } else {
+                            "Set-Cookie: session=synthetic-session; Path=/; Secure; HttpOnly\r\n"
+                        },
+                        json!({"ok":true,"access_token":"synthetic-new-login-token", "echo":"synthetic-new-session"}).to_string(),
                     )
                 } else if head.starts_with("POST /api/auth/change-password ") {
                     assert!(!reference_account);
@@ -951,6 +978,7 @@ mod tests {
                     assert_eq!(change["current_password"], "only-synthetic-password");
                     assert!(change["new_password"].as_str().unwrap().len() >= 32);
                     assert!(!body.contains("PATCHRIOT_CURRENT_PASSWORD"));
+                    changed_password = change["new_password"].as_str().map(str::to_owned);
                     (
                         200,
                         "",
@@ -1259,6 +1287,20 @@ mod tests {
             .unwrap()
             .test_target = Some(address);
         let reference = broker.reference.as_ref().unwrap();
+        assert_eq!(
+            broker.verify_changed_password().await.unwrap_err(),
+            "account_credential_changes_not_permitted"
+        );
+        broker
+            .browser_call("/patchriot/browser/begin", json!({}))
+            .await
+            .unwrap();
+        broker.browser_call("/patchriot/browser/http", json!({
+            "method":"POST","url":"https://owned.example/different/session",
+            "headers":{"content-type":"application/json"},"login":true,
+            "data":json!({"login":"fixture@example.com","secret":"only-synthetic-password"}).to_string()
+        })).await.unwrap();
+        assert!(broker.browser.lock().unwrap().password_login.is_some());
         let change = json!({"method":"POST","url":"https://owned.example/api/auth/change-password",
             "headers":{"content-type":"application/json"},"authenticated":true,
             "data":json!({"current_password":"{{PATCHRIOT_CURRENT_PASSWORD}}","new_password":"{{PATCHRIOT_NEW_PASSWORD}}"}).to_string()});
@@ -1368,6 +1410,10 @@ mod tests {
         let result = broker.http(change.clone()).await.unwrap();
         assert_eq!(result["evidence"]["status"], 200);
         assert_eq!(result["evidence"]["account"], "testing");
+        assert_eq!(
+            broker.password_change_control()["accepted_evidence_id"],
+            result["evidence"]["id"]
+        );
         let new_password = broker.access.current_browser_password().unwrap();
         assert_ne!(new_password.as_str(), "only-synthetic-password");
         assert!(!result.to_string().contains(new_password.as_str()));
@@ -1382,6 +1428,55 @@ mod tests {
         assert_eq!(
             broker.http(change).await.unwrap_err(),
             "password_change_already_attempted"
+        );
+        let old_authorization = broker
+            .browser
+            .lock()
+            .unwrap()
+            .verified_authorization
+            .clone();
+        let old_cookie = broker
+            .access
+            .cookies(&public_url("https://owned.example/").unwrap(), true);
+        assert_eq!(
+            reference.verify_changed_password().await.unwrap_err(),
+            "account_credential_changes_not_permitted"
+        );
+        let observed_login = broker.browser.lock().unwrap().password_login.take();
+        assert_eq!(
+            broker.verify_changed_password().await.unwrap_err(),
+            "password_login_not_observed"
+        );
+        broker.browser.lock().unwrap().password_login = observed_login;
+        let (first, second) = tokio::join!(
+            broker.verify_changed_password(),
+            broker.verify_changed_password()
+        );
+        let result = first.unwrap();
+        assert_eq!(second.unwrap_err(), "password_login_already_attempted");
+        assert_eq!(result["evidence"]["status"], 200);
+        assert_ne!(result["evidence"]["authenticated"], true);
+        assert_eq!(result["password_login_control"]["account"], "testing");
+        assert_eq!(
+            broker.password_change_control()["login_control_evidence_id"],
+            result["evidence"]["id"]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(result["body"].as_str().unwrap()).unwrap()["ok"],
+            true
+        );
+        assert!(!result.to_string().contains(new_password.as_str()));
+        assert!(!result.to_string().contains("synthetic-new-login-token"));
+        assert!(!result.to_string().contains("synthetic-new-session"));
+        assert_eq!(
+            broker.browser.lock().unwrap().verified_authorization,
+            old_authorization
+        );
+        assert_eq!(
+            broker
+                .access
+                .cookies(&public_url("https://owned.example/").unwrap(), true),
+            old_cookie
         );
         let result = reference
             .engine_http(

@@ -113,6 +113,7 @@ class EngineTests(unittest.TestCase):
         self.assertIn('one self-service password-change attempt', permitted)
         self.assertIn('Authenticated logout and session-revocation routes are blocked', permitted)
         self.assertIn('{{PATCHRIOT_NEW_PASSWORD}}', permitted)
+        self.assertIn('VERIFY_CHANGED_PASSWORD once', permitted)
         self.assertNotIn('Supplied accounts and existing records are not disposable.', permitted)
         self.assertIn('Never initiate or confirm password recovery', permitted)
 
@@ -304,7 +305,7 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(('/api/tasks/7/control', {'action': 'pause'}) in calls, terminal is None)
 
     def test_late_collection_failure_preserves_outcome_and_other_findings(self):
-        for failed in ['commands', 'findings', 'outcome']:
+        for failed in ['commands', 'findings', 'outcome', 'facts']:
             with self.subTest(failed=failed):
                 class FakeClient:
                     def call(self, path, body=None):
@@ -312,7 +313,7 @@ class EngineTests(unittest.TestCase):
                             return {'id': 7}
                         if path == '/api/tasks/7':
                             return {'status': 'done'}
-                        if failed in path:
+                        if failed in path or failed == 'facts' and 'kind=fact' in path:
                             raise ValueError('engine API response exceeds limit')
                         return {'saved': path}
                 engine = object.__new__(artex.Engine)
@@ -322,11 +323,24 @@ class EngineTests(unittest.TestCase):
                 result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator')
                 self.assertEqual(result['stop_reason'], 'done')
                 self.assertEqual(result['collection_errors'], [failed])
-                self.assertEqual(result['coverage_complete'], failed == 'commands')
-                for key in ['commands', 'findings', 'outcome']:
+                self.assertEqual(result['coverage_complete'], failed in ('commands', 'facts'))
+                for key in ['commands', 'findings', 'outcome', 'facts']:
                     self.assertEqual('saved' in result[key], key != failed)
                 summary = json.loads(artex.receipt_summary(result, json.dumps(result)))
                 self.assertEqual(summary['collection_errors'], [failed])
+
+    def test_fact_handoff_preserves_negative_controls_and_account_attempts(self):
+        import live_review
+        result = {'facts': {'total': 1, 'items': [{'id': '16', 'state': 'confirmed',
+            'payload': json.dumps({'summary': 'Password change accepted, fresh login unavailable',
+                                   'detail': 'Full retained explanation'})}]},
+            'password_change_control': {'attempted': True, 'accepted_evidence_id': 20,
+                                        'login_control_evidence_id': 21}}
+        encoded = artex.receipt_summary(result, json.dumps(result))
+        coverage = live_review.engine_coverage([{'tool': 'artex-engine', 'output_excerpt': encoded}])[0]
+        self.assertEqual(coverage['password_change_control'], result['password_change_control'])
+        self.assertIn('Password change accepted', coverage['facts_preview']['items'][0]['summary'])
+        self.assertTrue(coverage['facts_preview']['summarized'])
 
     def test_engine_usage_comes_from_broker_counter_differences(self):
         class FakeEngine:

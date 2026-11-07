@@ -7,6 +7,94 @@ use zeroize::Zeroizing;
 const CURRENT: &str = "{{PATCHRIOT_CURRENT_PASSWORD}}";
 const NEXT: &str = "{{PATCHRIOT_NEW_PASSWORD}}";
 
+/// A private replay of an observed login, with its password replaced by a
+/// marker. Models cannot choose the destination or submit replacement fields.
+pub(super) struct PasswordLogin {
+    url: String,
+    content_type: String,
+    data: Zeroizing<String>,
+}
+
+impl PasswordLogin {
+    pub(super) fn learn(
+        access: &access::Access,
+        method: &str,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        data: Option<&str>,
+    ) -> Option<Self> {
+        let raw = data?;
+        if method != "POST" || raw.contains("PATCHRIOT_") || public_url(url).ok()?.query().is_some()
+        {
+            return None;
+        }
+        let content_type = headers.get("content-type")?.split(';').next()?.trim();
+        let mut fields: BTreeMap<String, String> = match content_type {
+            "application/json" => serde_json::from_str(raw).ok()?,
+            "application/x-www-form-urlencoded" => {
+                let pairs: Vec<_> = url::form_urlencoded::parse(raw.as_bytes())
+                    .into_owned()
+                    .collect();
+                let fields: BTreeMap<_, _> = pairs.iter().cloned().collect();
+                if fields.len() != pairs.len() {
+                    return None;
+                }
+                fields
+            }
+            _ => return None,
+        };
+        let principal = access.browser_principal()?;
+        let password = access.current_browser_password().ok()?;
+        if !fields.values().any(|v| v == principal)
+            || fields
+                .values()
+                .filter(|v| v.as_str() == password.as_str())
+                .count()
+                != 1
+        {
+            return None;
+        }
+        for value in fields.values_mut() {
+            if value == password.as_str() {
+                *value = NEXT.into();
+            }
+        }
+        let data = if content_type == "application/json" {
+            serde_json::to_string(&fields).ok()?
+        } else {
+            url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(fields)
+                .finish()
+        };
+        Some(Self {
+            url: url.into(),
+            content_type: content_type.into(),
+            data: Zeroizing::new(data),
+        })
+    }
+
+    fn probe(&self, password: &str) -> Probe {
+        // Generated passwords contain only ASCII alphanumerics and '!'. Both
+        // encodings are produced through their serializers before substitution.
+        let (marker, replacement) = if self.content_type == "application/json" {
+            (NEXT.to_owned(), password.to_owned())
+        } else {
+            let encode = |value: &str| {
+                url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>()
+            };
+            (encode(NEXT), encode(password))
+        };
+        Probe {
+            method: "POST".into(),
+            url: self.url.clone(),
+            headers: BTreeMap::from([("content-type".into(), self.content_type.clone())]),
+            data: Some(self.data.replace(&marker, &replacement)),
+            authenticated: false,
+            account_change: false,
+        }
+    }
+}
+
 fn normalized(value: &str) -> String {
     value
         .chars()
@@ -57,6 +145,53 @@ fn self_service_path(url: &url::Url) -> bool {
 }
 
 impl LiveBroker {
+    pub(super) fn password_change_control(&self) -> Value {
+        let accepted = self.password_change_evidence.load(Ordering::SeqCst);
+        let login = self.password_login_evidence.load(Ordering::SeqCst);
+        json!({"attempted":self.password_change_attempted.load(Ordering::SeqCst),
+            "accepted_evidence_id":(accepted > 0).then_some(accepted),
+            "login_control_evidence_id":(login > 0).then_some(login)})
+    }
+
+    /// One isolated login control after an accepted authorized change. The
+    /// existing session remains available for the separate revocation check.
+    pub(super) async fn verify_changed_password(&self) -> Result<Value, &'static str> {
+        if !self.password_change_permitted() {
+            return Err("account_credential_changes_not_permitted");
+        }
+        let password = self.access.replacement_password()?;
+        let probe = {
+            let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            let login = state
+                .password_login
+                .as_ref()
+                .ok_or("password_login_not_observed")?;
+            let origin = public_url(&login.url)?.origin().ascii_serialization();
+            if state.verified_origin.as_deref() != Some(origin.as_str()) {
+                return Err("authenticated_origin_mismatch");
+            }
+            let probe = login.probe(&password);
+            self.probe_url(&probe, false)?;
+            if state.password_login_attempted {
+                return Err("password_login_already_attempted");
+            }
+            state.password_login_attempted = true;
+            probe
+        };
+        // An anonymous exchange sends no prior cookie or bearer token and does
+        // not install its new session. Only redacted evidence leaves the relay.
+        let mut result = self.exchange(probe, false).await?;
+        self.password_login_evidence.store(
+            result["evidence"]["id"]
+                .as_u64()
+                .expect("recorded HTTP evidence") as u32,
+            Ordering::SeqCst,
+        );
+        result["password_login_control"] = json!({"account":"testing","fresh_session":true,
+            "interpretation":"Compare the observed login response with the original successful login. HTTP success alone does not establish authentication."});
+        Ok(result)
+    }
+
     pub(super) fn password_change_permitted(&self) -> bool {
         if self.account != Some(AccountSlot::Testing)
             || !self
@@ -176,6 +311,87 @@ impl LiveBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn password_login_replays_only_observed_flat_credentials() {
+        let scope: LiveScope = serde_json::from_value(json!({"origins":["https://owned.example"],
+            "methods":["GET","POST"],"profile":"web_active_v2", "authentication":"session",
+            "browser_login":{},"tools":["active_web_v2","browser_login_v1"]}))
+        .unwrap();
+        let credentials: TestCredentials = serde_json::from_value(json!({"kind":"session",
+            "username":"fixture@example.com","password":"synthetic-password"}))
+        .unwrap();
+        let access = access::Access::new(&scope, Some(&credentials)).unwrap();
+        for (content, body) in [
+            (
+                "application/json",
+                r#"{"email":"fixture@example.com","password":"synthetic-password"}"#,
+            ),
+            (
+                "application/x-www-form-urlencoded",
+                "user=fixture%40example.com&pwd=synthetic-password",
+            ),
+        ] {
+            let headers = BTreeMap::from([("content-type".into(), content.into())]);
+            let login = PasswordLogin::learn(
+                &access,
+                "POST",
+                "https://owned.example/signin",
+                &headers,
+                Some(body),
+            )
+            .unwrap();
+            assert!(!login.data.contains("synthetic-password"));
+            let probe = login.probe("Pr!replacement123");
+            let fields: BTreeMap<String, String> = if content == "application/json" {
+                serde_json::from_str(probe.data.as_ref().unwrap()).unwrap()
+            } else {
+                url::form_urlencoded::parse(probe.data.as_ref().unwrap().as_bytes())
+                    .into_owned()
+                    .collect()
+            };
+            assert!(fields.values().any(|v| v == "Pr!replacement123"));
+            assert!(!probe.authenticated);
+            assert_eq!(probe.headers.len(), 1);
+            assert!(
+                PasswordLogin::learn(
+                    &access,
+                    "GET",
+                    "https://owned.example/signin",
+                    &headers,
+                    Some(body)
+                )
+                .is_none()
+            );
+            assert!(
+                PasswordLogin::learn(
+                    &access,
+                    "POST",
+                    "https://owned.example/signin?next=/",
+                    &headers,
+                    Some(body)
+                )
+                .is_none()
+            );
+        }
+        let headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
+        for body in [
+            r#"{"email":"other@example.com","password":"synthetic-password"}"#,
+            r#"{"email":"fixture@example.com","password":"wrong-password"}"#,
+            r#"{"email":"fixture@example.com","password":"synthetic-password","confirmation":"synthetic-password"}"#,
+            r#"{"credentials":{"email":"fixture@example.com","password":"synthetic-password"}}"#,
+        ] {
+            assert!(
+                PasswordLogin::learn(
+                    &access,
+                    "POST",
+                    "https://owned.example/signin",
+                    &headers,
+                    Some(body)
+                )
+                .is_none()
+            );
+        }
+    }
     #[test]
     fn self_service_exception_excludes_recovery_admin_targets_and_account_ids() {
         for path in [

@@ -56,10 +56,24 @@ def request(method, url, headers=None, data=None, authenticated=True, *, discove
             return json.loads(error.read(8192))
 
 
+def verify_changed_password():
+    """Replay one privately learned login after an accepted password change."""
+    if default_account() != 'testing':
+        raise ValueError('Password verification belongs to the testing account')
+    req = Request(os.environ['PATCHRIOT_BRIDGE_URL'] + '/patchriot/password/verify',
+                  data=b'{}', headers={'Content-Type': 'application/json'})
+    try:
+        with urlopen(req, timeout=75) as response:
+            return retain_evidence(json.loads(response.read(2 * 1024 * 1024)))
+    except HTTPError as error:
+        with error:
+            return json.loads(error.read(8192))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("method", choices=["GET", "HEAD", "OPTIONS", "POST"])
-    parser.add_argument("url")
+    parser.add_argument("method", choices=["GET", "HEAD", "OPTIONS", "POST", "VERIFY_CHANGED_PASSWORD"])
+    parser.add_argument("url", nargs='?')
     parser.add_argument("--data", help="Approved POST body: JSON or URL-encoded form, at most 16 KiB")
     parser.add_argument("--account", choices=["testing", "reference"])
     parser.add_argument("--anonymous", action="store_true", help="Omit the test account and session cookies for a control request")
@@ -67,8 +81,15 @@ if __name__ == "__main__":
     parser.add_argument("--save-body", help="Save response text under /work for analysis")
     parser.add_argument("--body-chars", type=int, default=8192, choices=range(0,32769), metavar="0..32768")
     args = parser.parse_args()
-    headers = dict(value.split(":", 1) for value in args.header)
-    result = request(args.method, args.url, {k.strip(): v.strip() for k, v in headers.items()}, data=args.data, authenticated=not args.anonymous, account=args.account)
+    if args.method == 'VERIFY_CHANGED_PASSWORD':
+        if args.url or args.data is not None or args.header or args.anonymous or args.account:
+            parser.error('Password verification uses the private observed login and accepts no request fields')
+        result = verify_changed_password()
+    else:
+        if not args.url:
+            parser.error('A URL is required for HTTP requests')
+        headers = dict(value.split(":", 1) for value in args.header)
+        result = request(args.method, args.url, {k.strip(): v.strip() for k, v in headers.items()}, data=args.data, authenticated=not args.anonymous, account=args.account)
     body = result.get("body", "")
     if args.save_body:
         path = Path(args.save_body).resolve()

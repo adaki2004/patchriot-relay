@@ -44,7 +44,7 @@ def receipt_summary(result, full_output):
         return value
     summary = {key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
-        'collection_errors',
+        'collection_errors', 'password_change_control',
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
@@ -57,7 +57,8 @@ def receipt_summary(result, full_output):
                    details_available_during_role='/work/artex-results.json',
                    commands_returned=len(entries) if isinstance(entries, list) else 0,
                    outcome_preview=preview(result.get('outcome')),
-                   findings_preview=preview(result.get('findings')))
+                   findings_preview=preview(result.get('findings')),
+                   facts_preview=facts_preview(result.get('facts')))
     encoded = json.dumps(summary, ensure_ascii=True)
     from web_tools import MAX_OUTPUT
     if len(encoded.encode()) > MAX_OUTPUT:
@@ -65,8 +66,28 @@ def receipt_summary(result, full_output):
         # in half. Evidence references and the local full file are unchanged.
         summary['outcome_preview'] = {'omitted': True}
         summary['findings_preview'] = {'omitted': True}
+        summary['facts_preview'] = {'omitted': True}
         encoded = json.dumps(summary, ensure_ascii=True)
     return encoded
+
+
+def facts_preview(facts):
+    """Retain recent engine observations as claims with a full-file reference."""
+    if not isinstance(facts, dict) or not isinstance(facts.get('items'), list):
+        return {'unavailable': True}
+    rows = []
+    for node in facts['items'][:8]:
+        if not isinstance(node, dict):
+            continue
+        try:
+            payload = json.loads(node.get('payload', '{}'))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict):
+            rows.append({'id': node.get('id'), 'state': node.get('state'),
+                         'summary': str(payload.get('summary', ''))[:400]})
+    return {'total': facts.get('total'), 'items': rows,
+            'summarized': True, 'details': '/work/artex-results.json'}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -196,6 +217,11 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'the relay supplies private values. A confirmation field may use the new-password marker. JSON or form bodies only. '
             'Do not add an account ID/email, use admin/user-ID routes, retry a rejected attempt or reset/recover an account. '
             'Unsupported paths/field layouts remain gaps. An HTTP success alone does not prove the password changed; do not overstate session-revocation findings. '
+            'After an accepted change, run python3 /patchriot/live_http.py VERIFY_CHANGED_PASSWORD once. '
+            'This trusted helper privately replays the observed login with the new password and no existing session. '
+            'It returns redacted evidence and preserves the original session for a separate revocation check. '
+            'Compare the actual login response with the original successful response. A generic HTTP 200 alone is insufficient. '
+            'Do not send password markers to a login URL yourself. If the helper cannot verify the observed login, report that gap. '
             'Continue through the preserved reference account if testing-account access becomes unavailable.')
     elif (scope.get('account_policy') or {}).get('allow_password_changes'):
         body['goal'] += ('\nThe requester allowed a testing-account password change, but the relay has not established the distinct identity proofs required to activate that permission. '
@@ -358,6 +384,7 @@ class Engine:
         for key, path in [
             ('outcome', '/api/tasks/' + identifier + '/outcome'),
             ('findings', '/api/exploration/findings?task=' + identifier),
+            ('facts', '/api/exploration/nodes?task=' + identifier + '&kind=fact&size=100'),
             ('commands', '/api/commands?task=' + identifier + '&size=100'),
         ]:
             try:
@@ -452,6 +479,16 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
                     failure = 'incomplete'
             finally:
                 refs = [identifier for mirror in mirrors + signed for identifier in mirror.refs]
+                if (scope.get('account_policy') or {}).get('allow_password_changes'):
+                    from report_finish import bridge
+                    try:
+                        control = bridge('/patchriot/access').get('password_change_control')
+                        if isinstance(control, dict):
+                            result['password_change_control'] = control
+                            refs.extend(control[key] for key in ('accepted_evidence_id', 'login_control_evidence_id')
+                                        if type(control.get(key)) is int and control[key] > 0)
+                    except (OSError, ValueError, KeyError):
+                        result.setdefault('collection_errors', []).append('password_change_control')
                 final_allowance = refresh_budget()
                 before = {r['model']: r for r in engine.allowance.get('inference_usage', [])}
                 observed = []
@@ -499,11 +536,11 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
     # when upstream commands include long scripts or page responses.
     output = json.dumps({key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
-        'collection_errors',
+        'collection_errors', 'password_change_control',
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
-        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested', 'inference_usage', 'outcome', 'findings', 'commands'
+        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested', 'inference_usage', 'outcome', 'findings', 'facts', 'commands'
     ) if key in result}, ensure_ascii=True)
     (directory / 'artex-results.json').write_text(output)
     return record('artex-engine', VERSION, ['/opt/artex/artex', *scope['origins']], started,

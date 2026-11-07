@@ -74,6 +74,13 @@ impl Access {
             .map_err(|_| "credential_unavailable")? = Some(password);
         Ok(())
     }
+    pub fn replacement_password(&self) -> Result<Zeroizing<String>, &'static str> {
+        self.replacement_password
+            .lock()
+            .map_err(|_| "credential_unavailable")?
+            .clone()
+            .ok_or("password_change_not_accepted")
+    }
     pub fn browser_principal(&self) -> Option<&str> {
         self.login_account
             .as_ref()

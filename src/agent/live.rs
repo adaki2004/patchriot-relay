@@ -267,6 +267,8 @@ pub struct LiveBroker {
     account: Option<AccountSlot>,
     reference: Option<Arc<LiveBroker>>,
     password_change_attempted: std::sync::atomic::AtomicBool,
+    password_change_evidence: std::sync::atomic::AtomicU32,
+    password_login_evidence: std::sync::atomic::AtomicU32,
     workflow: Mutex<Option<AssessmentWorkflow>>,
     access: access::Access,
     login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
@@ -463,6 +465,8 @@ impl LiveBroker {
             account: None,
             reference: None,
             password_change_attempted: std::sync::atomic::AtomicBool::new(false),
+            password_change_evidence: std::sync::atomic::AtomicU32::new(0),
+            password_login_evidence: std::sync::atomic::AtomicU32::new(0),
             workflow: Mutex::new(None),
             access,
             login_state: tokio::sync::Mutex::new(None),
@@ -805,6 +809,12 @@ impl LiveBroker {
                 .as_u64()
                 .is_some_and(|s| (200..300).contains(&s))
         {
+            self.password_change_evidence.store(
+                reply["evidence"]["id"]
+                    .as_u64()
+                    .expect("recorded HTTP evidence") as u32,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             self.access.replace_browser_password(password)?;
         }
         Ok(reply)
@@ -1077,6 +1087,25 @@ impl LiveBroker {
                     });
                 self.access
                     .remember(&url, response.headers(), probe.authenticated);
+                // Fresh anonymous login controls can receive cookies without
+                // installing them. Register those secrets before exposing any
+                // response text, including bodies that echo a cookie value.
+                let cookie_secrets = response
+                    .headers()
+                    .get_all(reqwest::header::SET_COOKIE)
+                    .iter()
+                    .try_for_each(|header| {
+                        let value = header
+                            .to_str()
+                            .map_err(|_| "uninspectable_cookie_response")?;
+                        if let Some((_, secret)) =
+                            value.split(';').next().unwrap_or("").split_once('=')
+                        {
+                            self.access
+                                .remember_secret(secret.trim_matches('"').into())?;
+                        }
+                        Ok::<(), &'static str>(())
+                    });
                 evidence.status = Some(response.status().as_u16());
                 if login {
                     login_redirect = response
@@ -1123,10 +1152,11 @@ impl LiveBroker {
                     }
                     Err(_) => Ok(()),
                 };
-                if let Err(error) = inspected {
+                if let Err(error) = cookie_secrets.and(inspected) {
                     // Keep the attempted request and status, but never retain
                     // a truncated/uninspectable JSON secret as ordinary text.
                     evidence.error = Some(error.into());
+                    evidence.headers.clear();
                     received.clear();
                 }
                 let (redacted, shortened) = if login {
@@ -1275,6 +1305,7 @@ impl LiveBroker {
                     json!({"verified":protected_url.is_some(),"protected_url":protected_url,
                         "password_change_permitted":self.password_change_permitted(),
                         "password_change_attempted":self.password_change_attempted.load(std::sync::atomic::Ordering::SeqCst),
+                        "password_change_control":self.password_change_control(),
                         "accounts":([Some(self),self.reference.as_deref()].into_iter().flatten().filter_map(|broker| {
                             let account=broker.account?; let url=broker.verified_access();
                             Some(json!({"account":account,"verified":url.is_some(),"protected_url":url}))
@@ -1328,6 +1359,10 @@ impl LiveBroker {
                     Err(e) => (400, json!({"error":e})),
                 }
             }
+            ("POST", "/patchriot/password/verify") => match self.verify_changed_password().await {
+                Ok(v) => (200, v),
+                Err(e) => (400, json!({"error":e})),
+            },
             ("POST", ENGINE_HTTP) => {
                 match self.engine_http(request.body.unwrap_or(Value::Null)).await {
                     Ok(v) => (200, v),
