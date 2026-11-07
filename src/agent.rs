@@ -546,6 +546,26 @@ struct AgentRun {
     events: Vec<Value>,
 }
 
+fn record_container_failure(report: &mut AgentRun, state: &Value, passed: bool) {
+    if passed || report.outcome != "completed" || report.failure_reason.is_some() {
+        return;
+    }
+    // A child can be OOM-killed while the main process still emits its report
+    // and exits zero. Retain that report, but name the container failure rather
+    // than publishing the contradictory failure reason "completed".
+    report.failure_reason = Some(if state["State"]["OOMKilled"] == true {
+        "container_memory_limit"
+    } else if state["State"]["Running"] != false || state["State"]["Status"] != "exited" {
+        "container_stop_unconfirmed"
+    } else if state["State"]["ExitCode"] != 0 {
+        "container_exit_failed"
+    } else if state["State"]["OOMKilled"] != false {
+        "container_memory_state_unconfirmed"
+    } else {
+        "agent_completion_unconfirmed"
+    });
+}
+
 struct RequestTask(Option<JoinHandle<()>>);
 impl Drop for RequestTask {
     fn drop(&mut self) {
@@ -1350,7 +1370,7 @@ pub fn run(
         ) {
             return Err("agent container policy rejected".into());
         }
-        let report = runtime.block_on(supervise(
+        let mut report = runtime.block_on(supervise(
             docker.command(&[
                 "container",
                 "start",
@@ -1388,6 +1408,7 @@ pub fn run(
                         || e["data"]["observed_fixture_regression"] == true)
                     && e["data"]["completed"] == true
             });
+        record_container_failure(&mut report, &state, passed);
         Ok((report, stopped, state["State"]["OOMKilled"].clone(), passed))
     })();
     let cleanup = owned.cleanup();
@@ -1538,6 +1559,40 @@ fn evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_container_failure_preserves_saved_report_and_names_the_actual_gap() {
+        let state =
+            json!({"State":{"Running":false,"Status":"exited","ExitCode":0,"OOMKilled":true}});
+        let events = vec![
+            json!({"event":"result","data":{"completed":true,"final_response":"Retained owned evidence"}}),
+        ];
+        let mut report = AgentRun {
+            outcome: "completed",
+            events: events.clone(),
+            ..AgentRun::default()
+        };
+        record_container_failure(&mut report, &state, false);
+        assert_eq!(report.failure_reason, Some("container_memory_limit"));
+        assert_eq!(report.events, events);
+        assert_eq!(report.outcome, "completed");
+
+        report.failure_reason = Some("agent_frame_invalid");
+        record_container_failure(&mut report, &state, false);
+        assert_eq!(report.failure_reason, Some("agent_frame_invalid"));
+        report.failure_reason = None;
+        report.outcome = "timed_out";
+        record_container_failure(&mut report, &state, false);
+        assert_eq!(report.failure_reason, None);
+
+        report.outcome = "completed";
+        let clean =
+            json!({"State":{"Running":false,"Status":"exited","ExitCode":0,"OOMKilled":false}});
+        record_container_failure(&mut report, &clean, true);
+        assert_eq!(report.failure_reason, None);
+        record_container_failure(&mut report, &clean, false);
+        assert_eq!(report.failure_reason, Some("agent_completion_unconfirmed"));
+    }
 
     pub(super) fn settings() -> Settings {
         Settings {
