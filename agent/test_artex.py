@@ -101,6 +101,19 @@ class EngineTests(unittest.TestCase):
         self.assertIn('missing authenticated coverage', body['goal'])
         self.assertNotIn('no supplied account', body['goal'])
 
+    def test_password_change_guidance_distinguishes_consent_from_verified_permission(self):
+        scope = dict(SCOPE, account_policy={'allow_password_changes': True})
+        blocked = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')['goal']
+        self.assertIn('requester allowed a testing-account password change', blocked)
+        self.assertIn('missing identity proof', blocked)
+        self.assertNotIn('{{PATCHRIOT_NEW_PASSWORD}}', blocked)
+        scope['_password_change_permitted'] = True
+        permitted = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')['goal']
+        self.assertIn('one self-service password-change attempt', permitted)
+        self.assertIn('{{PATCHRIOT_NEW_PASSWORD}}', permitted)
+        self.assertNotIn('Supplied accounts and existing records are not disposable.', permitted)
+        self.assertIn('Never initiate or confirm password recovery', permitted)
+
     def test_planner_gets_numeric_budget_finish_reserve_and_neutral_identity(self):
         body = artex.task_body(SCOPE, ['http://127.0.0.1:1234'], 1800, 'investigator',
                                {'engine_http_remaining': 1457, 'engine_model_calls_remaining': 400})

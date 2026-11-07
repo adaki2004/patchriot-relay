@@ -183,6 +183,9 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'Different logins alone do not prove different tenants or a vulnerability. Never request password or settings changes for the reference account. ')
     if scope.get('_password_change_permitted') is True:
         body['goal'] = body['goal'].replace('Never change passwords, initiate or confirm password recovery,', 'Never initiate or confirm password recovery,')
+        body['goal'] = body['goal'].replace(
+            'Supplied accounts and existing records are not disposable. Test these controls only in an owner-prepared disposable fixture; otherwise record them as untested.',
+            'The testing account has only the explicit password-change exception described below. Preserve the reference account and existing records. Record other account-changing controls as untested.')
         body['goal'] += ('\nThe requester explicitly permits one self-service password-change attempt on the TESTING account, after other useful checks. '
             'Both distinct account identities were verified by the relay. Use ONLY the testing authenticated mirror, the observed self-service password endpoint, '
             "and the application’s actual current_password/old_password and new_password field names. "
@@ -191,6 +194,9 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'Do not add an account ID/email, use admin/user-ID routes, retry a rejected attempt or reset/recover an account. '
             'Unsupported paths/field layouts remain gaps. An HTTP success alone does not prove the password changed; do not overstate session-revocation findings. '
             'Continue through the preserved reference account if testing-account access becomes unavailable.')
+    elif (scope.get('account_policy') or {}).get('allow_password_changes'):
+        body['goal'] += ('\nThe requester allowed a testing-account password change, but the relay has not established the distinct identity proofs required to activate that permission. '
+            'Preserve both accounts and record this missing identity proof as the reason that password-change testing remains unavailable.')
     return body
 
 
