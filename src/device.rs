@@ -646,24 +646,46 @@ fn work_tick(
     source_reviews: bool,
     live_tests: bool,
 ) -> Result<(), Error> {
-    // A restarted relay can have a completed outbox but no running monitor.
-    // Refresh its existing lease before a potentially large upload. A completed
-    // server lease may reject renewal yet still accept an idempotent replay.
+    // Outbox delivery after restart needs the same renewable lease as live
+    // execution: the upload deadline can exceed a single 60-second lease.
     let saved = read_config(directory)?;
-    if let Some(result) = &saved.pending_result
+    let renewal = if let Some(result) = &saved.pending_result
         && !saved.paused
         && saved.active_assignment.as_ref().map(|a| a.lease_id) == Some(result.lease_id)
     {
         match renew(directory, client, result.lease_id, None) {
-            Ok(_) => {}
+            Ok((started, renewed)) => Some((result.lease_id, started, renewed)),
+            // An already accepted result still needs its idempotent ack.
             Err(error)
                 if error
                     .downcast_ref::<RemoteError>()
-                    .is_some_and(|e| [404, 409].contains(&e.status)) => {}
+                    .is_some_and(|e| [404, 409].contains(&e.status)) =>
+            {
+                None
+            }
             Err(error) => return Err(error),
         }
+    } else {
+        None
+    };
+    if let Some((lease_id, started, renewed)) = renewal {
+        let window = LeaseWindow::new(started, renewed.valid_for_seconds);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let monitor = scope.spawn(|| {
+                monitor_lease(directory, client, stop, &window, &done, lease_id, || None)
+            });
+            let guard = StopMonitor(&done);
+            let result = send_result(directory, client);
+            drop(guard);
+            if monitor.join().is_err() {
+                return Err("saved delivery lease monitor stopped unexpectedly".into());
+            }
+            result
+        })?;
+    } else {
+        send_result(directory, client)?;
     }
-    send_result(directory, client)?;
     let (config, key) = {
         let _lock = state_lock(directory)?;
         let mut config = read_config(directory)?;
@@ -897,6 +919,96 @@ fn agent_execution_deadline(
         + Duration::from_secs(remaining.saturating_sub(patchriot_protocol::AGENT_CLEANUP_SECONDS)))
 }
 
+fn monitor_lease(
+    directory: &Path,
+    client: &reqwest::blocking::Client,
+    stop: &AtomicBool,
+    window: &LeaseWindow,
+    done: &AtomicBool,
+    lease_id: Uuid,
+    snapshot: impl Fn() -> Option<patchriot_protocol::pentests::LiveProgress>,
+) {
+    struct StopWindow<'a>(&'a LeaseWindow);
+    impl Drop for StopWindow<'_> {
+        fn drop(&mut self) {
+            self.0.stop();
+        }
+    }
+    let _stop_window = StopWindow(window);
+    let mut heartbeat_at = Instant::now() + Duration::from_secs(10);
+    let mut renew_at = Instant::now() + Duration::from_secs(20);
+    while !done.load(Ordering::Relaxed) {
+        let reason = if stop.load(Ordering::Relaxed) {
+            Some("operator_stop")
+        } else if window.stopped_at(Instant::now()) {
+            Some("lease_window_expired")
+        } else if !locally_ready(directory, lease_id) {
+            Some("local_assignment_unavailable")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            eprintln!("lease monitor stopped: {reason}");
+            window.stop();
+            break;
+        }
+        if Instant::now() >= heartbeat_at {
+            match tick(directory, client) {
+                Ok(Some(state)) if ["online", "busy"].contains(&state.as_str()) => {}
+                Err(error) if !terminal_remote_error(&error) => {
+                    eprintln!("heartbeat retry pending")
+                }
+                Ok(_) => {
+                    eprintln!("lease monitor stopped: heartbeat_device_unavailable");
+                    window.stop();
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("lease monitor stopped: heartbeat_rejected: {error}");
+                    window.stop();
+                    break;
+                }
+            }
+            heartbeat_at = Instant::now() + Duration::from_secs(10);
+        }
+        if Instant::now() >= renew_at {
+            let renewal_started = Instant::now();
+            match renew(directory, client, lease_id, snapshot()) {
+                Ok((started, reply)) => {
+                    window.extend_at(started, reply.valid_for_seconds, Instant::now());
+                    if window.stopped_at(Instant::now()) {
+                        eprintln!("lease monitor stopped: renewal_arrived_after_local_expiry");
+                        break;
+                    }
+                }
+                Err(error) if !terminal_remote_error(&error) => {
+                    eprintln!("lease renewal retry pending")
+                }
+                Err(error) => {
+                    eprintln!("lease monitor stopped: renewal_rejected: {error}");
+                    window.stop();
+                    break;
+                }
+            }
+            if renewal_started.elapsed() >= Duration::from_secs(2) {
+                eprintln!(
+                    "lease renewal delayed: duration_ms={}",
+                    renewal_started.elapsed().as_millis()
+                );
+            }
+            renew_at = Instant::now() + Duration::from_secs(10);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+struct StopMonitor<'a>(&'a AtomicBool);
+impl Drop for StopMonitor<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn agent_work(
     directory: &Path,
     client: &reqwest::blocking::Client,
@@ -937,92 +1049,21 @@ fn agent_work(
         .as_deref()
         .ok_or("missing model declaration")?;
     let done = AtomicBool::new(false);
-    struct StopMonitor<'a>(&'a AtomicBool);
-    impl Drop for StopMonitor<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
     println!(
         "{}",
         serde_json::json!({"event":"agent_started","review_id":assignment.review_id,"role":assignment.role,"lease_id":assignment.lease_id})
     );
     std::thread::scope(|scope| {
         let monitor = scope.spawn(|| {
-            struct StopWindow<'a>(&'a LeaseWindow);
-            impl Drop for StopWindow<'_> {
-                fn drop(&mut self) {
-                    self.0.stop();
-                }
-            }
-            let _stop_window = StopWindow(&window);
-            let mut heartbeat_at = Instant::now() + Duration::from_secs(10);
-            let mut renew_at = Instant::now() + Duration::from_secs(20);
-            while !done.load(Ordering::Relaxed) {
-                let reason = if stop.load(Ordering::Relaxed) {
-                    Some("operator_stop")
-                } else if window.stopped_at(Instant::now()) {
-                    Some("lease_window_expired")
-                } else if !locally_ready(directory, assignment.lease_id) {
-                    Some("local_assignment_unavailable")
-                } else {
-                    None
-                };
-                if let Some(reason) = reason {
-                    eprintln!("lease monitor stopped: {reason}");
-                    window.stop();
-                    break;
-                }
-                if Instant::now() >= heartbeat_at {
-                    match tick(directory, client) {
-                        Ok(Some(state)) if ["online", "busy"].contains(&state.as_str()) => {}
-                        Err(error) if !terminal_remote_error(&error) => {
-                            eprintln!("heartbeat retry pending")
-                        }
-                        Ok(_) => {
-                            eprintln!("lease monitor stopped: heartbeat_device_unavailable");
-                            window.stop();
-                            break;
-                        }
-                        Err(error) => {
-                            eprintln!("lease monitor stopped: heartbeat_rejected: {error}");
-                            window.stop();
-                            break;
-                        }
-                    }
-                    heartbeat_at = Instant::now() + Duration::from_secs(10);
-                }
-                if Instant::now() >= renew_at {
-                    let renewal_started = Instant::now();
-                    match renew(directory, client, assignment.lease_id, snapshot()) {
-                        Ok((started, reply)) => {
-                            window.extend_at(started, reply.valid_for_seconds, Instant::now());
-                            if window.stopped_at(Instant::now()) {
-                                eprintln!(
-                                    "lease monitor stopped: renewal_arrived_after_local_expiry"
-                                );
-                                break;
-                            }
-                        }
-                        Err(error) if !terminal_remote_error(&error) => {
-                            eprintln!("lease renewal retry pending")
-                        }
-                        Err(error) => {
-                            eprintln!("lease monitor stopped: renewal_rejected: {error}");
-                            window.stop();
-                            break;
-                        }
-                    }
-                    if renewal_started.elapsed() >= Duration::from_secs(2) {
-                        eprintln!(
-                            "lease renewal delayed: duration_ms={}",
-                            renewal_started.elapsed().as_millis()
-                        );
-                    }
-                    renew_at = Instant::now() + Duration::from_secs(10);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            monitor_lease(
+                directory,
+                client,
+                stop,
+                &window,
+                &done,
+                assignment.lease_id,
+                snapshot,
+            );
         });
         let stop_monitor = StopMonitor(&done);
         let result = (|| {
@@ -1516,6 +1557,127 @@ mod tests {
             server.join().unwrap();
         }
         assert!(!retryable_dispatcher_error(&"model profile changed".into()));
+    }
+
+    #[test]
+    fn restarted_outbox_keeps_renewing_during_delivery_without_starting_work() {
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("relay");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        initialize(
+            &state,
+            &HashMap::from([
+                ("--dispatcher", url.as_str()),
+                ("--audience", "test"),
+                ("--label", "Owned fixture"),
+                ("--compute-group", "owned"),
+            ]),
+        )
+        .unwrap();
+        let lease_id = Uuid::new_v4();
+        let mut config = read_config(&state).unwrap();
+        config.device_id = Some(Uuid::new_v4());
+        config.active_assignment = Some(WorkAssignment {
+            lease_id,
+            review_id: Uuid::new_v4(),
+            role: ReviewRole::Investigator,
+            scenario: FixtureScenario::AccessControlV1,
+            expires_at: i64::MAX,
+            mode: ReviewMode::OwnedFixture,
+            website: None,
+            source: None,
+            pentest: None,
+        });
+        config.pending_result = Some(CompleteWork {
+            lease_id,
+            result: WorkResult::Fixture(FixtureResult { runs: vec![] }),
+        });
+        write_config(&state, &config).unwrap();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let observed = renewals.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(35);
+            let mut handlers = Vec::new();
+            let polled = Arc::new(AtomicBool::new(false));
+            while !polled.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                let renewals = renewals.clone();
+                let polled = polled.clone();
+                handlers.push(std::thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new();
+                    let (end, length) = loop {
+                        let mut buffer = [0; 8192];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert!(n > 0 && bytes.len() < 16384);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let length: usize = std::str::from_utf8(&bytes[..end]).unwrap().lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                            }).unwrap();
+                            if bytes.len() >= end + 4 + length { break (end + 4, length); }
+                        }
+                    };
+                    let path = std::str::from_utf8(&bytes[..end]).unwrap().lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                    let body = if path.ends_with("/complete-gzip") {
+                        // Hold the completion open until a concurrent renewal arrives.
+                        while renewals.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        assert!(renewals.load(Ordering::Relaxed) >= 2);
+                        serde_json::json!({"accepted":true,"fixture_matches":true,"evidence_complete":null,"replayed":false})
+                    } else {
+                        let request: serde_json::Value = serde_json::from_slice(&bytes[end..end+length]).unwrap();
+                        if path.ends_with("/renew") {
+                            renewals.fetch_add(1, Ordering::Relaxed);
+                            serde_json::json!({"lease_id":lease_id,"sequence":request["payload"]["sequence"],"expires_at":100,"deadline_at":1000,"valid_for_seconds":60,"replayed":false})
+                        } else if path.ends_with("/heartbeat") {
+                            serde_json::json!({"state":"busy","sequence":request["payload"]["sequence"],"replayed":false})
+                        } else {
+                            assert!(path.ends_with("/poll"));
+                            polled.store(true, Ordering::Relaxed);
+                            serde_json::json!({"assignment":null})
+                        }
+                    }.to_string();
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}",body.len()).unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+            assert!(polled.load(Ordering::Relaxed));
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        work_tick(
+            &state,
+            &client,
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(observed.load(Ordering::Relaxed) >= 2);
+        assert!(read_config(&state).unwrap().pending_result.is_none());
+        assert!(read_config(&state).unwrap().active_assignment.is_none());
     }
 
     #[test]
