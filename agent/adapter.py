@@ -372,6 +372,7 @@ def main():
                 request('GET', protected, authenticated=True)
                 request('GET', protected, authenticated=False)
             access = bridge('/patchriot/access')
+            access['requested'] = bool(scope.get('authentication'))
             event("phase", name="artex_engine")
             engine_deadline = started + budget - min(900, budget / 3)
             workflow.begin("artex-engine")

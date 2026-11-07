@@ -48,7 +48,7 @@ def receipt_summary(result, full_output):
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
-        'anonymous_evidence_count', 'authenticated_evidence_count'
+        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested'
     ) if key in result}
     commands = result.get('commands', {})
     entries = commands.get('commands', []) if isinstance(commands, dict) else commands
@@ -127,7 +127,8 @@ def task_body(scope, targets, seconds, role, allowance=None):
         raise ValueError('missing target mirrors')
     mapping = '\n'.join(f'{origin} -> {target}' for origin, target in zip(scope['origins'], targets))
     authenticated = scope.get('_authenticated_targets', {})
-    access = ('This engine is anonymous; no supplied account is available. '
+    access = (('An account was declared for this assessment, but usable authenticated access was not verified. This engine pass is anonymous; report missing authenticated coverage, not a missing supplied account. '
+               if scope.get('_authentication_requested') else 'This is an anonymous black-box investigation. ')
               if not authenticated else
               'This is ONE combined public and authenticated investigation. The mirrors above are ANONYMOUS controls. '
               'These separate AUTHENTICATED mirrors inject the already verified account in the relay:\n' +
@@ -375,6 +376,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
             mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or partial(request, discovery=True, authenticated=False), methods=scope['methods'])) for origin in scope['origins']]
             signed = []
             engine_scope = dict(scope)
+            engine_scope['_authentication_requested'] = bool(scope.get('authentication') or (access or {}).get('requested'))
             if scope.get('authentication') and access and access.get('verified') is True:
                 from urllib.parse import urlsplit
                 parsed = urlsplit(access.get('protected_url', ''))
@@ -400,7 +402,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
             try:
                 result = engine.assess(engine_scope, [mirror.url for mirror in mirrors], role, stop=stop,
                                       progress=lambda: sum(len(m.progress_keys) for m in mirrors + signed))
-                result.update(access_mode='anonymous_and_authenticated' if signed else 'anonymous',
+                result.update(authentication_requested=engine_scope['_authentication_requested'], access_mode='anonymous_and_authenticated' if signed else 'anonymous',
                     authenticated_target_mapping=engine_scope.get('_authenticated_targets', {}),
                     anonymous_evidence_count=sum(len(m.refs) for m in mirrors),
                     authenticated_evidence_count=sum(len(m.refs) for m in signed))
@@ -463,7 +465,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
-        'anonymous_evidence_count', 'authenticated_evidence_count', 'inference_usage', 'outcome', 'findings', 'commands'
+        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested', 'inference_usage', 'outcome', 'findings', 'commands'
     ) if key in result}, ensure_ascii=True)
     (directory / 'artex-results.json').write_text(output)
     return record('artex-engine', VERSION, ['/opt/artex/artex', *scope['origins']], started,

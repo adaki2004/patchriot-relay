@@ -62,6 +62,13 @@ class EngineTests(unittest.TestCase):
             if use_private:
                 self.assertEqual(calls[1], (True, 'https://owned.example/private'))
 
+    def test_unverified_grey_access_is_not_described_as_a_missing_account(self):
+        scope = dict(SCOPE, _authentication_requested=True)
+        body = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')
+        self.assertIn('An account was declared', body['goal'])
+        self.assertIn('missing authenticated coverage', body['goal'])
+        self.assertNotIn('no supplied account', body['goal'])
+
     def test_planner_gets_numeric_budget_finish_reserve_and_neutral_identity(self):
         body = artex.task_body(SCOPE, ['http://127.0.0.1:1234'], 1800, 'investigator',
                                {'engine_http_remaining': 1457, 'engine_model_calls_remaining': 400})

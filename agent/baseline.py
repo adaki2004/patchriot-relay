@@ -108,11 +108,11 @@ def run(scope, deadline, fetch, record):
                 "The supplied account reached the protected URL; the anonymous control was denied." if confirmed else
                 "Could not prove authenticated access. Check the protected URL and test account; this is a coverage gap, not a vulnerability finding.", [anonymous, signed])
         else:
-            add(origin, "test-account", "Test-account access", "skipped", "No test account was supplied.")
+            add(origin, "test-account", "Test-account access", "skipped", "This public baseline stage runs anonymously. Account availability and verified access are reported separately for the assessment.")
         add(origin, "forms", "Form and state-changing tests", "inconclusive" if "POST" in scope["methods"] else "skipped",
             "POST is permitted. Inspect the agents' actual requests and findings; permission alone does not prove a form was tested." if "POST" in scope["methods"] else "This request permits read-only methods; no forms are submitted.")
         if scope.get("browser_login") is None:
-            add(origin, "browser", "Browser login, SSO and client-side execution", "unsupported", "This runner does not drive a browser or complete interactive login challenges.")
+            add(origin, "browser", "Browser login, SSO and client-side execution", "unsupported", "This baseline stage does not drive a browser. See the assessment’s separate browser access proof and signed-in checks.")
 
     complete = all(c["status"] != "inconclusive" for c in checks)
     return record("patchriot-baseline", VERSION, ["--profile", VERSION], started, observed, refs,
