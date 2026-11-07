@@ -249,6 +249,25 @@ class LiveOverviewTests(unittest.TestCase):
         self.assertEqual(plan[-1]['action'], 'reuse')
         self.assertEqual(plan[-1]['source_role'], 'reproducer')
 
+    def test_finished_engine_reuses_retained_work_with_individual_response_gaps(self):
+        import copy
+        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        report = {'role':'investigator', 'evidence':[
+            {'id':1, 'status':200, 'url':'https://owned.example/'},
+            {'id':2, 'status':200, 'url':'https://owned.example/large', 'error':'browser_json_too_wide'},
+            {'id':3, 'status':None, 'url':'https://owned.example/unavailable', 'error':'request_error'}],
+            'tool_runs':[{'tool':'artex-engine', 'exit_code':0, 'failure':None,
+                         'output_truncated':False, 'evidence_ids':[1, 2, 3]}]}
+        original = copy.deepcopy(report)
+        plan = live_review.discovery_plan('reproducer', scope, [report], 'investigate_validate_v1')
+        self.assertEqual(plan[-1]['action'], 'reuse')
+        self.assertEqual(report, original)
+        report['evidence'][0]['error'] = 'request_error'
+        self.assertEqual(live_review.discovery_plan('reproducer', scope, [report])[-1]['action'], 'recover')
+        report = copy.deepcopy(original)
+        report['evidence'].pop()
+        self.assertEqual(live_review.discovery_plan('reproducer', scope, [report])[-1]['action'], 'recover')
+
     def test_ares_discovery_from_older_runner_is_added_once_and_then_reused(self):
         scope = {'origins':['https://owned.example'], 'tools':[]}
         first = {'role':'investigator', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[

@@ -68,11 +68,16 @@ def discovery_plan(role, scope, previous, review_policy=None):
                 refs = [id for r in records for id in r.get('evidence_ids', [])]
                 covered = {urlsplit(evidence[id].get('url', '')).scheme + '://' + urlsplit(evidence[id].get('url', '')).netloc for id in refs if id in evidence}
                 origins_complete = tool not in ('patchriot-crawl', 'nuclei', 'ares-web-surface') or set(scope['origins']).issubset(covered)
-                public_refs = any(id in evidence and not evidence[id].get('authenticated') and not evidence[id].get('login') for id in refs)
+                public_refs = any(id in evidence and not evidence[id].get('authenticated')
+                                  and not evidence[id].get('login') and not evidence[id].get('error')
+                                  and type(evidence[id].get('status')) is int for id in refs)
+                # Finished engine passes can retain individual capture or
+                # transport gaps. Reuse preserves those records for review.
                 completed = public_refs and origins_complete and len(records) >= expected and bool(refs) and all(
                     r.get('exit_code') == 0 and not r.get('failure') and not r.get('output_truncated') and r.get('evidence_ids') for r in records) and all(
                     id in evidence and (not evidence[id].get('authenticated') or tool == 'artex-engine') and not evidence[id].get('login')
-                    and not evidence[id].get('error') and type(evidence[id].get('status')) is int for id in refs)
+                    and (tool == 'artex-engine' or not evidence[id].get('error')
+                         and type(evidence[id].get('status')) is int) for id in refs)
                 attempts.append((report.get('role'), completed))
                 if len(records) == 1:
                     reason = reusable_partial(records[0], report, scope)
