@@ -46,6 +46,20 @@ async fn await_model_reply<T>(
 pub fn is_chat_path(path: &str) -> bool {
     path == "/v1/chat/completions" || path == ENGINE_CHAT || path == SUMMARY_CHAT
 }
+
+/// HTTP status is safe to retain; provider error bodies can quote private input.
+/// Payment refusal is distinct from the review's own inference budget and must
+/// not trigger automatic retries or a change to another paid provider.
+fn provider_http_error(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "provider_authentication_failed",
+        402 => "provider_payment_required",
+        413 => "provider_context_limit",
+        429 => "provider_rate_limited",
+        500..=599 => "provider_unavailable",
+        _ => "provider_rejected_request",
+    }
+}
 /// A rejected discovery request must stop that engine, not discard the later
 /// reviewer's chance to report the saved evidence. Local input errors send no
 /// model request; transient provider failures keep their attempt and cost
@@ -681,7 +695,9 @@ impl LiveBroker {
             .await
             .map_err(|_| "provider_unavailable")?;
         if !response.status().is_success() {
-            return Err("provider_rejected_request");
+            let status = response.status().as_u16();
+            eprintln!("Provider completion rejected: http_status={status}");
+            return Err(provider_http_error(status));
         }
         let content_type = if body["stream"] == true {
             "text/event-stream"

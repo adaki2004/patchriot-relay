@@ -176,7 +176,7 @@ For a Linux host that should stay online, install the [systemd template](deploy/
 
 ### Inspect and maintain a relay
 
-Run these as the Unix user that owns the device state. `doctor` is read-only apart from lock files; it checks identity-file permissions, the gateway's HTTPS health, connection state and the configured image/provider files. It sends no customer data or model request. A passing health check does not prove remote approval.
+Run these as the Unix user that owns the device state. `doctor` is read-only apart from lock files; it checks identity-file permissions, the gateway's HTTPS health, connection state and the configured image/provider files. It sends no customer data or model request. A passing health check does not prove remote approval. It also does not prove inference credit is available. A live provider HTTP 402 is reported as `provider_payment_required`. After its saved result is acknowledged (or a fenced result is preserved), that worker pauses durably before taking more queued work. Restore the provider balance or key allowance, then explicitly `resume`; restarting the service does not clear this pause.
 
 | Command | Effect |
 | --- | --- |

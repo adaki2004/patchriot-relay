@@ -583,9 +583,24 @@ fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<S
 fn clear_assignment(directory: &Path) -> Result<(), Error> {
     let _lock = state_lock(directory)?;
     let mut config = read_config(directory)?;
+    let funding_blocked = config.pending_result.as_ref().is_some_and(|saved| {
+        matches!(&saved.result, WorkResult::Pentest(result)
+            if result.execution.state == patchriot_protocol::website_reviews::WebsiteRunState::Failed
+                && result.execution.failure_reason.as_deref() == Some("provider_payment_required"))
+    });
+    // Only after delivery acknowledgement (or preserving a fenced outbox) can
+    // we pause: doing it earlier would stop the result's own lease renewals.
+    // Keep the pause durable so restart cannot consume the rest of the queue.
+    if funding_blocked {
+        config.paused = true;
+    }
     config.active_assignment = None;
     config.pending_result = None;
-    write_config(directory, &config)
+    write_config(directory, &config)?;
+    if funding_blocked {
+        eprintln!("worker paused: provider_payment_required; restore funding before resume");
+    }
+    Ok(())
 }
 
 fn send_result(directory: &Path, client: &reqwest::blocking::Client) -> Result<(), Error> {
@@ -1936,6 +1951,109 @@ mod tests {
         config.introduction.label = "x".repeat(MAX_STATE as usize);
         assert!(write_config(directory.path(), &config).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn payment_refusal_pauses_only_after_saved_delivery_and_does_not_poll() {
+        use std::net::TcpListener;
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("relay");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        initialize(
+            &state,
+            &HashMap::from([
+                ("--dispatcher", url.as_str()),
+                ("--audience", "test"),
+                ("--label", "Owned fixture"),
+                ("--compute-group", "owned"),
+            ]),
+        )
+        .unwrap();
+        let mut config = read_config(&state).unwrap();
+        config.device_id = Some(Uuid::new_v4());
+        let result = serde_json::from_value(serde_json::json!({
+            "kind":"pentest_agent_v1","scope_sha256":"a".repeat(64),
+            "execution":{"state":"failed","provider":"venice.ai","model":"fixture",
+                "image_digest":"fixture","duration_ms":10,"inference_calls":1,"http_requests":1,
+                "cost_upper_microusd":1,"cleanup_confirmed":true,"failure_reason":"provider_payment_required"},
+            "assessment":null,"evidence":[],"raw_summary":"saved partial work"
+        })).unwrap();
+        config.pending_result = Some(CompleteWork {
+            lease_id: Uuid::new_v4(),
+            result: WorkResult::Pentest(result),
+        });
+        write_config(&state, &config).unwrap();
+        let before = serde_json::to_value(&config.pending_result).unwrap();
+        let server = std::thread::spawn(move || {
+            for status in [503, 200] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 8192];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0 && bytes.len() < 16384);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        assert!(
+                            headers
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .contains("/work/complete-gzip ")
+                        );
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = if status == 503 {
+                    "{}"
+                } else {
+                    r#"{"accepted":true,"fixture_matches":false,"evidence_complete":false,"replayed":true}"#
+                };
+                write!(stream,"HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert!(send_result(&state, &client).is_err());
+        let saved = read_config(&state).unwrap();
+        assert!(!saved.paused, "Delivery still needs normal lease renewal");
+        assert_eq!(serde_json::to_value(saved.pending_result).unwrap(), before);
+        // A later work tick delivers the exact outbox, then stops before polling
+        // another assignment. A third request would fail against this server.
+        work_tick(
+            &state,
+            &client,
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        server.join().unwrap();
+        let resumed = read_config(&state).unwrap();
+        assert!(resumed.paused);
+        assert!(resumed.pending_result.is_none());
+        assert!(resumed.active_assignment.is_none());
+        assert_eq!(resumed.device_id, config.device_id);
     }
 
     #[test]
