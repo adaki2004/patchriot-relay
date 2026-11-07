@@ -519,9 +519,7 @@ impl LiveBroker {
             anonymous_id: anonymous.evidence.id,
             check: BrowserAccessCheck::ProtectedResource,
         };
-        if !matches!(anonymous.evidence.status, Some(401 | 403))
-            && let Some(pointer) = input.json_pointer
-        {
+        if let Some(pointer) = input.json_pointer {
             let principal = if self.scope.authentication == Some(TestAuthKind::Wallet) {
                 self.browser
                     .lock()
@@ -966,9 +964,14 @@ mod tests {
                         "",
                         json!({"items":vec!["public-item"; 300]}).to_string(),
                     )
-                } else if head.starts_with("GET /identity ") {
+                } else if ["GET /identity ", "GET /identity-401 ", "GET /identity-403 "]
+                    .iter()
+                    .any(|path| head.starts_with(path))
+                {
                     (
-                        200,
+                        if !logged_in && head.starts_with("GET /identity-401 ") { 401 }
+                        else if !logged_in && head.starts_with("GET /identity-403 ") { 403 }
+                        else { 200 },
                         "",
                         if logged_in {
                             json!({"account":{"email":if reference_account {"reference@example.com"} else {"fixture@example.com"}}})
@@ -1263,14 +1266,33 @@ mod tests {
             broker.http(change.clone()).await.unwrap_err(),
             "account_credential_changes_not_permitted"
         );
-        for (actor, token) in [
-            (&broker, "synthetic-browser-token"),
-            (reference, "synthetic-reference-token"),
-        ] {
-            let proof=actor.browser_call("/patchriot/browser/check",json!({"url":"https://owned.example/identity", "headers":{"authorization":format!("Bearer {token}")}, "json_pointer":"/account/email"})).await.unwrap();
-            assert_eq!(proof["verified"], true);
+        for path in ["identity", "identity-401", "identity-403"] {
+            for (actor, token) in [
+                (&broker, "synthetic-browser-token"),
+                (reference, "synthetic-reference-token"),
+            ] {
+                let url = format!("https://owned.example/{path}");
+                let headers = json!({"authorization":format!("Bearer {token}")});
+                let invalid = actor
+                    .browser_call(
+                        "/patchriot/browser/check",
+                        json!({"url":url,"headers":headers,"json_pointer":"/account/missing"}),
+                    )
+                    .await;
+                assert_eq!(invalid.unwrap_err(), "authenticated_identity_missing");
+                assert!(!broker.password_change_permitted());
+                let proof = actor
+                    .browser_call(
+                        "/patchriot/browser/check",
+                        json!({"url":url,"headers":headers,"json_pointer":"/account/email"}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(proof["verified"], true);
+                assert_eq!(proof["proof"]["check"]["kind"], "account_identity");
+            }
+            assert!(broker.password_change_permitted(), "{path}");
         }
-        assert!(broker.password_change_permitted());
         let saved_reference_proof = reference.browser.lock().unwrap().proof.clone();
         reference.browser.lock().unwrap().proof = broker.browser.lock().unwrap().proof.clone();
         assert!(
