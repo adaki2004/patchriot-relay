@@ -115,6 +115,15 @@ finally:
 
 
 class LiveOverviewTests(unittest.TestCase):
+    def test_reports_require_real_credential_controls_and_target_error_evidence(self):
+        for role in ('investigator', 'reproducer'):
+            with self.subTest(role=role):
+                prompt = live_review.prompt(role, browser=True, access_prepared=True, paired=True)
+                self.assertIn('does not test the supplied password', prompt)
+                self.assertIn('private browser-fill login or a relay-managed credential operation', prompt)
+                self.assertIn('including a synthetic 502', prompt)
+                self.assertIn('Verify limitation citations', prompt)
+
     def test_validation_only_never_restarts_missing_discovery_and_preserves_claim_evidence(self):
         scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
         previous = [{'role':'investigator', 'assessment':{'summary':'Owned fixture', 'findings':[
