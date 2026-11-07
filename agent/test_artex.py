@@ -236,6 +236,34 @@ class EngineTests(unittest.TestCase):
                 summary = json.loads(artex.receipt_summary(result, json.dumps(result)))
                 self.assertEqual(summary['collection_errors'], [failed])
 
+    def test_engine_usage_comes_from_broker_counter_differences(self):
+        class FakeEngine:
+            def __init__(self, *_args): pass
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def assess(self, *_args, **_kwargs):
+                return {'engine': 'ARTEX', 'commit': artex.VERSION,
+                        'coverage_complete': True, 'stop_reason': 'done'}
+        before = {'http_remaining': 9000, 'model_calls_remaining': 2100,
+                  'remaining_cost_allowance_microusd': 29000000}
+        after = {'http_remaining': 8700, 'model_calls_remaining': 2010,
+                 'remaining_cost_allowance_microusd': 27900000}
+        for final in [after, {}, {**after, 'model_calls_remaining': 2200}]:
+            with self.subTest(final=final), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(artex, 'Engine', FakeEngine), \
+                    patch('report_finish.bridge', side_effect=[before.copy(), final.copy()]):
+                receipt = artex.run(SCOPE, 'investigator', time.monotonic()+600, Path(temp))
+                summary = json.loads(receipt['output_excerpt'])
+                saved = json.loads((Path(temp)/'artex-results.json').read_text())
+                if final == after:
+                    expected = {'http_requests': 300, 'inference_calls': 90,
+                                'cost_upper_microusd': 1100000}
+                    self.assertEqual(summary['usage'], expected)
+                    self.assertEqual(saved['usage'], expected)
+                else:
+                    self.assertNotIn('usage', summary)
+                    self.assertNotIn('usage', saved)
+
     def test_engine_http_uses_the_discovery_route_and_other_probes_keep_their_route(self):
         import live_http
         seen = []

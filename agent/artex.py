@@ -45,6 +45,7 @@ def receipt_summary(result, full_output):
     summary = {key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
         'collection_errors',
+        'usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping'
     ) if key in result}
@@ -381,6 +382,20 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
                     failure = 'incomplete'
             finally:
                 refs = [identifier for mirror in mirrors for identifier in mirror.refs]
+                final_allowance = refresh_budget()
+                meters = {
+                    'http_requests': 'http_remaining',
+                    'inference_calls': 'model_calls_remaining',
+                    'cost_upper_microusd': 'remaining_cost_allowance_microusd',
+                }
+                if all(type(engine.allowance.get(key)) is int
+                       and type(final_allowance.get(key)) is int
+                       and 0 <= final_allowance[key] <= engine.allowance[key]
+                       for key in meters.values()):
+                    result['usage'] = {
+                        name: engine.allowance[key] - final_allowance[key]
+                        for name, key in meters.items()
+                    }
     except FileNotFoundError:
         failure = 'unavailable'
     except (TimeoutError, subprocess.TimeoutExpired):
@@ -404,6 +419,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
     output = json.dumps({key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
         'collection_errors',
+        'usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'outcome', 'findings', 'commands'
     ) if key in result}, ensure_ascii=True)
