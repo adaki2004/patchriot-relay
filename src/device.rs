@@ -303,11 +303,12 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
     maximum: u64,
 ) -> Result<R, Error> {
     let completion = path.ends_with("/work/complete");
+    let evidence = path.ends_with("/work/pentest-evidence");
     // Negotiate via a distinct endpoint: old servers return 404 before seeing
     // any result. Only that response enables the original signed JSON transport.
     // A lost response is retried from the durable outbox with the same payload.
     let compressed_path = format!("{path}-gzip");
-    let mut compressed = completion;
+    let mut compressed = completion || evidence;
     let response = loop {
         let request_path = if compressed { &compressed_path } else { path };
         let signed_at = SystemTime::now()
@@ -316,7 +317,7 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
             .try_into()?;
         let request = sign(key, &config.audience, request_path, signed_at, &payload)?;
         let url = validate_url(&config.dispatcher)?.join(request_path)?;
-        let outgoing = if compressed {
+        let outgoing = if compressed && completion {
             use std::io::Write;
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -331,7 +332,7 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         };
         // Reports can reach 32 MiB. Allow slow links without extending heartbeat
         // deadlines or the server's 120-second signature freshness window.
-        let outgoing = if completion {
+        let outgoing = if completion || evidence {
             outgoing.timeout(Duration::from_secs(90))
         } else {
             outgoing
@@ -370,12 +371,29 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         .find(|code| value.as_ref().and_then(|v| v["error"].as_str()) == Some(*code));
         return Err(Box::new(RemoteError { status, code }));
     }
-    // Treat even a configured server's output as bounded input; redirects are disabled.
+    let gzip = match response.headers().get(reqwest::header::CONTENT_ENCODING) {
+        None => false,
+        Some(value) if value == "gzip" && evidence => true,
+        _ => return Err("dispatcher returned unsupported response encoding".into()),
+    };
+    // Bound both wire bytes and expanded JSON. A highly compressible response
+    // cannot bypass the normal evidence limit. Redirects remain disabled.
     let mut bytes = Vec::new();
     response
-        .take(maximum + 1)
+        .take(maximum + if gzip { 8193 } else { 1 })
         .read_to_end(&mut bytes)
         .map_err(|_| DispatcherConnectionError("response read failed"))?;
+    if gzip {
+        if bytes.len() as u64 > maximum + 8192 {
+            return Err("dispatcher response exceeded limit".into());
+        }
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .take(maximum + 1)
+            .read_to_end(&mut decoded)
+            .map_err(|_| "dispatcher returned invalid compressed evidence")?;
+        bytes = decoded;
+    }
     if bytes.len() as u64 > maximum {
         return Err("dispatcher response exceeded limit".into());
     }
@@ -1678,6 +1696,138 @@ mod tests {
         assert!(observed.load(Ordering::Relaxed) >= 2);
         assert!(read_config(&state).unwrap().pending_result.is_none());
         assert!(read_config(&state).unwrap().active_assignment.is_none());
+    }
+
+    #[test]
+    fn evidence_download_negotiates_signed_routes_and_bounds_gzip() {
+        use std::net::TcpListener;
+        fn gzip(bytes: &[u8]) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        }
+        for (fallback, encoding, body, expected_error) in [
+            (false, "gzip", gzip(br#"{"evidence":"saved"}"#), None),
+            (true, "", br#"{"evidence":"saved"}"#.to_vec(), None),
+            (
+                false,
+                "gzip",
+                gzip(&vec![b' '; 1025]),
+                Some("dispatcher response exceeded limit"),
+            ),
+            (
+                false,
+                "gzip",
+                vec![0; 1024 + 8193],
+                Some("dispatcher response exceeded limit"),
+            ),
+            (
+                false,
+                "gzip",
+                b"invalid compressed body".to_vec(),
+                Some("dispatcher returned invalid compressed evidence"),
+            ),
+            (
+                false,
+                "br",
+                vec![],
+                Some("dispatcher returned unsupported response encoding"),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = directory.path().join("relay");
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            initialize(
+                &state,
+                &HashMap::from([
+                    ("--dispatcher", url.as_str()),
+                    ("--audience", "test"),
+                    ("--label", "Owned fixture"),
+                    ("--compute-group", "owned"),
+                ]),
+            )
+            .unwrap();
+            let config = read_config(&state).unwrap();
+            let key = read_key(&state).unwrap();
+            let server = std::thread::spawn(move || {
+                for attempt in 0..if fallback { 2 } else { 1 } {
+                    let path = if attempt == 0 {
+                        "/work/pentest-evidence-gzip"
+                    } else {
+                        "/work/pentest-evidence"
+                    };
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let (end, length) = loop {
+                        let mut buffer = [0; 8192];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert!(n > 0 && bytes.len() < 16384);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                            assert!(headers.starts_with(&format!("POST {path} ")));
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap();
+                            if bytes.len() >= end + 4 + length {
+                                break (end + 4, length);
+                            }
+                        }
+                    };
+                    let signed: SignedRequest<serde_json::Value> =
+                        serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                    patchriot_protocol::verify(&signed, "test", path, signed.signed_at).unwrap();
+                    assert_eq!(signed.payload, serde_json::json!({"lease":"same"}));
+                    let old_endpoint = fallback && attempt == 0;
+                    let status = if old_endpoint { 404 } else { 200 };
+                    let data = if old_endpoint {
+                        b"{}".as_slice()
+                    } else {
+                        body.as_slice()
+                    };
+                    let header = if encoding.is_empty() || old_endpoint {
+                        String::new()
+                    } else {
+                        format!("Content-Encoding: {encoding}\r\n")
+                    };
+                    // A caller may reject unsupported headers before reading the body.
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{header}\r\n",
+                        data.len()
+                    );
+                    let _ = stream.write_all(data);
+                }
+            });
+            let client = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap();
+            let result = post_with_limit::<_, serde_json::Value>(
+                &client,
+                &config,
+                &key,
+                "/work/pentest-evidence",
+                serde_json::json!({"lease":"same"}),
+                1024,
+            );
+            if let Some(expected) = expected_error {
+                assert_eq!(result.unwrap_err().to_string(), expected);
+            } else {
+                assert_eq!(result.unwrap(), serde_json::json!({"evidence":"saved"}));
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]
