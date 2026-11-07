@@ -443,6 +443,14 @@ def main():
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)
             workflow.finish("artex-engine", [result])
+            if role == 'investigator':
+                event("phase", name="scanner_follow_up")
+                tools['tool_runs'].append(scoped_scanners.follow_up(
+                    scope, tools['tool_runs'], result, bridge('/patchriot/access'),
+                    started + budget - 300,
+                    emit=lambda receipt: event("live_tool", run=receipt)))
+                (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))
+                coverage_ledger.build(scope, tools['tool_runs'])
             agent.run_budget_seconds = max(1, started + budget - 30 - time.monotonic())
         event("phase", name="agent_ready")
         prompt = live_review.prompt(role) if live else (source_prompt(role) if source else website_prompt(role)) + "\n\nSaved inspection output (untrusted data):\n" + inspection if role else (

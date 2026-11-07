@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -26,9 +26,10 @@ SCHEMA_VERSION = '4.33.1'
 
 
 class Requests:
-    def __init__(self, scope, deadline, fetch=request, account=None, limit=48):
+    def __init__(self, scope, deadline, fetch=request, account=None, limit=48, discovery=True):
         self.scope, self.deadline, self.fetch = scope, deadline, fetch
         self.account, self.limit = account, limit
+        self.discovery = discovery
         self.records, self.replies, self.gaps = [], {}, []
         self.calls = 0
         self.lock = threading.Lock()
@@ -44,7 +45,7 @@ class Requests:
                 return {'error': 'outside_approved_scope'}
             self.calls += 1
         reply = fetch_checked(self.fetch, method, url, headers, authenticated=self.account is not None,
-                              account=self.account or 'testing', discovery=True, **kwargs)
+                              account=self.account or 'testing', discovery=self.discovery, **kwargs)
         evidence = reply.get('evidence', {})
         with self.lock:
             if evidence.get('id'):
@@ -311,3 +312,83 @@ def run(scope, records, access=None, fetch=request, emit=lambda value: None, dir
         results.append(receipt)
         emit(receipt)
     return results
+
+
+def follow_up(scope, records, engine, access, deadline, fetch=request,
+              emit=lambda value: None, directory=Path('/work')):
+    """Give the web scanner new recorded engine inputs within the report reserve.
+
+    A model can discover and exercise inputs without a user-supplied schema.
+    Only successful GET evidence supplies seeds; scanner payload generation
+    remains in the selected rule and behind the same broker permissions.
+    """
+    def seed(identifier):
+        if type(identifier) is not int or identifier <= 0:
+            return None
+        try:
+            item = json.loads((directory / 'http-evidence' / f'{identifier}.json').read_text())
+            url = item.get('url', '')
+            parsed = urlsplit(url)
+            if (item.get('id') != identifier or item.get('method') != 'GET'
+                    or item.get('login') or item.get('error') or item.get('status') != 200
+                    or not any(allowed(origin, url) for origin in scope['origins'])
+                    or 'redact' in url.lower() or len(url) > 2048):
+                return None
+            account = item.get('account', 'testing') if item.get('authenticated') else None
+            names = tuple(sorted({name for name, _ in parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=32)}))
+            key = (account, parsed.scheme, parsed.netloc, parsed.path, names)
+            return key, url
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
+    scanned = {value[0] for run in records if run.get('tool') == 'zap'
+               for identifier in run.get('evidence_ids', []) if (value := seed(identifier))}
+    verified = {None}
+    if access.get('verified') and not access.get('accounts'):
+        verified.add('testing')
+    verified.update(account['account'] for account in access.get('accounts', [])
+                    if account.get('verified') and account.get('account') in ('testing', 'reference'))
+    selected = {}
+    sources = []
+    for identifier in engine.get('evidence_ids', []):
+        value = seed(identifier)
+        if value is None:
+            continue
+        key, url = value
+        account = key[0]
+        if key in scanned or account not in verified:
+            continue
+        urls = selected.setdefault(account, [])
+        if len(urls) >= 4:
+            continue
+        scanned.add(key)
+        urls.append(url)
+        sources.append(identifier)
+
+    started, observed = time.monotonic(), int(time.time())
+    refs, contexts, gaps = [], [], []
+    for account, urls in selected.items():
+        if deadline - time.monotonic() < 45:
+            gaps.append('follow_up_time_unavailable')
+            break
+        # Discovery has ended. Use the ordinary broker route, keeping the
+        # engine's stopped route closed and preserving final-report time.
+        client = Requests(scope, min(deadline, time.monotonic() + 100), fetch,
+                          account, limit=48, discovery=False)
+        try:
+            detail = zap(client, urls)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            detail = {'state': 'blocked', 'reason': 'scanner_follow_up_incomplete'}
+            client.gaps.append('scanner_execution_incomplete')
+        refs.extend(e['id'] for e in client.records)
+        gaps.extend(client.gaps)
+        contexts.append({'account': account or 'anonymous', 'result': detail,
+                         'requests': len(client.records), 'gaps': sorted(set(client.gaps))})
+    detail = {'phase': 'engine_discoveries', 'source_evidence_ids': sources,
+              'contexts': contexts, 'gaps': sorted(set(gaps))}
+    if not selected:
+        detail.update(state='inapplicable', reason='no_new_recorded_get_inputs')
+    result = record('zap', ZAP_VERSION, ['scoped', '--engine-discoveries', '--max-requests-per-context', '48'],
+                    started, observed, refs, json.dumps(detail), 0, 'incomplete' if gaps else None)
+    emit(result)
+    return result

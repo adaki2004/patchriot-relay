@@ -77,6 +77,75 @@ class ScopedScannerTests(unittest.TestCase):
             self.assertEqual(sum(u['state'] == 'deferred' for u in data['units']), 4)
             self.assertFalse(run['output_truncated'])
 
+    def test_engine_handoff_preserves_context_and_skips_already_scanned_inputs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            evidence_dir = directory / 'http-evidence'
+            evidence_dir.mkdir()
+            rows = [
+                ('https://owned.example/search?q=first', None),
+                ('https://owned.example/search?q=another', None),
+                ('https://owned.example/search?q=private', 'reference'),
+                ('https://owned.example/new?term=generated', None),
+                ('https://owned.example/new?term=duplicate', None),
+                ('https://owned.example/blocked', 'testing'),
+            ]
+            for identifier, (url, account) in enumerate(rows, 1):
+                evidence_dir.joinpath(f'{identifier}.json').write_text(json.dumps({
+                    'id': identifier, 'url': url, 'method': 'GET', 'status': 200,
+                    'authenticated': account is not None, 'account': account}))
+            visits = []
+            def scanner(client, urls):
+                visits.append((client.account, urls))
+                for url in urls:
+                    client('GET', url)
+                return {'alerts': []}
+            with patch.object(scanners, 'zap', scanner):
+                result = scanners.follow_up(self.scope, [{'tool': 'zap', 'evidence_ids': [1]}],
+                    {'evidence_ids': [2, 3, 4, 5, 6]},
+                    {'accounts': [{'account': 'reference', 'verified': True}]},
+                    time.monotonic() + 120, self.fetch, directory=directory)
+            self.assertEqual(visits, [('reference', [rows[2][0]]), (None, [rows[3][0]])])
+            self.assertEqual(json.loads(result['output_excerpt'])['source_evidence_ids'], [3, 4])
+            self.assertEqual(len(result['evidence_ids']), 2)
+            self.assertTrue(all(call[3]['discovery'] is False for call in self.calls))
+
+    def test_engine_handoff_rejects_unavailable_or_unsafe_seeds_and_caps_work(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            evidence_dir = directory / 'http-evidence'
+            evidence_dir.mkdir()
+            base = {'method': 'GET', 'status': 200, 'url': 'https://owned.example/path'}
+            invalid = [{'url': 'https://other.example/path'}, {'method': 'POST'},
+                       {'status': 403}, {'error': 'unavailable'}, {'login': True},
+                       {'url': 'https://owned.example/path?token=[REDACTED]'}, {'id': 999}]
+            rows = invalid + [{'url': f'https://owned.example/new{number}?q=sample'} for number in range(8)]
+            for identifier, changes in enumerate(rows, 1):
+                evidence_dir.joinpath(f'{identifier}.json').write_text(json.dumps({**base, 'id': identifier, **changes}))
+            with patch.object(scanners, 'zap', return_value={}) as scanner:
+                result = scanners.follow_up(self.scope, [], {'evidence_ids': ['../outside', 0, *range(1, len(rows) + 1)]},
+                    {}, time.monotonic() + 120, self.fetch, directory=directory)
+            self.assertEqual(scanner.call_count, 1)
+            self.assertEqual(len(scanner.call_args.args[1]), 4)
+            self.assertEqual(json.loads(result['output_excerpt'])['source_evidence_ids'], [8, 9, 10, 11])
+
+    def test_engine_handoff_retains_time_gap_and_inapplicable_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            evidence_dir = directory / 'http-evidence'
+            evidence_dir.mkdir()
+            evidence_dir.joinpath('1.json').write_text(json.dumps({
+                'id': 1, 'method': 'GET', 'status': 200, 'url': 'https://owned.example/new'}))
+            with patch.object(scanners, 'zap') as scanner:
+                result = scanners.follow_up(self.scope, [], {'evidence_ids': [1]}, {},
+                    time.monotonic() + 10, self.fetch, directory=directory)
+                absent = scanners.follow_up(self.scope, [], {'evidence_ids': [2]}, {},
+                    time.monotonic() + 120, self.fetch, directory=directory)
+            scanner.assert_not_called()
+            self.assertEqual(result['failure'], 'incomplete')
+            self.assertEqual(json.loads(result['output_excerpt'])['gaps'], ['follow_up_time_unavailable'])
+            self.assertEqual(json.loads(absent['output_excerpt'])['reason'], 'no_new_recorded_get_inputs')
+
     @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
     def test_real_suite_uses_all_verified_contexts_and_one_public_discovery(self):
         scope = {**self.scope, 'authentication': 'session', 'account_policy': {'allow_password_changes': False}}
@@ -133,8 +202,17 @@ class ScopedScannerTests(unittest.TestCase):
                 value = parse_qs(urlsplit(url).query).get('q', [''])[0]
                 reply['body'] = '<html><body>' + (value if vulnerable else escape(value)) + '</body></html>'
                 return reply
-            client = scanners.Requests(scope, time.monotonic() + 90, fetch, limit=64)
-            result = scanners.zap(client, ['https://owned.example/search?q=fixture'])
+            with tempfile.TemporaryDirectory() as folder:
+                directory = Path(folder)
+                evidence_dir = directory / 'http-evidence'
+                evidence_dir.mkdir()
+                evidence_dir.joinpath('1000.json').write_text(json.dumps({
+                    'id': 1000, 'method': 'GET', 'status': 200,
+                    'url': 'https://owned.example/search?q=generated'}))
+                receipt = scanners.follow_up(scope, [], {'evidence_ids': [1000]}, {},
+                    time.monotonic() + 90, fetch, directory=directory)
+            self.assertIsNone(receipt['failure'], receipt['output_excerpt'])
+            result = json.loads(receipt['output_excerpt'])['contexts'][0]['result']
             reflected = [alert for alert in result['alerts'] if alert['rule'] == '40012']
             self.assertEqual(bool(reflected), vulnerable)
             self.assertTrue(all(alert['evidence_ids'] for alert in reflected))
