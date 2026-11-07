@@ -231,13 +231,22 @@ class ScopeMirror:
                     payload = reply.get("body", "").encode() if status else b"relay request unavailable"
                     self.send_response(status or 502)
                     for name, value in evidence.get("headers", {}).items():
-                        if name.lower() not in ("connection", "content-length", "transfer-encoding", "content-encoding") and "\r" not in value and "\n" not in value:
+                        if not name.lower().startswith("x-patchriot-") and name.lower() not in ("connection", "content-length", "transfer-encoding", "content-encoding") and "\r" not in value and "\n" not in value:
                             if name.lower() == "location":
                                 destination = urljoin(origin + self.path, value)
                                 if allowed(origin, destination):
                                     parsed = urlsplit(destination)
                                     value = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
                             self.send_header(name, value)
+                    # These are local transport facts, not target headers.
+                    # A body cap must not look like the target served a short
+                    # but complete file, or a denied probe like a target 502.
+                    self.send_header("X-Patchriot-Body-Truncated", "true" if reply.get("body_truncated") else "false")
+                    error = reply.get("error") or evidence.get("error")
+                    if isinstance(error, str) and re.fullmatch(r"[a-z0-9_]{1,80}", error):
+                        self.send_header("X-Patchriot-Relay-Error", error)
+                    if type(evidence.get("id")) is int and evidence['id'] > 0:
+                        self.send_header("X-Patchriot-Evidence-Id", str(evidence['id']))
                     self.send_header("Content-Length", str(len(payload)))
                     self.send_header("Connection", "close")
                     self.end_headers()

@@ -17,6 +17,34 @@ import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_mirror_distinguishes_partial_bodies_and_broker_denials_from_target_responses(self):
+        def fixture(method, url, headers, **kwargs):
+            if url.endswith('/blocked'):
+                return {'error':'account_credential_changes_not_permitted'}
+            return {'body':'partial script', 'body_truncated':True,
+                    'evidence':{'id':7,'status':200,'truncated':True,'headers':{
+                        'content-type':'application/javascript',
+                        'x-patchriot-body-truncated':'false',
+                        'x-patchriot-relay-error':'spoofed_target_header'}}}
+        with tools.ScopeMirror('https://owned.example', time.monotonic()+5, fixture) as mirror:
+            client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+            client.request('GET', '/app.js')
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b'partial script')
+            self.assertEqual(response.getheaders().count(('X-Patchriot-Body-Truncated','true')), 1)
+            self.assertEqual(response.getheader('X-Patchriot-Body-Truncated'), 'true')
+            self.assertEqual(response.getheader('X-Patchriot-Evidence-Id'), '7')
+            self.assertIsNone(response.getheader('X-Patchriot-Relay-Error'))
+            client.close()
+            client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+            client.request('GET', '/blocked')
+            response = client.getresponse(); response.read(); client.close()
+            self.assertEqual(response.status, 502)
+            self.assertEqual(response.getheader('X-Patchriot-Relay-Error'), 'account_credential_changes_not_permitted')
+            self.assertIsNone(response.getheader('X-Patchriot-Evidence-Id'))
+            self.assertEqual(mirror.refs, [7])
+
     def test_new_evidence_ids_and_repeated_replies_do_not_fake_target_progress(self):
         calls = []
         def fixture(method, url, headers, **kwargs):
