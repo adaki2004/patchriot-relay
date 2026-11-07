@@ -191,8 +191,7 @@ pub(super) async fn complete(
                                 VerifiedCompletionAttestation::Model(_)
                             ) =>
                     {
-                        super::routing::check_repetition(&completion)?;
-                        return Ok(completion);
+                        return Ok(());
                     }
                     Ok(_) => return Err("near_model_signature_required"),
                     Err(e) if e.retryable() && attempt < 2 => {
@@ -209,7 +208,9 @@ pub(super) async fn complete(
             }
             Err("near_signature_unavailable")
         })
-        .await
+        .await?;
+        super::routing::check_repetition(&completion)?;
+        Ok(completion)
     };
     let result = super::await_model_reply(
         operation,

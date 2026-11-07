@@ -274,6 +274,40 @@ impl LiveBroker {
         Ok(())
     }
 
+    async fn complete_route<F, R>(
+        &self,
+        route: Route,
+        mut body: Value,
+        engine: bool,
+        reason: Option<&'static str>,
+        send: &mut F,
+    ) -> Result<Value, &'static str>
+    where
+        F: FnMut(Route, Value) -> R,
+        R: Future<Output = Result<Value, &'static str>>,
+    {
+        let mut reserved = self.reserve_route(route, &body, engine, reason.is_none(), reason)?;
+        let mut completion = send(route, body.clone()).await;
+        if completion.as_ref().err() == Some(&"provider_repetition") {
+            // No output or tool call from the rejected generation reached the
+            // agent. One fresh generation consumes another call slot and keeps
+            // the failed attempt's reservation. All ordinary limits still apply.
+            body["messages"].as_array_mut().ok_or("invalid_model_request")?.insert(0, json!({
+                "role":"system", "content":"The previous generation was rejected for a repeated-output loop. Continue from the existing observations. Produce one concise next action or the requested final answer. Avoid repeating plans or earlier output. All original scope and permission restrictions still apply."
+            }));
+            body["reasoning_effort"] = json!("low");
+            reserved = self.reserve_route(route, &body, engine, true, None)?;
+            eprintln!(
+                "model repetition recovery: provider={} fresh_attempt=1",
+                route.provider().name()
+            );
+            completion = send(route, body).await;
+        }
+        let completion = completion?;
+        self.finish_route(route, reserved, &completion)?;
+        Ok(completion)
+    }
+
     async fn route_completion<F, R>(
         &self,
         body: Value,
@@ -298,18 +332,16 @@ impl LiveBroker {
         if already_fell_back {
             let secondary = secondary.ok_or("fallback_not_configured")?;
             let body = route_body(secondary, body);
-            let reserved = self.reserve_route(secondary, &body, engine, true, None)?;
-            let completion = send(secondary, body).await?;
-            self.finish_route(secondary, reserved, &completion)?;
-            return Ok(completion);
+            return self
+                .complete_route(secondary, body, engine, None, &mut send)
+                .await;
         }
         let primary_body = route_body(primary, body.clone());
-        let reserved = self.reserve_route(primary, &primary_body, engine, true, None)?;
-        match send(primary, primary_body).await {
-            Ok(completion) => {
-                self.finish_route(primary, reserved, &completion)?;
-                Ok(completion)
-            }
+        match self
+            .complete_route(primary, primary_body, engine, None, &mut send)
+            .await
+        {
+            Ok(completion) => Ok(completion),
             Err(reason)
                 if fallback_available_for(reason)
                     && self.fallback_key.is_some()
@@ -319,15 +351,13 @@ impl LiveBroker {
                 // charge, reserve the backup separately and stay there for this role.
                 let secondary = secondary.ok_or("fallback_not_configured")?;
                 let body = route_body(secondary, body);
-                let reserved = self.reserve_route(secondary, &body, engine, false, Some(reason))?;
                 eprintln!(
                     "model recovery: {} -> {} reason={reason}",
                     primary.provider().name(),
                     secondary.provider().name()
                 );
-                let completion = send(secondary, body).await?;
-                self.finish_route(secondary, reserved, &completion)?;
-                Ok(completion)
+                self.complete_route(secondary, body, engine, Some(reason), &mut send)
+                    .await
             }
             Err(reason) => Err(reason),
         }
@@ -638,13 +668,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completion, reply());
-        assert_eq!(routes, vec![Route::Near, Route::Venice]);
+        assert_eq!(routes, vec![Route::Near, Route::Near, Route::Venice]);
         let count = broker.counters.lock().unwrap();
-        assert_eq!(count.calls, 1);
+        assert_eq!(count.calls, 2);
         let receipt = count.fallback.as_ref().unwrap();
         assert_eq!(receipt.reason, "provider_repetition");
-        assert!(receipt.valid(1));
+        assert!(receipt.valid(2));
     }
+    #[tokio::test]
+    async fn repetition_has_one_fresh_attempt_per_route_and_preserves_report_capacity() {
+        let broker = broker();
+        let mut bodies = Vec::new();
+        let error = broker
+            .route_completion(request(), true, |route, body| {
+                bodies.push((route, body));
+                std::future::ready(Err("provider_repetition"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, "provider_repetition");
+        assert_eq!(
+            bodies.iter().map(|(route, _)| *route).collect::<Vec<_>>(),
+            vec![Route::Near, Route::Near, Route::Venice, Route::Venice]
+        );
+        for index in [1, 3] {
+            assert_eq!(bodies[index].1["reasoning_effort"], "low");
+            assert_eq!(bodies[index].1["messages"].as_array().unwrap().len(), 2);
+        }
+        let engine_request = Request {
+            id: 1,
+            method: "POST".into(),
+            path: ENGINE_CHAT.into(),
+            body: None,
+        };
+        assert!(recoverable_engine_error(&engine_request, error));
+        let retained = broker.counters.lock().unwrap().reserved;
+        assert!(retained > 0);
+        broker
+            .route_completion(request(), false, |route, _| {
+                assert_eq!(route, Route::Venice);
+                std::future::ready(Ok(reply()))
+            })
+            .await
+            .unwrap();
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(count.calls, 4);
+        assert!(count.reserved > retained);
+        assert!(count.fallback.as_ref().unwrap().valid(count.calls));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_generation_can_recover_without_switching_provider() {
+        let broker = broker();
+        let mut attempts = 0;
+        broker
+            .route_completion(request(), false, |route, _| {
+                assert_eq!(route, Route::Near);
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err("provider_repetition")
+                } else {
+                    Ok(reply())
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts, 2);
+        let count = broker.counters.lock().unwrap();
+        assert_eq!(count.calls, 2);
+        assert!(count.fallback.is_none());
+        assert!(count.reserved > token_cost(LiveProvider::NearDeepSeek, 1000, 100).unwrap());
+    }
+
     #[tokio::test]
     async fn rate_limited_discovery_preserves_attempts_and_allows_a_later_review() {
         let broker = broker();

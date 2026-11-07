@@ -59,6 +59,7 @@ pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool 
                 | "provider_rate_limited"
                 | "provider_unavailable"
                 | "provider_stream_interrupted"
+                | "provider_repetition"
                 | "near_verification_timeout"
                 | "model_history_limit"
                 | "model_messages_empty"

@@ -253,6 +253,8 @@ class Bridge(BaseHTTPRequestHandler):
                                     reason = json.loads(error_body).get('error')
                                     if reason == 'engine_budget_reached':
                                         engine_stop_reason = 'model_budget'
+                                    elif reason == 'provider_repetition':
+                                        engine_stop_reason = 'provider_repetition'
                                 except (ValueError, AttributeError):
                                     pass
                                 engine_stopping.set()

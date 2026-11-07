@@ -146,7 +146,7 @@ class LiveOverviewTests(unittest.TestCase):
         import artex
         import copy
         scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
-        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress'):
+        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress', 'provider_repetition'):
             with self.subTest(reason=reason):
                 detail = {'engine': 'ARTEX', 'stop_reason': reason, 'coverage_complete': False,
                           'failure': 'incomplete'}
@@ -293,7 +293,8 @@ class BridgeTests(unittest.TestCase):
     def test_discovery_distinguishes_budget_stop_from_provider_failure(self):
         for reason, expected in [('engine_budget_reached', 'model_budget'),
                                  ('provider_rate_limited', 'model_request_rejected'),
-                                 ('near_verification_timeout', 'model_request_rejected')]:
+                                 ('near_verification_timeout', 'model_request_rejected'),
+                                 ('provider_repetition', 'provider_repetition')]:
             with self.subTest(reason=reason):
                 adapter.engine_stopping.clear()
                 payload=json.dumps({'error':reason}).encode()
