@@ -257,6 +257,7 @@ impl LiveBroker {
             .filter(|(input, output)| *input > 0 && *input <= 10_000_000 && *output <= 1_000_000)
             .and_then(|(input, output)| token_cost(route.provider(), input, output));
         let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+        usage::observe(&mut count.inference_usage, route.provider(), completion);
         if let Some(cost) = cost {
             count.reserved = count
                 .reserved

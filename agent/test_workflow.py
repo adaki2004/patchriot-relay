@@ -61,6 +61,18 @@ class WorkflowTests(unittest.TestCase):
         bad=copy.deepcopy(good);bad['tool_runs'][0]['evidence_ids']=[]
         self.assertEqual(action(bad),'recover')
 
+    def test_combined_engine_reuse_requires_anonymous_evidence_too(self):
+        scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
+        previous = {'role': 'investigator', 'evidence': [
+            {'id': 1, 'status': 401, 'url': 'https://owned.example/private'},
+            {'id': 2, 'status': 200, 'url': 'https://owned.example/private', 'authenticated': True}],
+            'tool_runs': [{'tool': 'artex-engine', 'exit_code': 0, 'evidence_ids': [1, 2]}]}
+        def action():
+            return next(p['action'] for p in live_review.discovery_plan('reproducer', scope, [previous]) if p['tool'] == 'artex-engine')
+        self.assertEqual(action(), 'reuse')
+        previous['tool_runs'][0]['evidence_ids'] = [2]
+        self.assertEqual(action(), 'recover')
+
     def test_failed_public_work_remains_incomplete_when_grey_nodes_exist(self):
         scope={'origins':['https://owned.example'],'tools':[],'authentication':'basic'}
         with tempfile.TemporaryDirectory() as temp:

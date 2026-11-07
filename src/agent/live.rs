@@ -10,6 +10,7 @@ mod login;
 mod near;
 mod routing;
 mod safety;
+mod usage;
 mod wallet;
 
 #[cfg(test)]
@@ -196,6 +197,7 @@ impl Task {
 }
 #[derive(Default)]
 struct Counters {
+    inference_usage: Vec<InferenceUsage>,
     report_only: bool,
     reserved: u64,
     calls: u16,
@@ -297,7 +299,7 @@ impl LiveBroker {
         if let (Ok(count), Ok(mut current)) = (self.counters.lock(), progress.lock()) {
             let mut workflow = self.workflow.lock().ok().and_then(|w| w.clone());
             if let Some(workflow) = &mut workflow {
-                if self.scope.authentication.is_some() && phase != LivePhase::ScopedTools {
+                if self.scope.authentication.is_some() {
                     let proof = self.browser.lock().ok().and_then(|s| s.proof.clone());
                     workflow.checks[5].state = if proof.is_some() {
                         CheckState::Recorded
@@ -570,6 +572,16 @@ impl LiveBroker {
                     .await
                     .map_err(|_| "agent_disconnected")?;
             }
+            usage::observe_bytes(
+                &mut self
+                    .counters
+                    .lock()
+                    .map_err(|_| "counter_unavailable")?
+                    .inference_usage,
+                self.provider,
+                &bytes,
+                stream,
+            );
             if let Some(cost) = reported_cost(&bytes, stream, self.provider) {
                 let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
                 count.reserved = count
@@ -637,6 +649,16 @@ impl LiveBroker {
                     .map_err(|_| "agent_disconnected")?;
             }
         }
+        usage::observe_bytes(
+            &mut self
+                .counters
+                .lock()
+                .map_err(|_| "counter_unavailable")?
+                .inference_usage,
+            self.provider,
+            &usage_bytes,
+            body["stream"] == true,
+        );
         if let Some(cost) = reported_cost(&usage_bytes, body["stream"] == true, self.provider) {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
             count.reserved = count
@@ -721,12 +743,72 @@ impl LiveBroker {
                 return Err("engine_http_budget_reached");
             }
         }
-        // Public investigation is identical in black and grey modes. Never
-        // inject an account into a scanner's apparently anonymous curl call.
-        if let Some(probe) = body.as_object_mut() {
-            probe.insert("authenticated".into(), json!(false));
+        // Anonymous is the default. A separately labelled authenticated mirror
+        // may opt in only after the broker has verified paired access evidence.
+        let authenticated = body.get("authenticated") == Some(&json!(true));
+        if authenticated {
+            let protected = self
+                .verified_access()
+                .ok_or("authenticated_access_not_verified")?;
+            let target = public_url(body["url"].as_str().ok_or("invalid_probe")?)?;
+            if target.origin() != public_url(&protected)?.origin() {
+                return Err("authenticated_origin_mismatch");
+            }
         }
+        body.as_object_mut()
+            .ok_or("invalid_probe")?
+            .insert("authenticated".into(), json!(authenticated));
         self.http(body).await
+    }
+
+    fn verified_access(&self) -> Option<String> {
+        self.scope.authentication?;
+        let state = self.browser.lock().ok()?;
+        if self.scope.browser_login.is_some() && state.verified_origin.is_none() {
+            return None;
+        }
+        let proof = state.proof.clone();
+        drop(state);
+        let count = self.counters.lock().ok()?;
+        let url =
+            if self.scope.browser_login.is_some() {
+                let proof = proof?;
+                if !proof.valid(&self.scope, &count.evidence) {
+                    return None;
+                }
+                count
+                    .evidence
+                    .iter()
+                    .find(|e| e.id == proof.authenticated_id)?
+                    .url
+                    .clone()
+            } else {
+                let url = format!(
+                    "{}{}",
+                    self.scope.origins.first()?,
+                    self.scope.auth_check_path.as_ref()?
+                );
+                if !count.evidence.iter().any(|e| {
+                    e.url == url
+                        && e.method == "GET"
+                        && e.authenticated
+                        && e.error.is_none()
+                        && e.status.is_some_and(|s| (200..300).contains(&s))
+                }) || !count.evidence.iter().any(|e| {
+                    e.url == url && e.method == "GET" && self.scope.denies_anonymous_access(e)
+                }) {
+                    return None;
+                }
+                url
+            };
+        drop(count);
+        let parsed = public_url(&url).ok()?;
+        let browser = self.browser.lock().ok()?;
+        (self.access.authenticated(&parsed, true)
+            || (browser.verified_authorization.is_some()
+                && browser.verified_origin.as_deref()
+                    == Some(parsed.origin().ascii_serialization().as_str())))
+        .then_some(url)
     }
 
     fn probe_url(&self, probe: &Probe, login: bool) -> Result<url::Url, &'static str> {
@@ -816,10 +898,27 @@ impl LiveBroker {
         for (key, value) in &probe.headers {
             request = request.header(key, value);
         }
+        let browser_authorization = if !login && probe.authenticated {
+            let state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            if state.proof.is_some()
+                && state.verified_origin.as_deref()
+                    == Some(url.origin().ascii_serialization().as_str())
+            {
+                state.verified_authorization.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let authenticated = !login
             && self.scope.authentication.is_some()
-            && self.access.authenticated(&url, probe.authenticated);
+            && (self.access.authenticated(&url, probe.authenticated)
+                || browser_authorization.is_some());
         request = self.access.apply(request, &url, probe.authenticated);
+        if let Some(value) = browser_authorization {
+            request = request.header("authorization", value.as_str());
+        }
         if let Some(data) = &probe.data {
             request = request.body(data.clone());
         }
@@ -1035,11 +1134,19 @@ impl LiveBroker {
             return;
         }
         let (status, body) = match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/patchriot/access") => {
+                let protected_url = self.verified_access();
+                (
+                    200,
+                    json!({"verified":protected_url.is_some(),"protected_url":protected_url}),
+                )
+            }
             ("GET", "/patchriot/budget") => {
                 let count = self.counters.lock().expect("live counters poisoned");
                 (
                     200,
                     json!({
+                        "inference_usage": count.inference_usage,
                         "http_remaining": MAX_HTTP_REQUESTS.saturating_sub(count.evidence.len()),
                         "engine_http_remaining": ENGINE_HTTP_LIMIT.saturating_sub(count.evidence.len()),
                         "model_calls_remaining": MAX_LIVE_INFERENCE_CALLS.saturating_sub(count.calls),
@@ -1177,6 +1284,7 @@ impl LiveBroker {
                 inference_calls: count.calls,
                 http_requests: count.evidence.len() as u16,
                 cost_upper_microusd: count.reserved,
+                inference_usage: count.inference_usage.clone(),
                 cleanup_confirmed: cleanup,
                 failure_reason: if !tools_valid {
                     Some("invalid_tool_records".into())
@@ -2237,10 +2345,17 @@ for _ in range(270): print(frame,flush=True)
         )
         .unwrap();
         Arc::get_mut(&mut broker).unwrap().test_target = Some(address);
+        assert_eq!(
+            broker
+                .engine_http(
+                    json!({"method":"GET","url":"https://owned.example/","authenticated":true})
+                )
+                .await
+                .unwrap_err(),
+            "authenticated_access_not_verified"
+        );
         let reply = broker
-            .engine_http(
-                json!({"method":"GET","url":"https://owned.example/","authenticated":true}),
-            )
+            .engine_http(json!({"method":"GET","url":"https://owned.example/"}))
             .await
             .unwrap();
         assert_eq!(reply["evidence"]["status"], 200);

@@ -45,9 +45,10 @@ def receipt_summary(result, full_output):
     summary = {key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
         'collection_errors',
-        'usage',
+        'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
-        'limitations', 'target_mapping'
+        'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
+        'anonymous_evidence_count', 'authenticated_evidence_count'
     ) if key in result}
     commands = result.get('commands', {})
     entries = commands.get('commands', []) if isinstance(commands, dict) else commands
@@ -125,12 +126,23 @@ def task_body(scope, targets, seconds, role, allowance=None):
     if not targets or len(targets) != len(scope['origins']):
         raise ValueError('missing target mirrors')
     mapping = '\n'.join(f'{origin} -> {target}' for origin, target in zip(scope['origins'], targets))
+    authenticated = scope.get('_authenticated_targets', {})
+    access = ('This engine is anonymous; no supplied account is available. '
+              if not authenticated else
+              'This is ONE combined public and authenticated investigation. The mirrors above are ANONYMOUS controls. '
+              'These separate AUTHENTICATED mirrors inject the already verified account in the relay:\n' +
+              '\n'.join(f'{origin} -> {target}' for origin, target in authenticated.items()) + '\n' +
+              'Use both contexts. Discover public routes once, then examine signed-in features and compare protected resources with anonymous controls. '
+              'Do not repeat the whole public suite per context. Start signed-in coverage with the protected resource already verified by the relay: ' +
+              scope.get('_protected_url', '') + '. Credentials, cookies and tokens are deliberately unavailable to you; do not request, read or export them. '
+              'A failed authenticated response is a coverage gap, not proof of a vulnerability. ')
     return {
         'name': 'Approved website assessment',
         'description': 'Authorized website assessment through scoped local mirrors.\n' + mapping,
         'goal': (
             f'Approved targets and their local mirrors:\n{mapping}\n'
             f'Act as the {role}. Run a bounded web assessment using your planner and tools against ONLY these local target mirrors. '
+            + access +
             f'Time available: {seconds} seconds. Current relay allowances: {json.dumps(allowance or {})}. '
             'Read /work/engine-budget.json for refreshed remaining request, model and evidence allowances; this file is trusted budget metadata, not a target. '
             'Prioritize routes observed in the application, then material leads. Use small probe batches of at most 25 requests. '
@@ -153,7 +165,7 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'and message "Authorized security test. No action is needed; this is disposable test data." '
             'Never put internal engine/tool names, including ARTEX, into submitted names, companies, email addresses, subjects or messages. '
             'Contact forms and access/signup requests may send real notifications: send at most one successful test per endpoint, then reuse its receipt unless a specific material finding needs a different approved control. '
-            'Use only the methods in the approved scope. POST is available only in an explicitly authorized active scope (web_active_v1 or web_active_v2), using disposable test data; use JSON or URL-encoded bodies up to 16 KiB. This engine is anonymous in both black and grey modes; it never receives the supplied account. Never ask for credentials. No fund movement, real purchases, brute force, load testing or persistence. Never change passwords, initiate or confirm password recovery, change account email, roles or MFA, delete accounts, or revoke sessions. Supplied accounts and existing records are not disposable. Test these controls only in an owner-prepared disposable fixture; otherwise record them as untested. Never use browser credential-fill for password-change or recovery forms. '
+            'Use only the methods in the approved scope. POST is available only in an explicitly authorized active scope (web_active_v1 or web_active_v2), using disposable test data; use JSON or URL-encoded bodies up to 16 KiB. Never ask for credentials. No fund movement, real purchases, brute force, load testing or persistence. Never change passwords, initiate or confirm password recovery, change account email, roles or MFA, delete accounts, or revoke sessions. Supplied accounts and existing records are not disposable. Test these controls only in an owner-prepared disposable fixture; otherwise record them as untested. Never use browser credential-fill for password-change or recovery forms. '
             'External network and other hosts are unavailable. Some absolute links and redirects cannot be followed through a mirror; record that limit. '
             'A managed bot challenge or CAPTCHA is an access limitation, not application evidence. Do not reverse-engineer or solve challenge scripts, spoof a browser to defeat them, or keep probing the blocked path. Record the gap and continue only other reachable approved application paths. '
             'The mirrors return selected response headers and bounded decoded text. They cannot establish TLS configuration, binary-file behavior or real browser execution. '
@@ -343,7 +355,7 @@ class Engine:
 
 
 def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
-        stop=lambda: False, emit=lambda _: None):
+        stop=lambda: False, emit=lambda _: None, access=None, authenticated_fetch=None):
     from web_tools import ScopeMirror, record
     from live_http import request
     from functools import partial
@@ -361,6 +373,17 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
             raise TimeoutError('no engine time remaining')
         with ExitStack() as stack:
             mirrors = [stack.enter_context(ScopeMirror(origin, deadline, fetch=fetch or partial(request, discovery=True, authenticated=False), methods=scope['methods'])) for origin in scope['origins']]
+            signed = []
+            engine_scope = dict(scope)
+            if scope.get('authentication') and access and access.get('verified') is True:
+                from urllib.parse import urlsplit
+                parsed = urlsplit(access.get('protected_url', ''))
+                origin = f'{parsed.scheme}://{parsed.netloc}'
+                if origin not in scope['origins']:
+                    raise ValueError('verified access is outside scope')
+                signed = [stack.enter_context(ScopeMirror(origin, deadline,
+                    fetch=authenticated_fetch or partial(request, discovery=True, authenticated=True), methods=scope['methods']))]
+                engine_scope.update(_authenticated_targets={origin: signed[0].url}, _protected_url=access['protected_url'])
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
             def refresh_budget():
                 from report_finish import bridge
@@ -375,14 +398,32 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
                     return {}
             engine.allowance, engine.budget_refresh = refresh_budget(), refresh_budget
             try:
-                result = engine.assess(scope, [mirror.url for mirror in mirrors], role, stop=stop,
-                                      progress=lambda: sum(len(m.progress_keys) for m in mirrors))
+                result = engine.assess(engine_scope, [mirror.url for mirror in mirrors], role, stop=stop,
+                                      progress=lambda: sum(len(m.progress_keys) for m in mirrors + signed))
+                result.update(access_mode='anonymous_and_authenticated' if signed else 'anonymous',
+                    authenticated_target_mapping=engine_scope.get('_authenticated_targets', {}),
+                    anonymous_evidence_count=sum(len(m.refs) for m in mirrors),
+                    authenticated_evidence_count=sum(len(m.refs) for m in signed))
+                if signed and (not any(m.refs for m in signed) or not any(m.refs for m in mirrors)):
+                    result['coverage_complete'] = False
+                    result.setdefault('collection_errors', []).append('access_context_untested')
                 code = 0
                 if not result['coverage_complete']:
                     failure = 'incomplete'
             finally:
-                refs = [identifier for mirror in mirrors for identifier in mirror.refs]
+                refs = [identifier for mirror in mirrors + signed for identifier in mirror.refs]
                 final_allowance = refresh_budget()
+                before = {r['model']: r for r in engine.allowance.get('inference_usage', [])}
+                observed = []
+                for row in final_allowance.get('inference_usage', []):
+                    old = before.get(row['model'], {})
+                    delta = {key: value if key in ('provider', 'model') else max(0, value - old.get(key, 0))
+                             for key, value in row.items()}
+                    if delta.get('responses', 0):
+                        observed.append(delta)
+                if observed:
+                    result['inference_usage'] = observed
+
                 meters = {
                     'http_requests': 'http_remaining',
                     'inference_calls': 'model_calls_remaining',
@@ -406,7 +447,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
     result['limitations'] = [
         'This is the full upstream planner/worker engine under the approved web profile; it does not run every installed skill or optional external tool.',
         'Only recorded broker requests establish that a target was contacted. Engine findings and command counts are not independent verification.',
-        'Only the methods and test-account access declared in scope were allowed. Browser login, network discovery, external callbacks and unrestricted egress are unsupported. Missing binaries and blocked tests are coverage gaps.',
+        'Only the methods and test-account access declared in scope were allowed. The engine uses only preverified broker access; it cannot perform browser login itself. Network discovery, external callbacks and unrestricted egress are unsupported. Missing binaries and blocked tests are coverage gaps.',
         'A budget-limited run may contain useful findings while leaving goals unfinished. Review its stop reason and the later agents’ control requests.',
         'Discovery stops after fifteen minutes without a new target observation or distinct successful tool result. Heartbeats, tool errors and repeated command/output pairs do not reset that timer. Local analysis is activity, not proof of target coverage; the hard time and spending limits still apply.',
     ]
@@ -419,9 +460,10 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
     output = json.dumps({key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
         'collection_errors',
-        'usage',
+        'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
-        'limitations', 'target_mapping', 'outcome', 'findings', 'commands'
+        'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
+        'anonymous_evidence_count', 'authenticated_evidence_count', 'inference_usage', 'outcome', 'findings', 'commands'
     ) if key in result}, ensure_ascii=True)
     (directory / 'artex-results.json').write_text(output)
     return record('artex-engine', VERSION, ['/opt/artex/artex', *scope['origins']], started,

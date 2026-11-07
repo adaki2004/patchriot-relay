@@ -24,6 +24,44 @@ SCOPE = {'origins': ['https://owned.example'], 'objective': 'Owned fixture only'
 
 
 class EngineTests(unittest.TestCase):
+    def test_combined_investigation_uses_one_engine_and_two_isolated_contexts(self):
+        from urllib.request import urlopen
+        for use_private in (True, False):
+            starts, calls = [], []
+            def fetch(authenticated):
+                def request(method, url, headers=None, **kwargs):
+                    calls.append((authenticated, url))
+                    return {'evidence': {'id': len(calls), 'status': 200 if authenticated else 401},
+                            'body': 'private fixture' if authenticated else 'denied'}
+                return request
+            class FakeEngine:
+                def __init__(self, *_): starts.append(1)
+                def __enter__(self): return self
+                def __exit__(self, *_): pass
+                def assess(self, scope, targets, role, **kwargs):
+                    for target in targets:
+                        try: urlopen(target + '/private').read()
+                        except urllib.error.HTTPError: pass
+                    if use_private:
+                        for target in scope['_authenticated_targets'].values():
+                            urlopen(target + '/private').read()
+                    return {'coverage_complete': True, 'stop_reason': 'done', 'findings': []}
+            with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine):
+                scope = dict(SCOPE, authentication='session')
+                receipt = artex.run(scope, 'investigator', time.monotonic() + 10, Path(folder),
+                    fetch=fetch(False), authenticated_fetch=fetch(True),
+                    access={'verified': True, 'protected_url': 'https://owned.example/private'})
+                result = json.loads((Path(folder) / 'artex-results.json').read_text())
+            self.assertEqual(starts, [1])
+            self.assertEqual(result['access_mode'], 'anonymous_and_authenticated')
+            self.assertEqual(result['anonymous_evidence_count'], 1)
+            self.assertEqual(result['authenticated_evidence_count'], int(use_private))
+            self.assertEqual(result['coverage_complete'], use_private)
+            self.assertEqual(receipt['evidence_ids'], [1, 2] if use_private else [1])
+            self.assertEqual(calls[0], (False, 'https://owned.example/private'))
+            if use_private:
+                self.assertEqual(calls[1], (True, 'https://owned.example/private'))
+
     def test_planner_gets_numeric_budget_finish_reserve_and_neutral_identity(self):
         body = artex.task_body(SCOPE, ['http://127.0.0.1:1234'], 1800, 'investigator',
                                {'engine_http_remaining': 1457, 'engine_model_calls_remaining': 400})

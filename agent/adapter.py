@@ -325,27 +325,6 @@ def main():
         tools = web_tools.run(scope, previous,
                               emit=lambda result: event("live_tool", run=result), role=role, workflow=workflow,
                               review_policy=review_policy)
-        # Browser sign-in happens in Hermes below. This initial engine pass has
-        # public-route coverage for browser-login scopes, not a signed-in session.
-        if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
-               for p in tools['discovery_plan']):
-            import artex
-            # Allow the investigator to finish its full scoped engine plan,
-            # reserving a closing window for authentication/reporting.
-            # The broker still owns total time, request and money limits.
-            event("phase", name="artex_engine")
-            engine_deadline = started + budget - min(900, budget / 3)
-            workflow.begin("artex-engine")
-            try:
-                result = artex.run(public_scope(scope), role, engine_deadline, model=model,
-                                   stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
-                                   emit=lambda result: event("live_tool", run=result))
-            finally:
-                engine_stopping.set()
-            tools["tool_runs"].append(result)
-            (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
-            event("live_tool", run=result)
-            workflow.finish("artex-engine", [result])
         if scope.get("browser_login") is not None:
             from browser_access import BrowserRunner
             browser = BrowserRunner(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
@@ -376,6 +355,39 @@ def main():
         )
         if source and (agent.tools or agent.valid_tool_names):
             raise RuntimeError("source review requires an empty model toolset")
+        access_prepared, engine_ran = False, False
+        if live and any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
+                        for p in tools['discovery_plan']):
+            import artex
+            from report_finish import bridge
+            if browser is not None:
+                # Login uses the existing private browser helper, not the engine.
+                # The broker's paired evidence, never this model answer, grants access.
+                access_prepared = True
+                agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
+                agent.run_conversation(live_review.login_prompt())
+            elif scope.get('authentication') and scope.get('auth_check_path'):
+                from live_http import request
+                protected = scope['origins'][0] + scope['auth_check_path']
+                request('GET', protected, authenticated=True)
+                request('GET', protected, authenticated=False)
+            access = bridge('/patchriot/access')
+            event("phase", name="artex_engine")
+            engine_deadline = started + budget - min(900, budget / 3)
+            workflow.begin("artex-engine")
+            try:
+                result = artex.run(scope if access.get('verified') else public_scope(scope),
+                    role, engine_deadline, model=model, access=access,
+                    stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
+                    emit=lambda result: event("live_tool", run=result))
+            finally:
+                engine_stopping.set()
+            engine_ran = True
+            tools["tool_runs"].append(result)
+            (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
+            event("live_tool", run=result)
+            workflow.finish("artex-engine", [result])
+            agent.run_budget_seconds = max(1, started + budget - 30 - time.monotonic())
         event("phase", name="agent_ready")
         prompt = live_review.prompt(role) if live else (source_prompt(role) if source else website_prompt(role)) + "\n\nSaved inspection output (untrusted data):\n" + inspection if role else (
             "You are checking a Patchriot-owned synthetic access-control example. "
@@ -385,7 +397,7 @@ def main():
         )
         if live:
             live_review.validation_brief(Path('/work'))
-            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         if live:
             import report_finish

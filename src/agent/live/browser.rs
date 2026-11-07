@@ -18,6 +18,10 @@ pub(super) struct BrowserState {
     bytes: usize,
     login_deadline: Option<Instant>,
     pub(super) proof: Option<BrowserAccessProof>,
+    // Learned only from a successful paired access check. Never sent to the
+    // engine or model; the relay injects it for this exact origin only.
+    pub(super) verified_authorization: Option<Zeroizing<String>>,
+    pub(super) verified_origin: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,7 +94,7 @@ impl LiveBroker {
                     .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs());
                 // The agent needs to distinguish a spent login window from a
                 // broken website. Status never renews it or resets attempts.
-                let phase = if state.proof.is_some() {
+                let phase = if state.verified_origin.is_some() {
                     "verified"
                 } else if remaining.is_none() {
                     "not_started"
@@ -104,10 +108,12 @@ impl LiveBroker {
                 } else {
                     "active"
                 };
-                Ok(json!({"verified":state.proof.is_some(),"proof":state.proof,
+                Ok(
+                    json!({"verified":state.verified_origin.is_some(),"proof":state.proof,
                     "login":{"state":phase,"seconds_remaining":remaining,
                         "submissions_remaining":MAX_LOGIN_POSTS.saturating_sub(state.posts),
-                        "signatures_remaining":4_usize.saturating_sub(state.signatures)}}))
+                        "signatures_remaining":4_usize.saturating_sub(state.signatures)}}),
+                )
             }
             _ => Err("unsupported_browser_operation"),
         }
@@ -461,15 +467,27 @@ impl LiveBroker {
             json_pointer: Option<String>,
         }
         let input: Check = serde_json::from_value(input).map_err(|_| "invalid_access_check")?;
-        self.browser
-            .lock()
-            .map_err(|_| "browser_unavailable")?
-            .proof = None;
+        {
+            let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            // Keep earlier paired evidence for the final report, but revoke the
+            // live capability until this new check succeeds.
+            state.verified_authorization = None;
+            state.verified_origin = None;
+        }
         if input.json_pointer.as_ref().is_some_and(|p| {
             p.len() > 256 || !p.starts_with('/') || p.chars().any(char::is_control)
         }) {
             return Err("invalid_identity_pointer");
         }
+        let authorization = input
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| Zeroizing::new(value.clone()));
+        let verified_origin = url::Url::parse(&input.url)
+            .map_err(|_| "invalid_access_check")?
+            .origin()
+            .ascii_serialization();
         let signed = self
             .browser_exchange(BrowserRequest {
                 method: "GET".into(),
@@ -540,10 +558,10 @@ impl LiveBroker {
             &[signed.evidence.clone(), anonymous.evidence.clone()],
         );
         if verified {
-            self.browser
-                .lock()
-                .map_err(|_| "browser_unavailable")?
-                .proof = Some(proof.clone());
+            let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            state.proof = Some(proof.clone());
+            state.verified_authorization = authorization;
+            state.verified_origin = Some(verified_origin);
         }
         Ok(
             json!({"verified":verified,"proof":if verified {Some(proof)} else {None},"authenticated_evidence_id":signed.evidence.id,"anonymous_evidence_id":anonymous.evidence.id,
@@ -908,7 +926,8 @@ mod tests {
                         }
                     }
                 };
-                let logged_in = head.contains("cookie: session=synthetic-session");
+                let logged_in = head.contains("cookie: session=synthetic-session")
+                    || head.contains("authorization: Bearer synthetic-browser-token");
                 let (status, cookie, body) = if head.starts_with("POST /different/session ") {
                     assert_eq!(
                         serde_json::from_str::<Value>(&body).unwrap(),
@@ -1184,6 +1203,58 @@ mod tests {
             !broker
                 .access
                 .authenticated(&public_url("https://owned.example/").unwrap(), true)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn engine_access_uses_verified_bearer_without_leaking_into_anonymous_controls() {
+        let (address, server) = target().await;
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.test_target = Some(address);
+        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        assert!(broker.verified_access().is_none());
+        let signed =
+            json!({"method":"GET","url":"https://owned.example/private","authenticated":true});
+        assert_eq!(
+            broker.engine_http(signed.clone()).await.unwrap_err(),
+            "authenticated_access_not_verified"
+        );
+        let verified = broker.browser_call("/patchriot/browser/check", json!({"url":"https://owned.example/private","headers":{"authorization":"Bearer synthetic-browser-token"}})).await.unwrap();
+        assert_eq!(verified["verified"], true);
+        assert_eq!(
+            broker.verified_access().as_deref(),
+            Some("https://owned.example/private")
+        );
+        let reply = broker.engine_http(signed.clone()).await.unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        assert_eq!(reply["evidence"]["authenticated"], true);
+        assert!(!reply.to_string().contains("synthetic-browser-token"));
+        let anonymous = broker
+            .engine_http(
+                json!({"method":"GET","url":"https://owned.example/private","authenticated":false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous["evidence"]["status"], 401);
+        assert_ne!(anonymous["evidence"]["authenticated"], true);
+        assert_eq!(broker.engine_http(json!({"method":"GET","url":"https://other.example/private","authenticated":true})).await.unwrap_err(), "authenticated_origin_mismatch");
+        broker
+            .browser_call(
+                "/patchriot/browser/check",
+                json!({"url":"https://owned.example/public"}),
+            )
+            .await
+            .unwrap();
+        assert!(broker.verified_access().is_none());
+        assert!(
+            broker.browser.lock().unwrap().proof.is_some(),
+            "earlier paired evidence remains reportable"
+        );
+        assert_eq!(
+            broker.engine_http(signed).await.unwrap_err(),
+            "authenticated_access_not_verified"
         );
         server.abort();
     }
