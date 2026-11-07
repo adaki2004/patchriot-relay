@@ -12,6 +12,7 @@ pub(super) struct Access {
     authorization: Option<Zeroizing<String>>,
     login_account: Option<(Zeroizing<String>, Zeroizing<String>)>,
     secrets: Mutex<Vec<Zeroizing<String>>>,
+    supplied_secret_count: usize,
     cookies: Jar,
     cookie_bytes: Mutex<usize>,
     sessions: bool,
@@ -96,6 +97,7 @@ impl Access {
                 )),
                 _ => None,
             },
+            supplied_secret_count: secrets.len(),
             secrets: Mutex::new(secrets),
             cookies: Jar::default(),
             cookie_bytes: Mutex::new(0),
@@ -177,7 +179,12 @@ impl Access {
         // the marker itself when a server sets short cookies such as R or E,
         // allowing a small response to expand repeatedly during redaction.
         let mut covered = vec![false; value.len()];
-        for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        for (index, secret) in secrets.iter().enumerate().filter(|(_, s)| !s.is_empty()) {
+            // Supplied credentials always receive substring protection. Short
+            // discovered values can instead be invalid probe inputs or cookie
+            // flags (e.g. "x" or "1"). Hiding them inside unrelated words
+            // corrupts source code, paths and the next model's instructions.
+            let whole_value = index >= self.supplied_secret_count && secret.chars().count() < 8;
             // Echoed HTML/JSON/form values cannot smuggle the supplied secret
             // into a model prompt, evidence file or report.
             let json = serde_json::to_string(secret.as_str()).expect("string is JSON");
@@ -188,7 +195,15 @@ impl Access {
             ] {
                 if !pattern.is_empty() {
                     for (start, _) in value.match_indices(&pattern) {
-                        covered[start..start + pattern.len()].fill(true);
+                        let end = start + pattern.len();
+                        let identifier = |c: char| c.is_alphanumeric() || c == '_';
+                        if whole_value
+                            && (value[..start].chars().next_back().is_some_and(identifier)
+                                || value[end..].chars().next().is_some_and(identifier))
+                        {
+                            continue;
+                        }
+                        covered[start..end].fill(true);
                     }
                 }
             }
@@ -235,7 +250,7 @@ mod tests {
         for secret in ["x", "R", "E", "D", "A", "C", "T", "é\"&"] {
             access.remember_secret(secret.into()).unwrap();
         }
-        assert_eq!(access.redact(&"x".repeat(8192)), "REDACTED");
+        assert_eq!(access.redact(&"x".repeat(8192)), "x".repeat(8192));
         assert_eq!(access.redact("x ☃ x"), "REDACTED ☃ REDACTED");
         assert_eq!(
             access.redact("é\"& é\\\"& %C3%A9%22%26"),
@@ -244,6 +259,42 @@ mod tests {
         let (bounded, shortened) = access.redact_limited("x ☃ x", 11);
         assert_eq!(bounded, "REDACTED ");
         assert!(shortened);
+    }
+    #[test]
+    fn short_observed_values_do_not_corrupt_code_but_supplied_credentials_stay_private() {
+        let scope: LiveScope = serde_json::from_value(serde_json::json!({
+            "origins":["https://owned.example"], "methods":["GET"]
+        }))
+        .unwrap();
+        let access = Access::new(&scope, None).unwrap();
+        super::super::safety::remember_body_secrets(&access, r#"{"password":"x"}"#).unwrap();
+        let code = "except Exception: print('/work/example.txt')";
+        assert_eq!(access.redact(code), code);
+        assert_eq!(
+            access.redact(r#"{"password":"x"} password=x; 'x'"#),
+            r#"{"password":"REDACTED"} password=REDACTED; 'REDACTED'"#
+        );
+        access
+            .remember_secret("fixture-generated-secret".into())
+            .unwrap();
+        assert_eq!(
+            access.redact("prefixfixture-generated-secretsuffix"),
+            "prefixREDACTEDsuffix"
+        );
+
+        let scope: LiveScope = serde_json::from_value(serde_json::json!({
+            "origins":["https://owned.example"], "methods":["GET"], "authentication":"basic"
+        }))
+        .unwrap();
+        let access = Access::new(
+            &scope,
+            Some(&TestCredentials::Basic {
+                username: "fixture".into(),
+                password: "éééé".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(access.redact("prefixéééésuffix"), "prefixREDACTEDsuffix");
     }
     #[tokio::test]
     async fn a_real_session_keeps_cookies_out_of_anonymous_controls_and_does_not_follow_redirects()
@@ -354,7 +405,7 @@ mod tests {
             HeaderValue::from_static("short=x; Path=/; Secure"),
         );
         access.remember(&url, &short, true);
-        let (bounded, shortened) = access.redact_limited(&"xé".repeat(3000), 2048);
+        let (bounded, shortened) = access.redact_limited(&"x ☃ ".repeat(3000), 2048);
         assert!(shortened && bounded.len() <= 2048 && !bounded.contains('x'));
         assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
         let mut value = serde_json::json!({"summary":"synthetic-cookie-value","evidence":["synthetic-bearer-for-tests"]});
