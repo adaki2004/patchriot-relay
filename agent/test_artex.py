@@ -114,6 +114,7 @@ class EngineTests(unittest.TestCase):
         self.assertIn('Authenticated logout and session-revocation routes are blocked', permitted)
         self.assertIn('{{PATCHRIOT_NEW_PASSWORD}}', permitted)
         self.assertIn('VERIFY_CHANGED_PASSWORD once', permitted)
+        self.assertIn('Only evidence.headers contains headers actually observed', permitted)
         self.assertNotIn('Supplied accounts and existing records are not disposable.', permitted)
         self.assertIn('Never initiate or confirm password recovery', permitted)
 

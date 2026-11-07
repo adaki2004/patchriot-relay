@@ -220,6 +220,9 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'After an accepted change, run python3 /patchriot/live_http.py VERIFY_CHANGED_PASSWORD once. '
             'This trusted helper privately replays the observed login with the new password and no existing session. '
             'It returns redacted evidence and preserves the original session for a separate revocation check. '
+            'In helper replies, recorded_header_names lists headers the broker can capture. '
+            'Only evidence.headers contains headers actually observed on that response. '
+            'A name in recorded_header_names does not establish that the target emitted that header. '
             'Compare the actual login response with the original successful response. A generic HTTP 200 alone is insufficient. '
             'Do not send password markers to a login URL yourself. If the helper cannot verify the observed login, report that gap. '
             'Continue through the preserved reference account if testing-account access becomes unavailable.')
