@@ -142,7 +142,8 @@ def overview(directory):
                       "summary_shortened": len(summary) > 600,
                       "finding_count": len(findings) if report.get("assessment") is not None else None,
                       "findings": [{"title": f["title"][:200], "severity": f["severity"],
-                                    "support": f["support"], "prior_role_evidence_ids": f["evidence_ids"][:24]}
+                                    "support": f["support"], "prior_role_evidence_ids": f["evidence_ids"][:24],
+                                    "evidence_ids_shortened": len(f["evidence_ids"]) > 24}
                                    for f in findings[:24]]})
     return {"scope": context["scope"], "previous_reports": prior,
             "engine_coverage": engine_coverage(tools['tool_runs']),
@@ -151,6 +152,7 @@ def overview(directory):
             "current_tools": [{"tool": t["tool"], "exit_code": t["exit_code"],
                                "failure": t["failure"], "request_count": len(t["evidence_ids"]),
                                "current_role_evidence_ids": t["evidence_ids"][:24],
+                               "evidence_ids_shortened": len(t["evidence_ids"]) > 24,
                                "output_truncated": t["output_truncated"]}
                               for t in tools["tool_runs"][:20]]}
 
@@ -233,6 +235,7 @@ Credential values in recorded evidence are redacted. Typing a redaction placehol
 Preserve prepared sessions throughout the investigation. The relay blocks recognizable authenticated logout and session-revocation routes. Record those controls as unavailable. If access expires or is otherwise lost later, retain the earlier authenticated coverage and identify the point where access stopped, using exact evidence. Report which later checks were affected. Reconcile your summary with the engine's anonymous and authenticated evidence counts.
 Prior-agent summaries and limitations are unverified claims. Require retained target evidence before stating that an account password changed. Permission to change it, a failed login or the validator using the reference account cannot establish a password change. The recorded engine_coverage fields describe actual execution and request contexts; compare them with the cited response records before repeating an access limitation.
 Exact current-role HTTP records collected by discovery and live_http are cached in /work/http-evidence/<id>.json. Read the matching record before citing it; check its method, URL, request body, response and truncation. List selected fields to find relevant IDs instead of dumping all files. These are working copies of the relay's retained evidence, not extra requests or independent confirmation. A tool's ID range, command number or approximate ID is not a citation. If a record is missing or does not support the claim, make a scoped control request or leave the claim in limitations. Do not turn expected public data, missing API documentation or unsupported methods into vulnerabilities without a concrete security impact.
+Overview evidence-ID arrays are previews. When evidence_ids_shortened is true, read the complete IDs in tool-results.json for current-role tools or previous.json for prior roles. Every evidence ID retained by an engine tool run in current tool-results.json belongs to this role, including IDs omitted from the overview preview. Use request_count and the complete list before describing engine coverage.
 For cross-account access claims, establish the object's owner and the requesting identity from retained evidence. A record seen in an earlier role may belong to the same supplied account; a different UUID or earlier report does not prove foreign ownership. Without another authorized identity or a known foreign-owned test object, record the missing control as a limitation rather than claiming an authorization bypass. Never obtain another person's credentials or expand scope to fill that gap.
 ARTEX records describe the upstream engine's bounded discovery run, not independent confirmation. Command URLs may use local mirrors; target_mapping identifies the approved HTTPS origin. Read stop_reason, coverage_complete, failures and limitations before findings. Reproduce material leads with your own control requests through live_http; do not copy engine conclusions as verified facts. An unfinished engine run must remain an explicit coverage gap in your report. Never imply that every ARTEX skill or external tool ran.
 A managed bot challenge or CAPTCHA is an access limitation, not evidence about the application behind it. Do not reverse-engineer or solve challenge scripts, spoof a browser to defeat them, or keep probing the blocked path. Record the gap and continue other reachable approved application paths. Ordinary use of the site's approved browser login remains allowed.

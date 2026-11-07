@@ -133,7 +133,7 @@ class LiveOverviewTests(unittest.TestCase):
             'access_mode':'anonymous_and_authenticated', 'anonymous_evidence_count':12,
             'authenticated_evidence_count':9, 'authentication_requested':True}
         record = {'tool':'artex-engine', 'exit_code':0, 'failure':None,
-            'evidence_ids':[1, 2], 'output_truncated':False,
+            'evidence_ids':list(range(1, 30)), 'output_truncated':False,
             'output_excerpt':json.dumps({**coverage, 'commands':'long untrusted output'})}
         previous = [{'role':'investigator', 'assessment':{'summary':'Unverified prior claim',
             'findings':[], 'limitations':['Claimed no login']}, 'tool_runs':[record]}]
@@ -145,6 +145,9 @@ class LiveOverviewTests(unittest.TestCase):
             overview = live_review.overview(directory)
             self.assertEqual(overview['engine_coverage'], [coverage])
             self.assertEqual(overview['previous_reports'][0]['engine_coverage'], [coverage])
+            self.assertTrue(overview['current_tools'][0]['evidence_ids_shortened'])
+            self.assertEqual(overview['current_tools'][0]['request_count'], 29)
+            self.assertEqual(len(overview['current_tools'][0]['current_role_evidence_ids']), 24)
             live_review.validation_brief(directory)
             brief = json.loads((directory / 'validation-brief.json').read_text())
             self.assertEqual(brief[0]['engine_coverage'], [coverage])
