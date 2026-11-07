@@ -510,6 +510,15 @@ class BrowserAccounts:
     def activate(self, account):
         self.cdp = self.runners[account].cdp
         os.environ['BROWSER_CDP_URL'] = self.cdp
+        # The browser-exec daemon reads its CDP endpoint only at startup.
+        # Separate socket and scratch directories keep both default and named
+        # daemons attached to the selected account across repeated switches.
+        runtime = Path('/work') / ('browser-' + account)
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        os.environ['BH_RUNTIME_DIR'] = str(runtime)
+        os.environ['BH_RUNTIME_DIR_SHARED'] = '1'
+        os.environ['BH_TMP_DIR'] = str(runtime / 'tmp')
+        os.environ['BH_TMP_DIR_SHARED'] = '1'
         Path('/work/default-account.json').write_text(json.dumps(account))
 
     def close(self):
