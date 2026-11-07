@@ -1553,6 +1553,18 @@ mod tests {
             "assessment":null, "evidence":[], "raw_summary":""
         }))
         .unwrap();
+        // The inference SDK enables serde_json arbitrary_precision. Fractional
+        // observed costs must survive the untagged WorkResult outbox reader.
+        result.execution.inference_usage = vec![patchriot_protocol::pentests::InferenceUsage {
+            provider: "abliteration.ai".into(),
+            model: "abliterated-model-large-v2".into(),
+            responses: 1,
+            usd_cost_responses: 1,
+            diem_cost_responses: 1,
+            provider_reported_usd: 0.32495331000000005,
+            provider_reported_diem: 0.0,
+            ..Default::default()
+        }];
         // Escaped characters and many records are realistic HTML/tool output.
         // Fill to the wire limit, not an arbitrary 'large enough' test size.
         for id in 1..=500 {
