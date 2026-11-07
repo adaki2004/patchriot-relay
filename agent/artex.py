@@ -158,6 +158,7 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'Create a finite coverage plan covering the observed application: routes and exposed configuration; input handling; public authentication/recovery boundaries; '
             'API methods and cross-origin behavior; sensitive-data exposure; and relevant client-side code. '
             'For each applicable area record tested cases and controls as facts, plus findings where supported; explicitly record unavailable or inapplicable areas. '
+            'Rate-limit and lockout observations must include attempt counts, time window, identity scope and actual responses. A small burst cannot prove that a limit is absent. A bypass requires an observed enforced boundary and an approved bounded comparison of that same boundary; otherwise preserve the narrower observation. Do not increase traffic or guess passwords to establish an absent limit. '
             'Use the full permitted suite for that plan. Do not invent extra goals merely because no vulnerability was found. '
             'Once the applicable planned tests are finished, record a final coverage fact with evidence, then use prove_goal for the assessment goal referencing that fact. '
             'A negative assessment can meet the goal. Resource exhaustion is not completion: preserve any untested planned cases as gaps. '
