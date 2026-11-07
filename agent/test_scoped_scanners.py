@@ -119,7 +119,8 @@ class ScopedScannerTests(unittest.TestCase):
             invalid = [{'url': 'https://other.example/path'}, {'method': 'POST'},
                        {'status': 403}, {'error': 'unavailable'}, {'login': True},
                        {'url': 'https://owned.example/path?token=[REDACTED]'}, {'id': 999}]
-            rows = invalid + [{'url': f'https://owned.example/new{number}?q=sample'} for number in range(8)]
+            rows = invalid + [{'url': 'https://owned.example/static'}] + [
+                {'url': f'https://owned.example/new{number}?q=sample'} for number in range(8)]
             for identifier, changes in enumerate(rows, 1):
                 evidence_dir.joinpath(f'{identifier}.json').write_text(json.dumps({**base, 'id': identifier, **changes}))
             with patch.object(scanners, 'zap', return_value={}) as scanner:
@@ -127,7 +128,7 @@ class ScopedScannerTests(unittest.TestCase):
                     {}, time.monotonic() + 120, self.fetch, directory=directory)
             self.assertEqual(scanner.call_count, 1)
             self.assertEqual(len(scanner.call_args.args[1]), 4)
-            self.assertEqual(json.loads(result['output_excerpt'])['source_evidence_ids'], [8, 9, 10, 11])
+            self.assertEqual(json.loads(result['output_excerpt'])['source_evidence_ids'], [9, 10, 11, 12])
 
     def test_engine_handoff_retains_time_gap_and_inapplicable_state(self):
         with tempfile.TemporaryDirectory() as folder:

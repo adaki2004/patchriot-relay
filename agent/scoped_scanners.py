@@ -350,10 +350,11 @@ def follow_up(scope, records, engine, access, deadline, fetch=request,
                     if account.get('verified') and account.get('account') in ('testing', 'reference'))
     selected = {}
     sources = []
-    for identifier in engine.get('evidence_ids', []):
-        value = seed(identifier)
-        if value is None:
-            continue
+    candidates = [(identifier, value) for identifier in engine.get('evidence_ids', [])
+                  if (value := seed(identifier)) is not None]
+    # Give input-bearing URLs priority over passive-only pages within the cap.
+    candidates.sort(key=lambda candidate: not bool(urlsplit(candidate[1][1]).query))
+    for identifier, value in candidates:
         key, url = value
         account = key[0]
         if key in scanned or account not in verified:
