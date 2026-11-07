@@ -60,6 +60,9 @@ class WebToolsTests(unittest.TestCase):
             self.assertFalse(live_http.binary_response({'body': body, 'evidence': {'headers': {'content-type': media}}}))
         for body in ('PK\x03\x04\ufffd', 'abc\0def', '%PDF-1.4'):
             self.assertTrue(live_http.binary_response({'body': body, 'evidence': {'headers': {}}}))
+        # A binary download can be mislabeled as plain text by the application.
+        self.assertTrue(live_http.binary_response({'body': 'PK\x03\x04\ufffd',
+            'evidence': {'headers': {'content-type': 'text/plain; charset=utf-8'}}}))
 
     def test_mirror_exposes_broker_access_context_without_trusting_target_headers(self):
         cases = [({}, 'false', None),
