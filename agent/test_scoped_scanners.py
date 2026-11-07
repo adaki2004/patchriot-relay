@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 import coverage_ledger
 import schema_cases
@@ -49,6 +50,19 @@ class ScopedScannerTests(unittest.TestCase):
         for reference in ['https://other.example/schema', 'file:///etc/passwd', '/tmp/schema']:
             with self.assertRaises(ValueError):
                 schema_cases.check_references({'schema': {'$ref': reference}})
+
+    def test_scanner_failures_keep_bounded_codes_and_withhold_arbitrary_details(self):
+        for message, expected in [('scanner_api_internal_error', 'scanner_api_internal_error'),
+                                  ('https://private.example/?token=secret', 'ValueError')]:
+            with tempfile.TemporaryDirectory() as folder, patch.multiple(
+                scanners, probes=Mock(side_effect=ValueError(message)),
+                discovery=lambda *_: {}, zap=lambda *_: {}, schema_checks=lambda *_: {},
+                capture=lambda *_, **__: {'output': 'ffuf 2.1.0'},
+            ):
+                results = scanners.run(self.scope, [], fetch=self.fetch, directory=Path(folder))
+            detail = json.loads(results[0]['output_excerpt'])
+            self.assertEqual(detail['contexts'][0]['result']['reason'], expected)
+            self.assertEqual(results[0]['failure'], 'incomplete')
 
     def test_coverage_requires_real_records_and_preserves_gaps(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -101,7 +115,9 @@ class ScopedScannerTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
     def test_real_zap_runs_through_owned_broker_fixture(self):
         client = scanners.Requests(self.scope, time.monotonic() + 90, self.fetch, limit=12)
+        before = set(Path('/work').glob('patchriot-zap-*'))
         result = scanners.zap(client, ['https://owned.example/'])
+        self.assertEqual(set(Path('/work').glob('patchriot-zap-*')), before)
         self.assertIn('alerts', result)
         self.assertTrue(client.records)
         self.assertTrue(all(url.startswith('https://owned.example/') for _, url, _, _ in self.calls))

@@ -30,6 +30,33 @@ def report_validation(**details):
     event('phase', name='report_validation', **details)
 
 
+def login_completion(agent, account, paired, complete, read_access):
+    """End preparation from broker proof even if the model keeps exploring."""
+    verified_completions = 0
+    lock = threading.Lock()
+
+    def completed(*args, **kwargs):
+        nonlocal verified_completions
+        complete(*args, **kwargs)
+        try:
+            access = read_access()
+        except (OSError, ValueError):
+            return
+        contexts = access.get('accounts') or [dict(account='testing', verified=access.get('verified'))]
+        verified = any(context.get('account') == account and context.get('verified') is True
+                       for context in contexts)
+        if not verified:
+            return
+        with lock:
+            verified_completions += 1
+            # Paired setup can still make the optional observed identity check.
+            # Missing identity proof continues to block password-change permission.
+            if not paired or verified_completions >= 6:
+                agent.interrupt(tool_reason='host_cancelled')
+
+    return completed
+
+
 class MessageTooLarge(RuntimeError):
     """The request is valid JSON but exceeds the local transport allowance."""
 
@@ -374,10 +401,11 @@ def main():
                     browser.activate(account)
                     # Hermes caches its browser connection by agent session.
                     # Each account must get a distinct session, even after CDP changes.
-                    login_agent = agent
-                    if account == 'reference':
-                        login_agent = AIAgent(**agent_options)
-                        login_agents.append(login_agent)
+                    login_agent = AIAgent(**agent_options)
+                    login_agents.append(login_agent)
+                    login_agent.tool_complete_callback = login_completion(
+                        login_agent, account, scope.get('account_policy') is not None,
+                        complete, lambda: bridge('/patchriot/access'))
                     login_agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
                     login_agent.run_conversation(live_review.login_prompt(account=account, paired=scope.get('account_policy') is not None))
             elif scope.get('authentication') and scope.get('auth_check_path'):

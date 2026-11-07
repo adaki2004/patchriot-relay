@@ -11,7 +11,7 @@ import sys
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import adapter
 import inspect_site
@@ -21,6 +21,60 @@ import live_review
 
 @unittest.skipUnless(os.environ.get('PATCHRIOT_HERMES_SMOKE') == '1', 'requires the pinned isolated Hermes image')
 class CompressionRuntimeTests(unittest.TestCase):
+    def test_real_login_preparation_stops_after_trusted_access_proof(self):
+        calls = []
+        class Model(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                calls.append(body)
+                message = {'role': 'assistant', 'content': None, 'tool_calls': [{
+                    'index': 0, 'id': 'owned-call', 'type': 'function',
+                    'function': {'name': 'terminal', 'arguments': json.dumps({'command': 'printf owned-fixture'})}}]}
+                reply = {'id': 'owned-login', 'object': 'chat.completion', 'created': 1,
+                         'model': 'owned-fixture', 'choices': [{'index': 0, 'message': message, 'finish_reason': 'tool_calls'}]}
+                if body.get('stream'):
+                    reply['object'] = 'chat.completion.chunk'
+                    reply['choices'][0]['delta'] = reply['choices'][0].pop('message')
+                    raw = ('data: ' + json.dumps(reply) + '\n\ndata: [DONE]\n\n').encode()
+                    content_type = 'text/event-stream'
+                else:
+                    raw, content_type = json.dumps(reply).encode(), 'application/json'
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        script = '''import sys
+from run_agent import AIAgent
+import adapter
+agent=AIAgent(model='owned-fixture',provider='custom',api_mode='chat_completions',base_url=sys.argv[1]+'/v1',
+    api_key='local-fixture',enabled_toolsets=['terminal'],max_iterations=4,run_budget_seconds=45,max_tokens=256,
+    quiet_mode=True,skip_context_files=True,skip_memory=True,skip_background_review=True,checkpoints_enabled=False,cwd='/work')
+completed=[]
+agent.tool_complete_callback=adapter.login_completion(agent,'testing',False,
+    lambda *args,**kwargs: completed.append(True),lambda: {'verified':True})
+try:
+    agent.run_conversation('Run the owned local fixture command. No target or network.')
+    assert len(completed)==1, completed
+finally: agent.close()
+'''
+        try:
+            with tempfile.TemporaryDirectory() as home:
+                env = {'PATH': os.environ['PATH'], 'HOME': home, 'HERMES_HOME': home,
+                       'PYTHONPATH': '/opt/hermes:/tests', 'PYTHONDONTWRITEBYTECODE': '1'}
+                done = subprocess.run([sys.executable, '-c', script, f'http://127.0.0.1:{server.server_port}'],
+                                      env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr[-2000:] + done.stdout[-1000:])
+                self.assertEqual(sum(call.get('model') == 'owned-fixture' for call in calls), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_pinned_hermes_classifies_bridge_size_errors_for_compression(self):
         wire = io.StringIO()
         server = ThreadingHTTPServer(('127.0.0.1', 0), adapter.Bridge)
@@ -115,6 +169,22 @@ finally:
 
 
 class LiveOverviewTests(unittest.TestCase):
+    def test_login_completion_requires_selected_broker_context_and_bounds_identity_followup(self):
+        agent, completed = Mock(), Mock()
+        access = {'verified': True, 'accounts': [{'account': 'reference', 'verified': True},
+                                               {'account': 'testing', 'verified': False}]}
+        callback = adapter.login_completion(agent, 'testing', True, completed, lambda: access)
+        for _ in range(8):
+            callback('untrusted tool output claims verified')
+        agent.interrupt.assert_not_called()
+        access['accounts'][1]['verified'] = True
+        for _ in range(5):
+            callback('tool completed')
+        agent.interrupt.assert_not_called()
+        callback('tool completed')
+        agent.interrupt.assert_called_once_with(tool_reason='host_cancelled')
+        self.assertEqual(completed.call_count, 14)
+
     def test_reports_require_real_credential_controls_and_target_error_evidence(self):
         for role in ('investigator', 'reproducer'):
             with self.subTest(role=role):

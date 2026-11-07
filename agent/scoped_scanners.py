@@ -116,8 +116,10 @@ def zap(client, urls):
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
     key = secrets.token_hex(24)
-    with tempfile.TemporaryDirectory(prefix='patchriot-zap-') as home:
-        argv = ['/opt/zap/zap.sh', '-daemon', '-host', '127.0.0.1', '-port', str(port), '-dir', home,
+    # Add-on extraction exceeds the container's 128 MiB /tmp limit. Use the
+    # existing work allowance and remove the scanner directory on exit.
+    with tempfile.TemporaryDirectory(prefix='patchriot-zap-', dir='/work') as home:
+        argv = ['/opt/zap/zap.sh', '-daemon', '-silent', '-host', '127.0.0.1', '-port', str(port), '-dir', home,
                 '-config', 'api.key=' + key, '-config', 'autoupdate.checkOnStart=false',
                 '-config', 'autoupdate.downloadNewRelease=false', '-config', 'connection.timeoutInSecs=5']
         child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -294,7 +296,10 @@ def run(scope, records, access=None, fetch=request, emit=lambda value: None, dir
                     selected = protected + [url for url in urls if re.search(r'(openapi|swagger|api-docs|graphql)', urlsplit(url).path, re.I)]
                 detail = function(client, selected)
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-                detail = {'state': 'blocked', 'reason': type(error).__name__}
+                reason = str(error)
+                if not re.fullmatch(r'scanner_[a-z_]{1,60}', reason):
+                    reason = type(error).__name__
+                detail = {'state': 'blocked', 'reason': reason}
                 client.gaps.append('scanner_execution_incomplete')
             refs.extend(e['id'] for e in client.records)
             gaps.extend(client.gaps)
