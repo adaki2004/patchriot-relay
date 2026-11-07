@@ -901,6 +901,13 @@ impl LiveBroker {
         } else {
             self.scope.permits(&probe.method, &probe.url)?
         };
+        if self.account == Some(AccountSlot::Reference)
+            && probe.authenticated
+            && !login
+            && !matches!(probe.method.as_str(), "GET" | "HEAD" | "OPTIONS")
+        {
+            return Err("protected_reference_read_only");
+        }
         if let Some(data) = &probe.data {
             let content = probe
                 .headers

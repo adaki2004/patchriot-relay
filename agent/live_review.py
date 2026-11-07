@@ -221,7 +221,7 @@ Choose one enum value, never the pipe-separated example. EVERY finding, includin
         result += (f"\nTwo accounts were supplied. Your browser and default HTTP context use the {selected} account. "
             "Use live_http.py --account testing or --account reference for explicit HTTP controls and retain each evidence record's account label. "
             "Compare only supplied identities and disposable test objects whose ownership you can establish. "
-            "The reference account's credentials and settings stay protected. Password changes, when explicitly permitted, are handled by the engine's testing-account control. "
+            "The reference account permits authenticated GET, HEAD and OPTIONS after login. The relay blocks other signed-in writes, including settings changes. Record checks requiring reference-account POST as unavailable. Password changes, when explicitly permitted, are handled by the engine's testing-account control. "
             "For validation, sign in only with the protected reference account. The investigator may have changed the testing password. "
             "Use prior saved evidence for that mutation and report any control you cannot freshly reproduce. Never retry the old testing password.\n")
     if browser:

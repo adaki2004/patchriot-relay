@@ -180,7 +180,8 @@ def task_body(scope, targets, seconds, role, allowance=None):
     }
     if scope.get('account_policy') is not None:
         body['goal'] += ('\nKeep testing and reference account contexts distinct. Establish actual object ownership and requesting identity before a cross-account finding. '
-            'Different logins alone do not prove different tenants or a vulnerability. Never request password or settings changes for the reference account. ')
+            'Different logins alone do not prove different tenants or a vulnerability. The reference mirror permits authenticated GET, HEAD and OPTIONS only. '
+            'Use the testing mirror for permitted writes. Record reference checks requiring POST as unavailable. Preserve reference credentials, settings and existing records. ')
     if scope.get('_password_change_permitted') is True:
         body['goal'] = body['goal'].replace('Never change passwords, initiate or confirm password recovery,', 'Never initiate or confirm password recovery,')
         body['goal'] = body['goal'].replace(

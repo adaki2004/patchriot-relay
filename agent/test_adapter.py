@@ -123,6 +123,7 @@ class LiveOverviewTests(unittest.TestCase):
                 self.assertIn('private browser-fill login or a relay-managed credential operation', prompt)
                 self.assertIn('including a synthetic 502', prompt)
                 self.assertIn('Verify limitation citations', prompt)
+                self.assertIn('reference account permits authenticated GET, HEAD and OPTIONS', prompt)
 
     def test_validation_only_never_restarts_missing_discovery_and_preserves_claim_evidence(self):
         scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}

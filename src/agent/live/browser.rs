@@ -1305,6 +1305,44 @@ mod tests {
             reference.http(change.clone()).await.unwrap_err(),
             "account_credential_changes_not_permitted"
         );
+        let mut reference_write = json!({"method":"POST","url":"https://owned.example/api/preferences",
+            "headers":{"content-type":"application/json"},"authenticated":true,
+            "data":json!({"display_name":"Synthetic fixture"}).to_string()});
+        let evidence_count = broker.counters.lock().unwrap().evidence.len();
+        assert_eq!(
+            reference.http(reference_write.clone()).await.unwrap_err(),
+            "protected_reference_read_only"
+        );
+        assert_eq!(
+            reference
+                .engine_http(reference_write.clone())
+                .await
+                .unwrap_err(),
+            "protected_reference_read_only"
+        );
+        assert_eq!(
+            reference
+                .browser_call("/patchriot/browser/http", reference_write.clone())
+                .await
+                .unwrap_err(),
+            "protected_reference_read_only"
+        );
+        assert_eq!(
+            broker.counters.lock().unwrap().evidence.len(),
+            evidence_count
+        );
+        let mut false_login = reference_write.clone();
+        false_login["login"] = json!(true);
+        assert_eq!(
+            reference
+                .browser_call("/patchriot/browser/http", false_login)
+                .await
+                .unwrap_err(),
+            "browser_login_submission_limit"
+        );
+        assert!(broker.http(reference_write.clone()).await.is_ok());
+        reference_write["authenticated"] = json!(false);
+        assert!(reference.http(reference_write).await.is_ok());
         let result = broker.http(change.clone()).await.unwrap();
         assert_eq!(result["evidence"]["status"], 200);
         assert_eq!(result["evidence"]["account"], "testing");
