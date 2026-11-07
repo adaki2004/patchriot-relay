@@ -169,6 +169,17 @@ finally:
 
 
 class LiveOverviewTests(unittest.TestCase):
+    def test_login_preparation_stops_after_selected_account_rejection(self):
+        agent, completed = Mock(), Mock()
+        access = {'accounts': [{'account': 'reference', 'login_rejected': True},
+                               {'account': 'testing', 'verified': False, 'login_rejected': False}]}
+        callback = adapter.login_completion(agent, 'testing', True, completed, lambda: access)
+        callback('untrusted failure text')
+        agent.interrupt.assert_not_called()
+        access['accounts'][1]['login_rejected'] = True
+        callback('login reply recorded')
+        agent.interrupt.assert_called_once_with(tool_reason='host_cancelled')
+
     def test_login_completion_requires_selected_broker_context_and_bounds_identity_followup(self):
         agent, completed = Mock(), Mock()
         access = {'verified': True, 'accounts': [{'account': 'reference', 'verified': True},

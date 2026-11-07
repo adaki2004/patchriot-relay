@@ -42,7 +42,12 @@ def login_completion(agent, account, paired, complete, read_access):
             access = read_access()
         except (OSError, ValueError):
             return
-        contexts = access.get('accounts') or [dict(account='testing', verified=access.get('verified'))]
+        contexts = access.get('accounts') or [{**access, 'account': 'testing'}]
+        rejected = any(context.get('account') == account and context.get('login_rejected') is True
+                       for context in contexts)
+        if rejected:
+            agent.interrupt(tool_reason='host_cancelled')
+            return
         verified = any(context.get('account') == account and context.get('verified') is True
                        for context in contexts)
         if not verified:

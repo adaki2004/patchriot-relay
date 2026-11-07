@@ -853,6 +853,17 @@ impl LiveBroker {
         self.http(body).await
     }
 
+    fn login_rejected(&self) -> bool {
+        self.counters.lock().ok().is_some_and(|count| {
+            count
+                .evidence
+                .iter()
+                .rev()
+                .find(|item| item.login && item.method == "POST" && item.account == self.account)
+                .is_some_and(|item| matches!(item.status, Some(401 | 403)))
+        })
+    }
+
     fn verified_access(&self) -> Option<String> {
         self.scope.authentication?;
         let state = self.browser.lock().ok()?;
@@ -1303,12 +1314,14 @@ impl LiveBroker {
                 (
                     200,
                     json!({"verified":protected_url.is_some(),"protected_url":protected_url,
+                        "login_rejected":self.login_rejected(),
                         "password_change_permitted":self.password_change_permitted(),
                         "password_change_attempted":self.password_change_attempted.load(std::sync::atomic::Ordering::SeqCst),
                         "password_change_control":self.password_change_control(),
                         "accounts":([Some(self),self.reference.as_deref()].into_iter().flatten().filter_map(|broker| {
                             let account=broker.account?; let url=broker.verified_access();
-                            Some(json!({"account":account,"verified":url.is_some(),"protected_url":url}))
+                            Some(json!({"account":account,"verified":url.is_some(),"protected_url":url,
+                                "login_rejected":broker.login_rejected()}))
                         }).collect::<Vec<_>>())}),
                 )
             }

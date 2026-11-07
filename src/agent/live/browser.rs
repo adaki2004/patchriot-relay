@@ -816,6 +816,48 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn login_rejection_tracks_the_latest_credential_request_for_its_account() {
+        let broker = broker("session");
+        let mut evidence: HttpEvidence = serde_json::from_value(json!({
+            "id":1,"method":"POST","url":"https://owned.example/login",
+            "request_headers":{},"status":401,"headers":{},"body_excerpt":"",
+            "truncated":false,"error":null,"observed_at":1,"authenticated":false,"login":true
+        }))
+        .unwrap();
+        broker
+            .counters
+            .lock()
+            .unwrap()
+            .evidence
+            .push(evidence.clone());
+        assert!(broker.login_rejected());
+        evidence.id = 2;
+        evidence.status = Some(200);
+        broker
+            .counters
+            .lock()
+            .unwrap()
+            .evidence
+            .push(evidence.clone());
+        assert!(!broker.login_rejected());
+        evidence.id = 3;
+        evidence.status = Some(403);
+        evidence.account = Some(AccountSlot::Reference);
+        broker
+            .counters
+            .lock()
+            .unwrap()
+            .evidence
+            .push(evidence.clone());
+        assert!(!broker.login_rejected());
+        evidence.id = 4;
+        evidence.account = None;
+        evidence.login = false;
+        broker.counters.lock().unwrap().evidence.push(evidence);
+        assert!(!broker.login_rejected());
+    }
+
     #[tokio::test]
     async fn password_changes_are_blocked_even_when_labeled_as_browser_login() {
         let mut broker = broker("session");
