@@ -16,12 +16,15 @@ RUN /opt/hermes/.venv/bin/python /tmp/install_nuclei.py
 FROM base
 USER root
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    postgresql-17 curl wget jq ripgrep git dnsutils nmap netcat-openbsd ffuf sqlmap chromium \
+    openjdk-21-jre-headless postgresql-17 curl wget jq ripgrep git dnsutils nmap netcat-openbsd ffuf sqlmap chromium \
     && rm -rf /var/lib/apt/lists/* /var/lib/postgresql/17/main \
     && mkdir -p /opt/artex /usr/share/licenses/artex \
     && ln -s /work/artex-auth/jwt.key /opt/artex/jwt.key
 RUN /opt/hermes/.venv/bin/python -m ensurepip --upgrade && \
-    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir playwright==1.60.0
+    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir playwright==1.60.0 schemathesis==4.33.1
+# Pinned upstream scanner distribution, used only inside the scoped container.
+ADD --checksum=sha256:efe799aaa3627db683b43f00c9c210aea0b75c00cc8f0a0f0434d12bb3ddde5a https://github.com/zaproxy/zaproxy/releases/download/v2.17.0/ZAP_2.17.0_Linux.tar.gz /tmp/zap.tar.gz
+RUN mkdir -p /opt/zap && tar -xzf /tmp/zap.tar.gz -C /opt/zap --strip-components=1 && rm /tmp/zap.tar.gz
 # Match the pinned Hermes manifest. Install at build time; task containers have
 # no network/package installation and attach only to our scoped Chromium.
 ADD --checksum=sha256:8a48cf4110d7dc2c12c1c4d6d25e0babdfa31604b537f05df0dc835fe2f854bf https://registry.npmjs.org/agent-browser/-/agent-browser-0.26.0.tgz /tmp/agent-browser.tgz
@@ -38,12 +41,12 @@ COPY --from=engine /src/skills /opt/artex/skills
 COPY --from=engine /src/LICENSE /usr/share/licenses/artex/LICENSE
 COPY --from=engine /tmp/artex.tar.gz /usr/share/licenses/artex/corresponding-source.tar.gz
 COPY --from=engine /out/dependency-source.tar.gz /usr/share/licenses/artex/dependency-source.tar.gz
-COPY adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py baseline.py artex.py ares_web.py /patchriot/
+COPY scoped_scanners.py schema_cases.py coverage_ledger.py adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py baseline.py artex.py ares_web.py workflow.py report_finish.py /patchriot/
 COPY ares-LICENSE.txt /usr/share/licenses/ares/LICENSE
 COPY browser_access.py browser_wallet.js test_browser_access.py /patchriot/
 COPY templates /patchriot/templates
 USER 65534:65534
 WORKDIR /work
 ENV HOME=/opt/data HERMES_HOME=/opt/data/hermes PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/hermes TERMINAL_ENV=local TERMINAL_CWD=/work HERMES_API_TIMEOUT=540 NORMA_RIPGREP_NO_INSTALL=1
-LABEL io.patchriot.agent-adapter="15"
+LABEL io.patchriot.agent-adapter="21"
 ENTRYPOINT ["/opt/hermes/.venv/bin/python", "/patchriot/adapter.py"]

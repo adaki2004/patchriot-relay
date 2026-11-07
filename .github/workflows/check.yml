@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: adaki2004/patchriot-core
-          ref: 241bf483cb5cb76a068eed898ff952086acf89b3
+          ref: 423360f072406be33fbc6a47b77bda7289b1098d
           path: patchriot-core
           token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
           persist-credentials: false
@@ -69,10 +69,11 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: adaki2004/patchriot-core
-          ref: 241bf483cb5cb76a068eed898ff952086acf89b3
+          ref: 423360f072406be33fbc6a47b77bda7289b1098d
           path: patchriot-core
           token: ${{ secrets.PATCHRIOT_READ_TOKEN || secrets.READ_TOKEN || github.token }}
           persist-credentials: false
       - run: rustup toolchain install 1.94.1 --profile minimal
       - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: python3 scripts/check-audit-scope.py
       - run: cargo audit

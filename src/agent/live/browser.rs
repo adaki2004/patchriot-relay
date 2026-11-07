@@ -18,25 +18,32 @@ pub(super) struct BrowserState {
     bytes: usize,
     login_deadline: Option<Instant>,
     pub(super) proof: Option<BrowserAccessProof>,
+    // Learned only from a successful paired access check. Never sent to the
+    // engine or model; the relay injects it for this exact origin only.
+    pub(super) verified_authorization: Option<Zeroizing<String>>,
+    pub(super) verified_origin: Option<String>,
+    pub(super) password_login: Option<accounts::PasswordLogin>,
+    pub(super) password_login_attempted: bool,
+    pub(super) password_login_proof: Option<BrowserAccessProof>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BrowserRequest {
-    method: String,
-    url: String,
+pub(super) struct BrowserRequest {
+    pub(super) method: String,
+    pub(super) url: String,
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    pub(super) headers: BTreeMap<String, String>,
     #[serde(default)]
-    data: Option<String>,
+    pub(super) data: Option<String>,
     #[serde(default = "enabled")]
-    authenticated: bool,
+    pub(super) authenticated: bool,
     #[serde(default)]
-    login: bool,
+    pub(super) login: bool,
 }
-struct BrowserReply {
-    evidence: HttpEvidence,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(super) struct BrowserReply {
+    pub(super) evidence: HttpEvidence,
+    pub(super) headers: Vec<(String, String)>,
+    pub(super) body: Vec<u8>,
 }
 
 impl LiveBroker {
@@ -90,7 +97,7 @@ impl LiveBroker {
                     .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs());
                 // The agent needs to distinguish a spent login window from a
                 // broken website. Status never renews it or resets attempts.
-                let phase = if state.proof.is_some() {
+                let phase = if state.verified_origin.is_some() {
                     "verified"
                 } else if remaining.is_none() {
                     "not_started"
@@ -104,16 +111,18 @@ impl LiveBroker {
                 } else {
                     "active"
                 };
-                Ok(json!({"verified":state.proof.is_some(),"proof":state.proof,
+                Ok(
+                    json!({"verified":state.verified_origin.is_some(),"proof":state.proof,
                     "login":{"state":phase,"seconds_remaining":remaining,
                         "submissions_remaining":MAX_LOGIN_POSTS.saturating_sub(state.posts),
-                        "signatures_remaining":4_usize.saturating_sub(state.signatures)}}))
+                        "signatures_remaining":4_usize.saturating_sub(state.signatures)}}),
+                )
             }
             _ => Err("unsupported_browser_operation"),
         }
     }
 
-    async fn browser_exchange(
+    pub(super) async fn browser_exchange(
         &self,
         mut input: BrowserRequest,
     ) -> Result<BrowserReply, &'static str> {
@@ -203,6 +212,7 @@ impl LiveBroker {
         if !resource {
             self.probe_url(
                 &Probe {
+                    account_change: false,
                     method: input.method.clone(),
                     url: input.url.clone(),
                     headers: input
@@ -218,6 +228,9 @@ impl LiveBroker {
                 },
                 input.login,
             )?;
+            if let Some(data) = &input.data {
+                safety::remember_body_secrets(&self.access, data)?;
+            }
         }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
@@ -285,6 +298,11 @@ impl LiveBroker {
             }
         }
         let mut evidence = HttpEvidence {
+            account: if authenticated || input.login {
+                self.account
+            } else {
+                None
+            },
             id: 0,
             method: input.method,
             url: retained_url.to_string(),
@@ -306,9 +324,22 @@ impl LiveBroker {
         };
         let mut headers = Vec::new();
         let mut body = Vec::new();
+        let mut json_response = false;
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
             Ok(mut response) => {
+                json_response = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value
+                            .split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .ends_with("json")
+                    });
                 evidence.status = Some(response.status().as_u16());
                 // A browser receives raw response headers. If a new session
                 // secret cannot be tracked for redaction, do not deliver it to
@@ -387,13 +418,33 @@ impl LiveBroker {
         // Anonymous dependencies cannot establish a target session. Their
         // public catalogs may be much wider than a bounded login response.
         // Known secrets are still redacted from all retained evidence below.
-        if !resource
-            && let Ok(value) = serde_json::from_slice::<Value>(&body)
-            && let Err(error) = remember_tokens(&self.access, &value, 0)
+        if !resource {
+            let inspected = match serde_json::from_slice::<Value>(&body) {
+                Ok(value) => remember_tokens(&self.access, &value, 0),
+                Err(_) if json_response && !body.is_empty() => Err("uninspectable_json_response"),
+                Err(_) => Ok(()),
+            };
+            if let Err(error) = inspected {
+                evidence.error = Some(error.into());
+                body.clear();
+                headers.clear();
+            }
+        }
+        if input.login
+            && evidence.error.is_none()
+            && evidence.status.is_some_and(|s| (200..400).contains(&s))
+            && let Some(login) = accounts::PasswordLogin::learn(
+                &self.access,
+                &evidence.method,
+                &input.url,
+                &input.headers,
+                input.data.as_deref(),
+            )
         {
-            evidence.error = Some(error.into());
-            body.clear();
-            headers.clear();
+            self.browser
+                .lock()
+                .map_err(|_| "browser_unavailable")?
+                .password_login = Some(login);
         }
         if !input.login {
             if let Some(data) = input.data {
@@ -430,7 +481,7 @@ impl LiveBroker {
         })
     }
 
-    async fn browser_check(&self, input: Value) -> Result<Value, &'static str> {
+    pub(super) async fn browser_check(&self, input: Value) -> Result<Value, &'static str> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Check {
@@ -441,15 +492,27 @@ impl LiveBroker {
             json_pointer: Option<String>,
         }
         let input: Check = serde_json::from_value(input).map_err(|_| "invalid_access_check")?;
-        self.browser
-            .lock()
-            .map_err(|_| "browser_unavailable")?
-            .proof = None;
+        {
+            let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            // Keep earlier paired evidence for the final report, but revoke the
+            // live capability until this new check succeeds.
+            state.verified_authorization = None;
+            state.verified_origin = None;
+        }
         if input.json_pointer.as_ref().is_some_and(|p| {
             p.len() > 256 || !p.starts_with('/') || p.chars().any(char::is_control)
         }) {
             return Err("invalid_identity_pointer");
         }
+        let authorization = input
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| Zeroizing::new(value.clone()));
+        let verified_origin = url::Url::parse(&input.url)
+            .map_err(|_| "invalid_access_check")?
+            .origin()
+            .ascii_serialization();
         let signed = self
             .browser_exchange(BrowserRequest {
                 method: "GET".into(),
@@ -475,9 +538,7 @@ impl LiveBroker {
             anonymous_id: anonymous.evidence.id,
             check: BrowserAccessCheck::ProtectedResource,
         };
-        if !matches!(anonymous.evidence.status, Some(401 | 403))
-            && let Some(pointer) = input.json_pointer
-        {
+        if let Some(pointer) = input.json_pointer {
             let principal = if self.scope.authentication == Some(TestAuthKind::Wallet) {
                 self.browser
                     .lock()
@@ -520,10 +581,10 @@ impl LiveBroker {
             &[signed.evidence.clone(), anonymous.evidence.clone()],
         );
         if verified {
-            self.browser
-                .lock()
-                .map_err(|_| "browser_unavailable")?
-                .proof = Some(proof.clone());
+            let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            state.proof = Some(proof.clone());
+            state.verified_authorization = authorization;
+            state.verified_origin = Some(verified_origin);
         }
         Ok(
             json!({"verified":verified,"proof":if verified {Some(proof)} else {None},"authenticated_evidence_id":signed.evidence.id,"anonymous_evidence_id":anonymous.evidence.id,
@@ -590,7 +651,7 @@ impl LiveBroker {
     }
 }
 
-fn remember_tokens(
+pub(super) fn remember_tokens(
     access: &access::Access,
     value: &Value,
     depth: usize,
@@ -604,18 +665,7 @@ fn remember_tokens(
                 return Err("browser_json_too_wide");
             }
             for (key, value) in fields {
-                if [
-                    "token",
-                    "access_token",
-                    "accesstoken",
-                    "refresh_token",
-                    "refreshtoken",
-                    "id_token",
-                    "jwt",
-                    "secret",
-                    "password",
-                ]
-                .contains(&key.to_ascii_lowercase().as_str())
+                if safety::secret_field(key)
                     && let Some(secret) = value.as_str()
                     && !secret.is_empty()
                 {
@@ -766,6 +816,66 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn login_rejection_tracks_the_latest_credential_request_for_its_account() {
+        let broker = broker("session");
+        let mut evidence: HttpEvidence = serde_json::from_value(json!({
+            "id":1,"method":"POST","url":"https://owned.example/login",
+            "request_headers":{},"status":401,"headers":{},"body_excerpt":"",
+            "truncated":false,"error":null,"observed_at":1,"authenticated":false,"login":true
+        }))
+        .unwrap();
+        broker
+            .counters
+            .lock()
+            .unwrap()
+            .evidence
+            .push(evidence.clone());
+        assert!(broker.login_rejected());
+        evidence.id = 2;
+        evidence.status = Some(200);
+        broker
+            .counters
+            .lock()
+            .unwrap()
+            .evidence
+            .push(evidence.clone());
+        assert!(!broker.login_rejected());
+        evidence.id = 3;
+        evidence.status = Some(403);
+        evidence.account = Some(AccountSlot::Reference);
+        broker
+            .counters
+            .lock()
+            .unwrap()
+            .evidence
+            .push(evidence.clone());
+        assert!(!broker.login_rejected());
+        evidence.id = 4;
+        evidence.account = None;
+        evidence.login = false;
+        broker.counters.lock().unwrap().evidence.push(evidence);
+        assert!(!broker.login_rejected());
+    }
+
+    #[tokio::test]
+    async fn password_changes_are_blocked_even_when_labeled_as_browser_login() {
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        for login in [false, true] {
+            assert_eq!(broker.browser_call("/patchriot/browser/http", json!({
+                "method":"POST","url":"https://owned.example/api/auth/me/password",
+                "headers":{"Content-Type":"application/json"},
+                "data":r#"{"current_password":"only-synthetic-password","new_password":"fixture-change"}"#,
+                "login":login
+            })).await, Err("account_credential_changes_not_permitted"));
+        }
+        assert_eq!(broker.browser.lock().unwrap().requests, 0);
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
+    }
+
     #[tokio::test]
     async fn expired_login_is_visible_and_cannot_be_reopened_or_submit() {
         for kind in ["wallet", "session"] {
@@ -853,9 +963,14 @@ mod tests {
     }
 
     async fn target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        target_login("both").await
+    }
+
+    async fn target_login(session_kind: &'static str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
+            let mut changed_password: Option<String> = None;
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
@@ -881,16 +996,51 @@ mod tests {
                         }
                     }
                 };
-                let logged_in = head.contains("cookie: session=synthetic-session");
+                let reference_account =
+                    head.contains("authorization: Bearer synthetic-reference-token");
+                let logged_in = head.contains("cookie: session=synthetic-session")
+                    || head.contains("authorization: Bearer synthetic-browser-token")
+                    || head.contains("authorization: Bearer synthetic-new-login-token")
+                    || head.contains("cookie: session=synthetic-new-session")
+                    || reference_account;
                 let (status, cookie, body) = if head.starts_with("POST /different/session ") {
                     assert_eq!(
                         serde_json::from_str::<Value>(&body).unwrap(),
-                        json!({"login":"fixture@example.com","secret":"only-synthetic-password"})
+                        json!({"login":"fixture@example.com","secret":changed_password.as_deref().unwrap_or("only-synthetic-password")})
                     );
+                    if changed_password.is_some() {
+                        assert!(!head.contains("authorization:"));
+                        assert!(!head.contains("cookie:"));
+                    }
                     (
                         200,
-                        "Set-Cookie: session=synthetic-session; Path=/; Secure; HttpOnly\r\n",
-                        json!({"ok":true}).to_string(),
+                        if changed_password.is_some() && session_kind == "bearer" {
+                            ""
+                        } else if changed_password.is_some() {
+                            "Set-Cookie: session=synthetic-new-session; Path=/; Secure; HttpOnly\r\n"
+                        } else {
+                            "Set-Cookie: session=synthetic-session; Path=/; Secure; HttpOnly\r\n"
+                        },
+                        if session_kind == "cookie" {
+                            json!({"ok":true}).to_string()
+                        } else if session_kind == "bearer" {
+                            json!({"ok":true,"access_token":"synthetic-new-login-token"})
+                                .to_string()
+                        } else {
+                            json!({"ok":true,"access_token":"synthetic-new-login-token", "echo":"synthetic-new-session"}).to_string()
+                        },
+                    )
+                } else if head.starts_with("POST /api/auth/change-password ") {
+                    assert!(!reference_account);
+                    let change: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(change["current_password"], "only-synthetic-password");
+                    assert!(change["new_password"].as_str().unwrap().len() >= 32);
+                    assert!(!body.contains("PATCHRIOT_CURRENT_PASSWORD"));
+                    changed_password = change["new_password"].as_str().map(str::to_owned);
+                    (
+                        200,
+                        "",
+                        json!({"password":change["new_password"]}).to_string(),
                     )
                 } else if head.starts_with("GET /public ") {
                     (200, "", json!({"public":true}).to_string())
@@ -900,12 +1050,17 @@ mod tests {
                         "",
                         json!({"items":vec!["public-item"; 300]}).to_string(),
                     )
-                } else if head.starts_with("GET /identity ") {
+                } else if ["GET /identity ", "GET /identity-401 ", "GET /identity-403 "]
+                    .iter()
+                    .any(|path| head.starts_with(path))
+                {
                     (
-                        200,
+                        if !logged_in && head.starts_with("GET /identity-401 ") { 401 }
+                        else if !logged_in && head.starts_with("GET /identity-403 ") { 403 }
+                        else { 200 },
                         "",
                         if logged_in {
-                            json!({"account":{"email":"fixture@example.com"}})
+                            json!({"account":{"email":if reference_account {"reference@example.com"} else {"fixture@example.com"}}})
                         } else {
                             json!({"account":null})
                         }
@@ -923,7 +1078,12 @@ mod tests {
                         .into(),
                     )
                 };
-                stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                let content_type = if serde_json::from_str::<Value>(&body).is_ok() {
+                    "application/json"
+                } else {
+                    "text/plain"
+                };
+                stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
         });
         (address, task)
@@ -1152,6 +1312,315 @@ mod tests {
             !broker
                 .access
                 .authenticated(&public_url("https://owned.example/").unwrap(), true)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn two_accounts_isolate_access_and_require_explicit_verified_password_permission() {
+        for session_kind in ["both", "cookie", "bearer"] {
+            verify_password_session_fixture(session_kind).await;
+        }
+    }
+
+    async fn verify_password_session_fixture(session_kind: &'static str) {
+        let (address, server) = target_login(session_kind).await;
+        let scope: LiveScope = serde_json::from_value(json!({"origins":["https://owned.example"],
+            "methods":["GET","HEAD","OPTIONS","POST"], "profile":"web_active_v2",
+            "tools":["active_web_v2","artex_engine_v1","authenticated_http_v1","browser_login_v1","multi_account_v1"],
+            "authentication":"session","browser_login":{},"account_policy":{"allow_password_changes":true}})).unwrap();
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key.path(), "synthetic-fixture-provider-key").unwrap();
+        let credentials: TestCredentials =
+            serde_json::from_value(json!({"kind":"session_accounts",
+            "testing":{"username":"fixture@example.com","password":"only-synthetic-password"},
+            "reference":{"username":"reference@example.com","password":"reference-password"}}))
+            .unwrap();
+        let mut broker = LiveBroker::new_with_credentials(
+            LiveProvider::Abliteration,
+            key.path(),
+            scope.normalized().unwrap(),
+            Instant::now() + Duration::from_secs(60),
+            Some(&credentials),
+            None,
+        )
+        .unwrap();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.test_target = Some(address);
+        Arc::get_mut(inner.reference.as_mut().unwrap())
+            .unwrap()
+            .test_target = Some(address);
+        let reference = broker.reference.as_ref().unwrap();
+        assert_eq!(
+            broker.verify_changed_password().await.unwrap_err(),
+            "account_credential_changes_not_permitted"
+        );
+        broker
+            .browser_call("/patchriot/browser/begin", json!({}))
+            .await
+            .unwrap();
+        broker.browser_call("/patchriot/browser/http", json!({
+            "method":"POST","url":"https://owned.example/different/session",
+            "headers":{"content-type":"application/json"},"login":true,
+            "data":json!({"login":"fixture@example.com","secret":"only-synthetic-password"}).to_string()
+        })).await.unwrap();
+        assert!(broker.browser.lock().unwrap().password_login.is_some());
+        let change = json!({"method":"POST","url":"https://owned.example/api/auth/change-password",
+            "headers":{"content-type":"application/json"},"authenticated":true,
+            "data":json!({"current_password":"{{PATCHRIOT_CURRENT_PASSWORD}}","new_password":"{{PATCHRIOT_NEW_PASSWORD}}"}).to_string()});
+        assert_eq!(
+            broker.http(change.clone()).await.unwrap_err(),
+            "account_credential_changes_not_permitted"
+        );
+        for path in ["identity", "identity-401", "identity-403"] {
+            for (actor, token) in [
+                (&broker, "synthetic-browser-token"),
+                (reference, "synthetic-reference-token"),
+            ] {
+                let url = format!("https://owned.example/{path}");
+                let headers = json!({"authorization":format!("Bearer {token}")});
+                let invalid = actor
+                    .browser_call(
+                        "/patchriot/browser/check",
+                        json!({"url":url,"headers":headers,"json_pointer":"/account/missing"}),
+                    )
+                    .await;
+                assert_eq!(invalid.unwrap_err(), "authenticated_identity_missing");
+                assert!(!broker.password_change_permitted());
+                let proof = actor
+                    .browser_call(
+                        "/patchriot/browser/check",
+                        json!({"url":url,"headers":headers,"json_pointer":"/account/email"}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(proof["verified"], true);
+                assert_eq!(proof["proof"]["check"]["kind"], "account_identity");
+            }
+            assert!(broker.password_change_permitted(), "{path}");
+        }
+        let saved_reference_proof = reference.browser.lock().unwrap().proof.clone();
+        reference.browser.lock().unwrap().proof = broker.browser.lock().unwrap().proof.clone();
+        assert!(
+            !broker.password_change_permitted(),
+            "same identity cannot authorize account changes"
+        );
+        reference.browser.lock().unwrap().proof = saved_reference_proof;
+        assert!(!reference.password_change_permitted());
+        assert_eq!(
+            reference.http(change.clone()).await.unwrap_err(),
+            "account_credential_changes_not_permitted"
+        );
+        let mut reference_write = json!({"method":"POST","url":"https://owned.example/api/preferences",
+            "headers":{"content-type":"application/json"},"authenticated":true,
+            "data":json!({"display_name":"Synthetic fixture"}).to_string()});
+        let evidence_count = broker.counters.lock().unwrap().evidence.len();
+        assert_eq!(
+            reference.http(reference_write.clone()).await.unwrap_err(),
+            "protected_reference_read_only"
+        );
+        assert_eq!(
+            reference
+                .engine_http(reference_write.clone())
+                .await
+                .unwrap_err(),
+            "protected_reference_read_only"
+        );
+        assert_eq!(
+            reference
+                .browser_call("/patchriot/browser/http", reference_write.clone())
+                .await
+                .unwrap_err(),
+            "protected_reference_read_only"
+        );
+        assert_eq!(
+            broker.counters.lock().unwrap().evidence.len(),
+            evidence_count
+        );
+        let mut false_login = reference_write.clone();
+        false_login["login"] = json!(true);
+        assert_eq!(
+            reference
+                .browser_call("/patchriot/browser/http", false_login)
+                .await
+                .unwrap_err(),
+            "browser_login_submission_limit"
+        );
+        assert!(broker.http(reference_write.clone()).await.is_ok());
+        reference_write["authenticated"] = json!(false);
+        assert!(reference.http(reference_write).await.is_ok());
+        for method in ["GET", "POST"] {
+            let logout = json!({"method":method,"url":"https://owned.example/api/auth/logout","authenticated":true});
+            let count = broker.counters.lock().unwrap().evidence.len();
+            assert_eq!(
+                broker.http(logout.clone()).await.unwrap_err(),
+                "session_revocation_not_permitted"
+            );
+            assert_eq!(
+                broker.engine_http(logout.clone()).await.unwrap_err(),
+                "session_revocation_not_permitted"
+            );
+            assert_eq!(
+                broker
+                    .browser_call("/patchriot/browser/http", logout)
+                    .await
+                    .unwrap_err(),
+                "session_revocation_not_permitted"
+            );
+            assert_eq!(broker.counters.lock().unwrap().evidence.len(), count);
+        }
+        assert_eq!(reference.engine_http(json!({"method":"GET","url":"https://owned.example/sign-out","authenticated":true})).await.unwrap_err(), "session_revocation_not_permitted");
+        assert!(broker.http(json!({"method":"POST","url":"https://owned.example/api/auth/logout","authenticated":false})).await.is_ok());
+        let result = broker.http(change.clone()).await.unwrap();
+        assert_eq!(result["evidence"]["status"], 200);
+        assert_eq!(result["evidence"]["account"], "testing");
+        assert_eq!(
+            broker.password_change_control()["accepted_evidence_id"],
+            result["evidence"]["id"]
+        );
+        let new_password = broker.access.current_browser_password().unwrap();
+        assert_ne!(new_password.as_str(), "only-synthetic-password");
+        assert!(!result.to_string().contains(new_password.as_str()));
+        assert_eq!(
+            reference
+                .access
+                .current_browser_password()
+                .unwrap()
+                .as_str(),
+            "reference-password"
+        );
+        assert_eq!(
+            broker.http(change).await.unwrap_err(),
+            "password_change_already_attempted"
+        );
+        let old_authorization = broker
+            .browser
+            .lock()
+            .unwrap()
+            .verified_authorization
+            .clone();
+        let old_cookie = broker
+            .access
+            .cookies(&public_url("https://owned.example/").unwrap(), true);
+        assert_eq!(
+            reference.verify_changed_password().await.unwrap_err(),
+            "account_credential_changes_not_permitted"
+        );
+        let observed_login = broker.browser.lock().unwrap().password_login.take();
+        assert_eq!(
+            broker.verify_changed_password().await.unwrap_err(),
+            "password_login_replay_unavailable"
+        );
+        broker.browser.lock().unwrap().password_login = observed_login;
+        let (first, second) = tokio::join!(
+            broker.verify_changed_password(),
+            broker.verify_changed_password()
+        );
+        let result = first.unwrap();
+        assert_eq!(second.unwrap_err(), "password_login_already_attempted");
+        assert_eq!(result["evidence"]["status"], 200);
+        assert_ne!(result["evidence"]["authenticated"], true);
+        assert_eq!(result["password_login_control"]["account"], "testing");
+        assert_eq!(result["password_login_control"]["verified"], true);
+        assert!(broker.password_change_control()["fresh_session_proof"].is_object());
+        assert_eq!(
+            broker.password_change_control()["login_control_evidence_id"],
+            result["evidence"]["id"]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(result["body"].as_str().unwrap()).unwrap()["ok"],
+            true
+        );
+        assert!(!result.to_string().contains(new_password.as_str()));
+        assert!(!result.to_string().contains("synthetic-new-login-token"));
+        assert!(!result.to_string().contains("synthetic-new-session"));
+        assert_eq!(
+            broker.browser.lock().unwrap().verified_authorization,
+            old_authorization
+        );
+        assert_eq!(
+            broker
+                .access
+                .cookies(&public_url("https://owned.example/").unwrap(), true),
+            old_cookie
+        );
+        let result = reference
+            .engine_http(
+                json!({"method":"GET","url":"https://owned.example/identity","authenticated":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["evidence"]["status"], 200);
+        assert_eq!(result["evidence"]["account"], "reference");
+        assert!(Arc::ptr_eq(&broker.counters, &reference.counters));
+        assert_eq!(
+            broker
+                .access
+                .redact("reference-password synthetic-reference-token"),
+            "REDACTED REDACTED"
+        );
+        Arc::get_mut(&mut broker)
+            .unwrap()
+            .scope
+            .account_policy
+            .as_mut()
+            .unwrap()
+            .allow_password_changes = false;
+        assert!(
+            !broker.password_change_permitted(),
+            "verified accounts still require explicit permission"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn engine_access_uses_verified_bearer_without_leaking_into_anonymous_controls() {
+        let (address, server) = target().await;
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.test_target = Some(address);
+        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        assert!(broker.verified_access().is_none());
+        let signed =
+            json!({"method":"GET","url":"https://owned.example/private","authenticated":true});
+        assert_eq!(
+            broker.engine_http(signed.clone()).await.unwrap_err(),
+            "authenticated_access_not_verified"
+        );
+        let verified = broker.browser_call("/patchriot/browser/check", json!({"url":"https://owned.example/private","headers":{"authorization":"Bearer synthetic-browser-token"}})).await.unwrap();
+        assert_eq!(verified["verified"], true);
+        assert_eq!(
+            broker.verified_access().as_deref(),
+            Some("https://owned.example/private")
+        );
+        let reply = broker.engine_http(signed.clone()).await.unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        assert_eq!(reply["evidence"]["authenticated"], true);
+        assert!(!reply.to_string().contains("synthetic-browser-token"));
+        let anonymous = broker
+            .engine_http(
+                json!({"method":"GET","url":"https://owned.example/private","authenticated":false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous["evidence"]["status"], 401);
+        assert_ne!(anonymous["evidence"]["authenticated"], true);
+        assert_eq!(broker.engine_http(json!({"method":"GET","url":"https://other.example/private","authenticated":true})).await.unwrap_err(), "authenticated_origin_mismatch");
+        broker
+            .browser_call(
+                "/patchriot/browser/check",
+                json!({"url":"https://owned.example/public"}),
+            )
+            .await
+            .unwrap();
+        assert!(broker.verified_access().is_none());
+        assert!(
+            broker.browser.lock().unwrap().proof.is_some(),
+            "earlier paired evidence remains reportable"
+        );
+        assert_eq!(
+            broker.engine_http(signed).await.unwrap_err(),
+            "authenticated_access_not_verified"
         );
         server.abort();
     }

@@ -1,7 +1,7 @@
 """Pinned web checks. Every target request crosses the relay's scope broker.
 
 Nuclei sees a loopback mirror of one approved HTTPS origin. Its container has no
-external network, and only our three installed templates are selected. Scanner
+external network, and only our six installed templates are selected. Scanner
 matches are leads; controls and another role must assess their actual impact.
 """
 import hashlib
@@ -154,6 +154,10 @@ def crawl(origin, deadline, fetch=request):
                 forms.extend(parser.forms[:20])
             except (ValueError, RecursionError):
                 pass
+        if "javascript" in content or urlsplit(url).path.endswith(('.js', '.mjs')):
+            # Static literals only. Target JavaScript is never executed here.
+            routes = re.findall(r"""(?:fetch|axios\.(?:get|post|put|patch|delete))\(\s*['"](/[^'"\s\\]{1,200})['"]""", body)
+            queue.extend(origin + path for path in routes[:8] if allowed(origin, origin + path))
         if url.endswith("robots.txt"):
             for line in body.splitlines()[:100]:
                 if line.lower().startswith(("allow:", "disallow:")):
@@ -161,7 +165,7 @@ def crawl(origin, deadline, fetch=request):
                     if path.startswith("/") and "*" not in path and "$" not in path:
                         queue.append(origin + path)
     output = json.dumps({"pages": pages, "forms_observed_not_submitted": forms[:20], "remaining_links": len(queue),
-                         "limitations": ["Static links only; no JavaScript execution, account login or form submission."]})
+                         "limitations": ["Static links and literal client API routes only; no JavaScript execution, account login or form submission."]})
     failure = "request_error" if any(p["error"] for p in pages) else ("timeout" if queue and time.monotonic() >= deadline else None)
     return record("patchriot-crawl", VERSION, [origin, "--max-pages", str(MAX_PAGES)], started, observed, refs, output,
                   1 if failure else 0, failure)
@@ -231,13 +235,22 @@ class ScopeMirror:
                     payload = reply.get("body", "").encode() if status else b"relay request unavailable"
                     self.send_response(status or 502)
                     for name, value in evidence.get("headers", {}).items():
-                        if name.lower() not in ("connection", "content-length", "transfer-encoding", "content-encoding") and "\r" not in value and "\n" not in value:
+                        if not name.lower().startswith("x-patchriot-") and name.lower() not in ("connection", "content-length", "transfer-encoding", "content-encoding") and "\r" not in value and "\n" not in value:
                             if name.lower() == "location":
                                 destination = urljoin(origin + self.path, value)
                                 if allowed(origin, destination):
                                     parsed = urlsplit(destination)
                                     value = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
                             self.send_header(name, value)
+                    # These are local transport facts, not target headers.
+                    # A body cap must not look like the target served a short
+                    # but complete file, or a denied probe like a target 502.
+                    self.send_header("X-Patchriot-Body-Truncated", "true" if reply.get("body_truncated") else "false")
+                    error = reply.get("error") or evidence.get("error")
+                    if isinstance(error, str) and re.fullmatch(r"[a-z0-9_]{1,80}", error):
+                        self.send_header("X-Patchriot-Relay-Error", error)
+                    if type(evidence.get("id")) is int and evidence['id'] > 0:
+                        self.send_header("X-Patchriot-Evidence-Id", str(evidence['id']))
                     self.send_header("Content-Length", str(len(payload)))
                     self.send_header("Connection", "close")
                     self.end_headers()
@@ -318,35 +331,47 @@ def fetch_checked_request(method, url, **kwargs):
     return fetch_checked(request, method, url, **kwargs)
 
 
-def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator"):
+def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="investigator", workflow=None, review_policy=None):
     from live_review import discovery_plan
-    deadline = time.monotonic() + 180
-    plan = discovery_plan(role, scope, previous)
+    from workflow import public_scope
+    from functools import partial
+    plan = discovery_plan(role, scope, previous, review_policy)
     selected = {p['tool'] for p in plan if p['action'] in ('run', 'recover')}
+    public = public_scope(scope)
+    # A supplied account must not change public probes or their authentication.
+    anonymous = partial(request, authenticated=False)
+    def public_fetch(method, url, headers=None, **kwargs):
+        kwargs['authenticated'] = False
+        return fetch_checked(request, method, url, headers, **kwargs)
     records = []
-    if 'patchriot-baseline' in selected:
-        import baseline
-        initial = baseline.run(scope, deadline, fetch_checked_request, record)
-        records.append(initial)
-        emit(initial)
-    for origin in scope["origins"]:
-        checks = []
-        if 'ares-web-surface' in selected:
-            import ares_web
-            checks.append(lambda: ares_web.run(origin, deadline))
-        if 'patchriot-crawl' in selected:
-            checks.append(lambda: crawl(origin, deadline))
-        if 'nuclei' in selected:
-            checks.append(lambda: scanner(origin, deadline))
-        checks.append(lambda: controls(origin, deadline, previous, auth_check_path=scope.get("auth_check_path") if scope.get("authentication") else None))
-        for check in checks:
-            if time.monotonic() >= deadline:
-                break
-            result = check()
+    import baseline
+    import ares_web
+    # Each family gets its own bounded window. A slow crawl cannot silently
+    # consume the signatures/fingerprints window, in either assessment mode.
+    for tool in ('patchriot-baseline', 'patchriot-crawl', 'nuclei', 'ares-web-surface'):
+        if tool not in selected:
+            continue
+        if workflow:
+            workflow.begin(tool)
+        deadline = time.monotonic() + 45
+        family = []
+        if tool == 'patchriot-baseline':
+            family.append(baseline.run(public, deadline, public_fetch, record))
+        else:
+            check = {'patchriot-crawl': crawl, 'nuclei': scanner, 'ares-web-surface': ares_web.run}[tool]
+            for origin in public['origins']:
+                family.append(check(origin, deadline, fetch=anonymous))
+        for result in family:
             records.append(result)
             emit(result)
+        if workflow:
+            workflow.finish(tool, family)
+    for origin in public['origins']:
+        result = controls(origin, time.monotonic() + 15, previous, fetch=anonymous)
+        records.append(result)
+        emit(result)
     result = {"profile": PROFILE, "role": role, "tool_runs": records, "discovery_plan": plan,
-              "limitations": ["Only three curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
+              "limitations": ["Six curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
                               "The scanner receives selected headers and decoded text through the broker; use recorded target requests as the source of evidence.",
                               "Scanner host/IP and curl snippets describe a loopback mirror, not the target's IP, TLS or exact upstream headers.",
                               "All matches are hypotheses until controls and review establish impact."]}

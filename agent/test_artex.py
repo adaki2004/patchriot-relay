@@ -24,6 +24,110 @@ SCOPE = {'origins': ['https://owned.example'], 'objective': 'Owned fixture only'
 
 
 class EngineTests(unittest.TestCase):
+    def test_two_accounts_share_one_engine_with_distinct_authenticated_mirrors(self):
+        from urllib.request import urlopen
+        for missing in (None, 'testing', 'reference'):
+            starts, calls = [], []
+            def request(method, url, headers=None, authenticated=False, account=None, **kwargs):
+                calls.append((authenticated, account))
+                return {'evidence': {'id': len(calls), 'status': 200}, 'body': account or 'public'}
+            class FakeEngine:
+                def __init__(self, *_): starts.append(1)
+                def __enter__(self): return self
+                def __exit__(self, *_): pass
+                def assess(self, scope, targets, role, **kwargs):
+                    urlopen(targets[0] + '/private').read()
+                    self.assertions = scope['_authenticated_targets']
+                    for label, target in self.assertions.items():
+                        if missing and f'({missing} account)' in label: continue
+                        urlopen(target + '/private').read()
+                    return {'coverage_complete': True, 'stop_reason': 'done', 'findings': []}
+            with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine), patch('live_http.request', request):
+                scope = dict(SCOPE, authentication='session', account_policy={'allow_password_changes': False})
+                receipt = artex.run(scope, 'investigator', time.monotonic() + 10, Path(folder),
+                    access={'accounts': [{'account': account, 'verified': True,
+                        'protected_url': 'https://owned.example/private'} for account in ('testing', 'reference')]})
+                result = json.loads((Path(folder) / 'artex-results.json').read_text())
+            self.assertEqual(starts, [1])
+            self.assertEqual(calls[0], (False, None))
+            expected = [(True, account) for account in ('testing', 'reference') if account != missing]
+            self.assertCountEqual(calls[1:], expected)
+            self.assertEqual(result['coverage_complete'], missing is None)
+            self.assertEqual(len(result['authenticated_target_mapping']), 2)
+            self.assertEqual(len(receipt['evidence_ids']), len(calls))
+
+    def test_combined_investigation_uses_one_engine_and_two_isolated_contexts(self):
+        from urllib.request import urlopen
+        for use_private in (True, False):
+            starts, calls = [], []
+            def fetch(authenticated):
+                def request(method, url, headers=None, **kwargs):
+                    calls.append((authenticated, url))
+                    return {'evidence': {'id': len(calls), 'status': 200 if authenticated else 401},
+                            'body': 'private fixture' if authenticated else 'denied'}
+                return request
+            class FakeEngine:
+                def __init__(self, *_): starts.append(1)
+                def __enter__(self): return self
+                def __exit__(self, *_): pass
+                def assess(self, scope, targets, role, **kwargs):
+                    for target in targets:
+                        try: urlopen(target + '/private').read()
+                        except urllib.error.HTTPError: pass
+                    if use_private:
+                        for target in scope['_authenticated_targets'].values():
+                            urlopen(target + '/private').read()
+                    return {'coverage_complete': True, 'stop_reason': 'done', 'findings': []}
+            with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine):
+                scope = dict(SCOPE, authentication='session')
+                receipt = artex.run(scope, 'investigator', time.monotonic() + 10, Path(folder),
+                    fetch=fetch(False), authenticated_fetch=fetch(True),
+                    access={'verified': True, 'protected_url': 'https://owned.example/private'})
+                result = json.loads((Path(folder) / 'artex-results.json').read_text())
+            self.assertEqual(starts, [1])
+            self.assertEqual(result['access_mode'], 'anonymous_and_authenticated')
+            self.assertEqual(result['anonymous_evidence_count'], 1)
+            self.assertEqual(result['authenticated_evidence_count'], int(use_private))
+            self.assertEqual(result['coverage_complete'], use_private)
+            self.assertEqual(receipt['evidence_ids'], [1, 2] if use_private else [1])
+            self.assertEqual(calls[0], (False, 'https://owned.example/private'))
+            if use_private:
+                self.assertEqual(calls[1], (True, 'https://owned.example/private'))
+
+    def test_unverified_grey_access_is_not_described_as_a_missing_account(self):
+        scope = dict(SCOPE, _authentication_requested=True)
+        body = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')
+        self.assertIn('A small burst cannot prove that a limit is absent', body['goal'])
+        self.assertIn('An account was declared', body['goal'])
+        self.assertIn('missing authenticated coverage', body['goal'])
+        self.assertNotIn('no supplied account', body['goal'])
+
+    def test_password_change_guidance_distinguishes_consent_from_verified_permission(self):
+        scope = dict(SCOPE, account_policy={'allow_password_changes': True})
+        blocked = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')['goal']
+        self.assertIn('requester allowed a testing-account password change', blocked)
+        self.assertIn('missing identity proof', blocked)
+        self.assertNotIn('{{PATCHRIOT_NEW_PASSWORD}}', blocked)
+        scope['_password_change_permitted'] = True
+        permitted = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')['goal']
+        self.assertIn('one self-service password-change attempt', permitted)
+        self.assertIn('Authenticated logout and session-revocation routes are blocked', permitted)
+        self.assertIn('{{PATCHRIOT_NEW_PASSWORD}}', permitted)
+        self.assertIn('VERIFY_CHANGED_PASSWORD once', permitted)
+        self.assertIn('Only evidence.headers contains headers actually observed', permitted)
+        self.assertNotIn('Supplied accounts and existing records are not disposable.', permitted)
+        self.assertIn('Never initiate or confirm password recovery', permitted)
+
+    def test_planner_gets_numeric_budget_finish_reserve_and_neutral_identity(self):
+        body = artex.task_body(SCOPE, ['http://127.0.0.1:1234'], 1800, 'investigator',
+                               {'engine_http_remaining': 1457, 'engine_model_calls_remaining': 400})
+        self.assertIn('1457', body['goal'])
+        self.assertIn('1800 seconds', body['goal'])
+        self.assertIn('final 10 percent', body['goal'])
+        self.assertIn('security-test@example.com', body['goal'])
+        self.assertIn('at most one successful test per endpoint', body['goal'])
+        self.assertNotIn('artex.test@', body['goal'])
+
     def test_oversized_engine_details_leave_a_complete_handoff_and_exact_local_file(self):
         details = {'engine': 'ARTEX', 'commit': artex.VERSION,
                    'stop_reason': 'time_budget', 'coverage_complete': False,
@@ -106,12 +210,12 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(result['coverage_complete'])
 
     def test_watchdog_ignores_heartbeats_preserves_leads_and_yields_to_completion(self):
-        # A fake clock exercises the five-minute wait without sleeping. A new
-        # observation at minute four extends it; task heartbeats alone do not.
+        # A fake clock exercises the fifteen-minute wait without sleeping. A new
+        # observation at minute fourteen extends it; task heartbeats alone do not.
         for progress_at, completed_at, expected_time, expected_reason in [
-            (None, None, 300, 'no_target_progress'),
-            (240, None, 540, 'no_target_progress'),
-            (None, 300, 300, 'completed'),
+            (None, None, 900, 'no_engine_progress'),
+            (840, None, 1740, 'no_engine_progress'),
+            (None, 900, 900, 'completed'),
         ]:
             with self.subTest(progress_at=progress_at, completed_at=completed_at), tempfile.TemporaryDirectory() as temp:
                 clock, calls = [0.0], []
@@ -127,7 +231,7 @@ class EngineTests(unittest.TestCase):
                         return {}
                 def tick(_seconds): clock[0] += 60
                 engine = object.__new__(artex.Engine)
-                engine.client, engine.deadline, engine.profile_id = FakeClient(), 900, 1
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 2700, 1
                 engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
                 (engine.directory / 'process.log').write_text('')
                 with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
@@ -138,6 +242,134 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(result['coverage_complete'], completed_at is not None)
                 self.assertEqual(result['findings'], [{'title': 'Owned fixture lead', 'verified': False}])
                 self.assertEqual(('/api/tasks/7/control', {'action':'pause'}) in calls, completed_at is None)
+
+    def test_offline_analysis_extends_watchdog_but_repeats_and_errors_do_not(self):
+        for mode, expected_time, reason in [('analysis', 2100, 'done'),
+                                            ('repeated', 1140, 'no_engine_progress'),
+                                            ('error', 900, 'no_engine_progress')]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                clock = [0.0]
+                class FakeClient:
+                    def call(self, path, body=None):
+                        if path == '/api/tasks': return {'id': 7}
+                        if path == '/api/tasks/7':
+                            return {'status': 'done' if clock[0] >= 2100 else 'running'}
+                        if path.startswith('/api/commands'):
+                            batch = int(clock[0] // 240) if mode == 'analysis' else 1
+                            return {'commands': [] if clock[0] < 240 else [{
+                                'id': clock[0], 'tool': 'Bash', 'command': 'inspect saved application files',
+                                'output': 'analysis of file ' + str(batch), 'is_error': mode == 'error'}]}
+                        return {}
+                def tick(_seconds): clock[0] += 30
+                engine = object.__new__(artex.Engine)
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 2700, 1
+                engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
+                (engine.directory / 'process.log').write_text('')
+                with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
+                    result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator')
+                self.assertEqual(clock[0], expected_time)
+                self.assertEqual(result['stop_reason'], reason)
+                self.assertEqual(result['distinct_target_observations'], 0)
+                self.assertEqual(result['seconds_without_target_progress'], expected_time)
+                self.assertEqual(result['coverage_complete'], mode == 'analysis')
+        self.assertEqual(artex.command_observations({'commands': None}), set())
+
+    def test_upstream_can_settle_before_hard_cutoff_without_upgrading_timeout(self):
+        for terminal in ['done', 'timeout', None]:
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as temp:
+                clock, calls, timeout = [0.0], [], []
+                class FakeClient:
+                    def call(self, path, body=None):
+                        calls.append((path, body))
+                        if path == '/api/tasks':
+                            timeout.append(body['timeout_seconds'])
+                            # Delayed startup plus a two-minute settlement pass.
+                            clock[0] += 45
+                            return {'id': 7}
+                        if path == '/api/tasks/7':
+                            settled = clock[0] >= 45 + timeout[0] + 120
+                            return {'status': terminal if terminal and settled else 'running'}
+                        return {}
+                def tick(_seconds): clock[0] += 15
+                engine = object.__new__(artex.Engine)
+                engine.client, engine.deadline, engine.profile_id = FakeClient(), 1800, 1
+                engine.directory, engine.process = Path(temp), SimpleNamespace(poll=lambda: None)
+                (engine.directory / 'process.log').write_text('')
+                with patch.object(artex.time, 'monotonic', lambda: clock[0]), patch.object(artex.time, 'sleep', tick):
+                    result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator',
+                                           progress=lambda: int(clock[0]))
+                self.assertEqual(timeout, [1500])
+                self.assertEqual(engine.deadline, 1800)
+                self.assertEqual(result['stop_reason'], terminal or 'time_budget')
+                self.assertEqual(result['coverage_complete'], terminal == 'done')
+                self.assertEqual(clock[0], 1665 if terminal else 1800)
+                self.assertEqual(('/api/tasks/7/control', {'action': 'pause'}) in calls, terminal is None)
+
+    def test_late_collection_failure_preserves_outcome_and_other_findings(self):
+        for failed in ['commands', 'findings', 'outcome', 'facts']:
+            with self.subTest(failed=failed):
+                class FakeClient:
+                    def call(self, path, body=None):
+                        if path == '/api/tasks':
+                            return {'id': 7}
+                        if path == '/api/tasks/7':
+                            return {'status': 'done'}
+                        if failed in path or failed == 'facts' and 'kind=fact' in path:
+                            raise ValueError('engine API response exceeds limit')
+                        return {'saved': path}
+                engine = object.__new__(artex.Engine)
+                engine.client = FakeClient()
+                engine.deadline = time.monotonic() + 600
+                engine.profile_id = 1
+                result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator')
+                self.assertEqual(result['stop_reason'], 'done')
+                self.assertEqual(result['collection_errors'], [failed])
+                self.assertEqual(result['coverage_complete'], failed in ('commands', 'facts'))
+                for key in ['commands', 'findings', 'outcome', 'facts']:
+                    self.assertEqual('saved' in result[key], key != failed)
+                summary = json.loads(artex.receipt_summary(result, json.dumps(result)))
+                self.assertEqual(summary['collection_errors'], [failed])
+
+    def test_fact_handoff_preserves_negative_controls_and_account_attempts(self):
+        import live_review
+        result = {'facts': {'total': 1, 'items': [{'id': '16', 'state': 'confirmed',
+            'payload': json.dumps({'summary': 'Password change accepted, fresh login unavailable',
+                                   'detail': 'Full retained explanation'})}]},
+            'password_change_control': {'attempted': True, 'accepted_evidence_id': 20,
+                                        'login_control_evidence_id': 21}}
+        encoded = artex.receipt_summary(result, json.dumps(result))
+        coverage = live_review.engine_coverage([{'tool': 'artex-engine', 'output_excerpt': encoded}])[0]
+        self.assertEqual(coverage['password_change_control'], result['password_change_control'])
+        self.assertIn('Password change accepted', coverage['facts_preview']['items'][0]['summary'])
+        self.assertTrue(coverage['facts_preview']['summarized'])
+
+    def test_engine_usage_comes_from_broker_counter_differences(self):
+        class FakeEngine:
+            def __init__(self, *_args): pass
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def assess(self, *_args, **_kwargs):
+                return {'engine': 'ARTEX', 'commit': artex.VERSION,
+                        'coverage_complete': True, 'stop_reason': 'done'}
+        before = {'http_remaining': 9000, 'model_calls_remaining': 2100,
+                  'remaining_cost_allowance_microusd': 29000000}
+        after = {'http_remaining': 8700, 'model_calls_remaining': 2010,
+                 'remaining_cost_allowance_microusd': 27900000}
+        for final in [after, {}, {**after, 'model_calls_remaining': 2200}]:
+            with self.subTest(final=final), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(artex, 'Engine', FakeEngine), \
+                    patch('report_finish.bridge', side_effect=[before.copy(), final.copy()]):
+                receipt = artex.run(SCOPE, 'investigator', time.monotonic()+600, Path(temp))
+                summary = json.loads(receipt['output_excerpt'])
+                saved = json.loads((Path(temp)/'artex-results.json').read_text())
+                if final == after:
+                    expected = {'http_requests': 300, 'inference_calls': 90,
+                                'cost_upper_microusd': 1100000}
+                    self.assertEqual(summary['usage'], expected)
+                    self.assertEqual(saved['usage'], expected)
+                else:
+                    self.assertNotIn('usage', summary)
+                    self.assertNotIn('usage', saved)
 
     def test_engine_http_uses_the_discovery_route_and_other_probes_keep_their_route(self):
         import live_http

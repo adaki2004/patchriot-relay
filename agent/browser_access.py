@@ -110,8 +110,11 @@ def configure_hermes_browser(scope):
 
 
 class BrowserAccess:
-    def __init__(self, scope, bridge, *, directory='/work', executable='/usr/bin/chromium'):
+    def __init__(self, scope, bridge, *, directory='/work', executable='/usr/bin/chromium', account='testing'):
         self.scope, self.bridge = scope, bridge
+        self.account_slot = account
+        if account not in ("testing", "reference") or account == "reference" and not scope.get("account_policy"):
+            raise ValueError("Account context is not configured")
         self.origin = scope['origins'][0]
         self.resources = set(scope.get('browser_login', {}).get('resource_origins', []))
         self.pending = {}
@@ -138,16 +141,18 @@ class BrowserAccess:
         self.directory, self.executable = Path(directory), executable
 
     async def call(self, path, data):
-        return await asyncio.to_thread(rpc, self.bridge, '/patchriot/browser/' + path, data)
+        prefix = '/patchriot/accounts/reference/browser/' if self.account_slot == 'reference' else '/patchriot/browser/'
+        return await asyncio.to_thread(rpc, self.bridge, prefix + path, data)
 
     async def start(self):
         from playwright.async_api import async_playwright
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.playwright = await async_playwright().start()
         # Playwright otherwise disables Chromium's sandbox. The container is
         # unprivileged, has no direct egress and supplies the reviewed seccomp file.
         self.context = await self.playwright.chromium.launch_persistent_context(
             str(self.directory / 'browser-profile'), executable_path=self.executable, headless=True,
-            chromium_sandbox=True, service_workers='block', accept_downloads=False,
+            chromium_sandbox=True, timeout=60000, service_workers='block', accept_downloads=False,
             args=['--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
                   '--disable-background-networking', '--disable-component-update',
                   '--disable-sync', '--disable-extensions', '--disable-quic',
@@ -444,6 +449,7 @@ class BrowserAccess:
 
 def cli():
     parser = argparse.ArgumentParser(description='Private account filling and login proof for the approved browser')
+    parser.add_argument('--account', choices=['testing', 'reference'])
     parser.add_argument('command',choices=['status','wait','begin','fill','approve','reject','check','legacy'])
     parser.add_argument('--username', help='CSS selector for username/email input; never enter credentials here')
     parser.add_argument('--password', help='CSS selector for password input; never enter credentials here')
@@ -451,7 +457,9 @@ def cli():
     parser.add_argument('--url', help='Actual protected GET resource or account API observed in the browser')
     parser.add_argument('--json-pointer', help='JSON pointer to supplied username or test wallet address in an account response')
     args = vars(parser.parse_args())
-    settings = json.loads(Path('/work/browser-access.json').read_text())
+    from live_http import default_account
+    selected = args.pop('account') or default_account()
+    settings = json.loads(Path('/work/reference-browser/browser-access.json' if selected == 'reference' else '/work/browser-access.json').read_text())
     req = urllib.request.Request(settings['url']+'/',data=json.dumps(args).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+settings['secret']})
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req,timeout=150 if args['command']=='wait' else 60) as response: print(response.read().decode())
@@ -464,12 +472,13 @@ if __name__ == '__main__': cli()
 
 class BrowserRunner:
     """Own the browser event loop while Hermes runs its synchronous agent loop."""
-    def __init__(self, scope, bridge):
+    def __init__(self, scope, bridge, account="testing"):
         import threading
+        self.account_slot = account
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, name='patchriot-browser', daemon=True)
         self.thread.start()
-        self.browser = BrowserAccess(scope, bridge)
+        self.browser = BrowserAccess(scope, bridge, account=account, directory="/work/reference-browser" if account == "reference" else "/work")
         try:
             self.cdp = asyncio.run_coroutine_threadsafe(self.browser.start(), self.loop).result(timeout=60)
             configure_hermes_browser(scope)
@@ -483,3 +492,45 @@ class BrowserRunner:
         finally:
             self.loop.call_soon_threadsafe(self.loop.stop)
             self.thread.join(timeout=5)
+
+
+class BrowserAccounts:
+    """One isolated Chromium profile and broker session per supplied identity."""
+    def __init__(self, scope, bridge):
+        self.runners = {}
+        try:
+            self.runners['testing'] = BrowserRunner(scope, bridge)
+            if scope.get('account_policy') is not None:
+                self.runners['reference'] = BrowserRunner(scope, bridge, 'reference')
+            self.activate('testing')
+        except Exception:
+            self.close()
+            raise
+
+    def activate(self, account):
+        self.cdp = self.runners[account].cdp
+        os.environ['BROWSER_CDP_URL'] = self.cdp
+        # The browser-exec daemon reads its CDP endpoint only at startup.
+        # Separate socket and scratch directories keep both default and named
+        # daemons attached to the selected account across repeated switches.
+        runtime = Path('/work') / ('browser-' + account)
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        os.environ['BH_RUNTIME_DIR'] = str(runtime)
+        os.environ['BH_RUNTIME_DIR_SHARED'] = '1'
+        os.environ['BH_TMP_DIR'] = str(runtime / 'tmp')
+        os.environ['BH_TMP_DIR_SHARED'] = '1'
+        Path('/work/default-account.json').write_text(json.dumps(account))
+
+    def close(self):
+        runners, self.runners = self.runners, {}
+        failure = None
+        try:
+            for runner in runners.values():
+                try:
+                    runner.close()
+                except Exception as error:
+                    failure = failure or error
+        finally:
+            Path('/work/default-account.json').unlink(missing_ok=True)
+        if failure:
+            raise failure

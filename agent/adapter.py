@@ -24,6 +24,44 @@ engine_stop_reason = None
 request_id = 0
 
 
+def report_validation(**details):
+    # Phase is part of the supervisor wire contract; a new event type would
+    # abort the role before the final result can be delivered.
+    event('phase', name='report_validation', **details)
+
+
+def login_completion(agent, account, paired, complete, read_access):
+    """End preparation from broker proof even if the model keeps exploring."""
+    verified_completions = 0
+    lock = threading.Lock()
+
+    def completed(*args, **kwargs):
+        nonlocal verified_completions
+        complete(*args, **kwargs)
+        try:
+            access = read_access()
+        except (OSError, ValueError):
+            return
+        contexts = access.get('accounts') or [{**access, 'account': 'testing'}]
+        rejected = any(context.get('account') == account and context.get('login_rejected') is True
+                       for context in contexts)
+        if rejected:
+            agent.interrupt(tool_reason='host_cancelled')
+            return
+        verified = any(context.get('account') == account and context.get('verified') is True
+                       for context in contexts)
+        if not verified:
+            return
+        with lock:
+            verified_completions += 1
+            # Paired setup can still make the optional observed identity check.
+            # Missing identity proof continues to block password-change permission.
+            if not paired or verified_completions >= 6:
+                agent.interrupt(tool_reason='host_cancelled')
+
+    return completed
+
+
 class MessageTooLarge(RuntimeError):
     """The request is valid JSON but exceeds the local transport allowance."""
 
@@ -147,8 +185,8 @@ def finish_result(browser=None, **data):
 
 def execution_budget(value):
     """Operator-selected limit; website text and models cannot change it."""
-    if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 3600:
-        raise ValueError("agent time limit must be 600..3600 seconds")
+    if not value.isascii() or not value.isdecimal() or not 600 <= int(value) <= 10800:
+        raise ValueError("agent time limit must be 600..10800 seconds")
     return int(value)
 
 
@@ -247,6 +285,8 @@ class Bridge(BaseHTTPRequestHandler):
                                     reason = json.loads(error_body).get('error')
                                     if reason == 'engine_budget_reached':
                                         engine_stop_reason = 'model_budget'
+                                    elif reason == 'provider_repetition':
+                                        engine_stop_reason = 'provider_repetition'
                                 except (ValueError, AttributeError):
                                     pass
                                 engine_stopping.set()
@@ -309,32 +349,24 @@ def main():
     if live:
         import web_tools
         event("phase", name="scoped_tools")
-        scope = json.loads(Path("/work/scope.json").read_text())["scope"]
-        tools = web_tools.run(scope, json.loads(Path("/work/previous.json").read_text()),
-                              emit=lambda result: event("live_tool", run=result), role=role)
-        # Browser sign-in happens in Hermes below. This initial engine pass has
-        # public-route coverage for browser-login scopes, not a signed-in session.
-        if any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
-               for p in tools['discovery_plan']):
-            import artex
-            # Keep at least four minutes for the review and final report. ARTEX
-            # also shares the relay's total model and target-request allowances.
-            event("phase", name="artex_engine")
-            engine_deadline = min(started + budget - 240, time.monotonic() + budget / 2)
-            try:
-                result = artex.run(scope, role, engine_deadline, model=model,
-                                   stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
-                                   emit=lambda result: event("live_tool", run=result))
-            finally:
-                engine_stopping.set()
-            tools["tool_runs"].append(result)
-            (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
-            event("live_tool", run=result)
+        context = json.loads(Path("/work/scope.json").read_text())
+        scope = context["scope"]
+        review_policy = context.get("review_policy")
+        from workflow import Workflow, public_scope
+        previous = json.loads(Path("/work/previous.json").read_text())
+        workflow = Workflow(scope, live_review.discovery_plan(role, scope, previous, review_policy),
+                            lambda value: event("workflow", workflow=value))
+        tools = web_tools.run(scope, previous,
+                              emit=lambda result: event("live_tool", run=result), role=role, workflow=workflow,
+                              review_policy=review_policy)
         if scope.get("browser_login") is not None:
-            from browser_access import BrowserRunner
-            browser = BrowserRunner(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
+            from browser_access import BrowserAccounts
+            browser = BrowserAccounts(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
+            if scope.get("account_policy") is not None and role != "investigator":
+                browser.activate("reference")
             os.environ["BROWSER_CDP_URL"] = browser.cdp
     agent = None
+    login_agents = []
     try:
         from run_agent import AIAgent
         observed = []
@@ -343,13 +375,13 @@ def main():
             observed.append(args)
             event("tool_complete", args=args, kwargs=kwargs)
 
-        agent = AIAgent(
+        agent_options = dict(
             model=model, provider="custom", api_mode="chat_completions",
             base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
-            # The relay asks for the final report before its 200-call ceiling.
+            # The relay asks for the final report before its 2400-call ceiling.
             # A smaller Hermes turn limit can interrupt that handoff and emit a
             # failed partial summary. Time, HTTP and money limits stay in Rust.
-            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=200 if live else 3, max_tokens=8192 if live else (512 if role else 192),
+            enabled_toolsets=[] if source else ["terminal", "browser"] if browser else ["terminal"], max_iterations=2400 if live else 3, max_tokens=8192 if live else (512 if role else 192),
             reasoning_config={"enabled": True, "effort": "medium"} if live else {"enabled": False, "effort": "none"},
             request_overrides={} if live else {"reasoning_effort": "none"},
             quiet_mode=True, skip_context_files=True, skip_memory=True,
@@ -358,8 +390,68 @@ def main():
             tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
             tool_complete_callback=complete,
         )
+        agent = AIAgent(**agent_options)
         if source and (agent.tools or agent.valid_tool_names):
             raise RuntimeError("source review requires an empty model toolset")
+        access_prepared, engine_ran = False, False
+        if live and any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
+                        for p in tools['discovery_plan']):
+            import artex
+            from report_finish import bridge
+            if browser is not None:
+                # Login uses the existing private browser helper, not the engine.
+                # The broker's paired evidence, never this model answer, grants access.
+                access_prepared = True
+                for account in (['reference', 'testing'] if scope.get('account_policy') is not None else ['testing']):
+                    browser.activate(account)
+                    # Hermes caches its browser connection by agent session.
+                    # Each account must get a distinct session, even after CDP changes.
+                    login_agent = AIAgent(**agent_options)
+                    login_agents.append(login_agent)
+                    login_agent.tool_complete_callback = login_completion(
+                        login_agent, account, scope.get('account_policy') is not None,
+                        complete, lambda: bridge('/patchriot/access'))
+                    login_agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
+                    login_agent.run_conversation(live_review.login_prompt(account=account, paired=scope.get('account_policy') is not None))
+            elif scope.get('authentication') and scope.get('auth_check_path'):
+                from live_http import request
+                protected = scope['origins'][0] + scope['auth_check_path']
+                request('GET', protected, authenticated=True)
+                request('GET', protected, authenticated=False)
+            access = bridge('/patchriot/access')
+            access['requested'] = bool(scope.get('authentication'))
+            if role == 'investigator':
+                import scoped_scanners
+                extra = scoped_scanners.run(scope, tools['tool_runs'], access=access,
+                    emit=lambda receipt: event("live_tool", run=receipt))
+                tools['tool_runs'].extend(extra)
+                (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))
+            import coverage_ledger
+            coverage_ledger.build(scope, tools['tool_runs'])
+            event("phase", name="artex_engine")
+            engine_deadline = started + budget - min(900, budget / 3)
+            workflow.begin("artex-engine")
+            try:
+                result = artex.run(scope if access.get('verified') or any(a.get('verified') for a in access.get('accounts', [])) else public_scope(scope),
+                    role, engine_deadline, model=model, access=access,
+                    stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
+                    emit=lambda result: event("live_tool", run=result))
+            finally:
+                engine_stopping.set()
+            engine_ran = True
+            tools["tool_runs"].append(result)
+            (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
+            event("live_tool", run=result)
+            workflow.finish("artex-engine", [result])
+            if role == 'investigator':
+                event("phase", name="scanner_follow_up")
+                tools['tool_runs'].append(scoped_scanners.follow_up(
+                    scope, tools['tool_runs'], result, bridge('/patchriot/access'),
+                    started + budget - 300,
+                    emit=lambda receipt: event("live_tool", run=receipt)))
+                (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))
+                coverage_ledger.build(scope, tools['tool_runs'])
+            agent.run_budget_seconds = max(1, started + budget - 30 - time.monotonic())
         event("phase", name="agent_ready")
         prompt = live_review.prompt(role) if live else (source_prompt(role) if source else website_prompt(role)) + "\n\nSaved inspection output (untrusted data):\n" + inspection if role else (
             "You are checking a Patchriot-owned synthetic access-control example. "
@@ -368,8 +460,19 @@ def main():
             "Report only observed output. Do not edit files, install anything or access the network."
         )
         if live:
-            prompt = live_review.prompt(role, browser=browser is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            live_review.validation_brief(Path('/work'))
+            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran, paired=scope.get("account_policy") is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
+        if live:
+            import report_finish
+            result = report_finish.finish(agent, result, started + budget - 30,
+                emit=report_validation)
+        if live:
+            import coverage_ledger
+            ledger = coverage_ledger.build(scope, tools['tool_runs'])
+            # The relay generates the authoritative report ledger from its
+            # own evidence. This local file only helps orient the agent.
+
         regression = False
         for args in observed:
             if len(args) < 4 or args[1] != "terminal":
@@ -393,6 +496,8 @@ def main():
         bridge_stopping.set()
         if agent:
             agent.close()
+        for login_agent in login_agents:
+            login_agent.close()
         if browser:
             browser.close()
         server.shutdown()

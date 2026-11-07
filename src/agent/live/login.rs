@@ -45,6 +45,7 @@ impl LiveBroker {
             let reply = self
                 .exchange(
                     Probe {
+                        account_change: false,
                         method: "GET".into(),
                         url: page.to_string(),
                         headers: BTreeMap::new(),
@@ -97,6 +98,7 @@ impl LiveBroker {
         let reply = self
             .exchange(
                 Probe {
+                    account_change: false,
                     method: "POST".into(),
                     url: submit.to_string(),
                     headers: [

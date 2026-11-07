@@ -1,0 +1,19 @@
+id: patchriot-prometheus-metrics-observation
+info:
+  name: Public operational metrics
+  author: patchriot
+  severity: info
+  description: Recorded surface observation. Establish sensitivity, intended access and a missing-path control before reporting a vulnerability.
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/metrics"
+    redirects: false
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '(?m)^# (HELP|TYPE) [a-zA-Z_:][a-zA-Z0-9_:]* '

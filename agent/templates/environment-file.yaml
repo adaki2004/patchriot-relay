@@ -1,0 +1,19 @@
+id: patchriot-environment-file-observation
+info:
+  name: Environment configuration exposure
+  author: patchriot
+  severity: info
+  description: Recorded surface observation. Establish sensitivity, intended access and a missing-path control before reporting a vulnerability.
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.env"
+    redirects: false
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '(?m)^(DATABASE_URL|DB_PASSWORD|SECRET_KEY|AWS_SECRET_ACCESS_KEY)\s*=\s*[^\r\n]+'

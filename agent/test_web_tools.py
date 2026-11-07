@@ -17,6 +17,64 @@ import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_crawl_discovers_literal_client_routes_without_executing_scripts(self):
+        calls = []
+        def fetch(method, url, headers=None, **kwargs):
+            calls.append(url)
+            body = '<script src="/app.js"></script>' if url.endswith('/') else "fetch('/api/items'); fetch('https://other.example/private')" if url.endswith('/app.js') else '{}'
+            content = 'text/javascript' if url.endswith('.js') else 'text/html' if url.endswith('/') else 'application/json'
+            return {'evidence': {'id': len(calls), 'status': 200, 'headers': {'content-type': content}}, 'body': body}
+        tools.crawl('https://owned.example', time.monotonic() + 5, fetch)
+        self.assertIn('https://owned.example/api/items', calls)
+        self.assertTrue(all(url.startswith('https://owned.example/') for url in calls))
+
+    def test_password_control_uses_private_replay_and_retains_evidence(self):
+        reply = {'evidence': {'id': 42, 'status': 200}, 'body': '{"ok":true}'}
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.dict('os.environ', {'PATCHRIOT_BRIDGE_URL': 'http://127.0.0.1:1234'}), \
+                patch.object(live_http, 'default_account', return_value='testing'), \
+                patch.object(live_http, 'EVIDENCE_DIRECTORY', Path(folder)), \
+                patch.object(live_http, 'urlopen', return_value=io.BytesIO(json.dumps(reply).encode())) as upstream:
+            result = live_http.verify_changed_password()
+            request = upstream.call_args.args[0]
+            self.assertEqual(request.full_url, 'http://127.0.0.1:1234/patchriot/password/verify')
+            self.assertEqual(request.data, b'{}')
+            self.assertEqual(json.loads((Path(folder) / '42.json').read_text()), reply['evidence'])
+            self.assertEqual(result['evidence']['id'], 42)
+        with patch.object(live_http, 'default_account', return_value='reference'), \
+                patch.object(live_http, 'urlopen') as upstream:
+            with self.assertRaises(ValueError):
+                live_http.verify_changed_password()
+            upstream.assert_not_called()
+
+    def test_mirror_distinguishes_partial_bodies_and_broker_denials_from_target_responses(self):
+        def fixture(method, url, headers, **kwargs):
+            if url.endswith('/blocked'):
+                return {'error':'account_credential_changes_not_permitted'}
+            return {'body':'partial script', 'body_truncated':True,
+                    'evidence':{'id':7,'status':200,'truncated':True,'headers':{
+                        'content-type':'application/javascript',
+                        'x-patchriot-body-truncated':'false',
+                        'x-patchriot-relay-error':'spoofed_target_header'}}}
+        with tools.ScopeMirror('https://owned.example', time.monotonic()+5, fixture) as mirror:
+            client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+            client.request('GET', '/app.js')
+            response = client.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b'partial script')
+            self.assertEqual(response.getheaders().count(('X-Patchriot-Body-Truncated','true')), 1)
+            self.assertEqual(response.getheader('X-Patchriot-Body-Truncated'), 'true')
+            self.assertEqual(response.getheader('X-Patchriot-Evidence-Id'), '7')
+            self.assertIsNone(response.getheader('X-Patchriot-Relay-Error'))
+            client.close()
+            client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+            client.request('GET', '/blocked')
+            response = client.getresponse(); response.read(); client.close()
+            self.assertEqual(response.status, 502)
+            self.assertEqual(response.getheader('X-Patchriot-Relay-Error'), 'account_credential_changes_not_permitted')
+            self.assertIsNone(response.getheader('X-Patchriot-Evidence-Id'))
+            self.assertEqual(mirror.refs, [7])
+
     def test_new_evidence_ids_and_repeated_replies_do_not_fake_target_progress(self):
         calls = []
         def fixture(method, url, headers, **kwargs):
@@ -172,8 +230,8 @@ class WebToolsTests(unittest.TestCase):
 
     def test_followups_do_not_repeat_scanners_or_lose_fresh_control_evidence(self):
         scope = {'origins': ['https://owned.example'], 'methods': ['GET', 'HEAD', 'OPTIONS']}
-        previous = [{'role':'investigator', 'tool_runs':[
-            {'tool':name, 'exit_code':0, 'failure':None}
+        previous = [{'role':'investigator', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None, 'evidence_ids':[1]}
             for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}]
         for role in ['investigator', 'reproducer', 'challenger']:
             with tempfile.TemporaryDirectory() as temp, patch('baseline.run', return_value={'tool': 'baseline'}) as baseline, \

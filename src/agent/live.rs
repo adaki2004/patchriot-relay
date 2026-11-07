@@ -5,10 +5,13 @@ use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunSta
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
+mod accounts;
 mod browser;
 mod login;
 mod near;
 mod routing;
+mod safety;
+mod usage;
 mod wallet;
 
 #[cfg(test)]
@@ -18,12 +21,12 @@ pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
 const ENGINE_HTTP: &str = "/patchriot/artex/http";
 pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
-// addition to the byte limit without cutting a valid 200-call role in half.
-const MAX_MODEL_MESSAGES: usize = 1024;
-// Live pilot calls normally returned within a minute. Bound the whole reply,
-// including NEAR verification, so one provider cannot hold the worker for three
-// minutes before the consented backup gets a turn. No unverified reply is used.
-const MODEL_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
+// addition to the byte limit without cutting the expanded role allowance in half.
+const MAX_MODEL_MESSAGES: usize = 16384;
+// Long reasoning calls can exceed ninety seconds. Bound the whole reply,
+// including NEAR verification, while allowing three minutes within the existing
+// role deadline and spend cap. No unverified reply is used.
+const MODEL_REPLY_TIMEOUT: Duration = Duration::from_secs(180);
 
 async fn await_model_reply<T>(
     operation: impl std::future::Future<Output = Result<T, &'static str>>,
@@ -56,6 +59,7 @@ pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool 
                 | "provider_rate_limited"
                 | "provider_unavailable"
                 | "provider_stream_interrupted"
+                | "provider_repetition"
                 | "near_verification_timeout"
                 | "model_history_limit"
                 | "model_messages_empty"
@@ -67,8 +71,8 @@ pub(super) fn recoverable_engine_error(request: &Request, reason: &str) -> bool 
 }
 // Generous pilot ceilings. Stop investigation early enough to save a report;
 // increasing time/calls must not let the engine spend the reviewer's reserve.
-const MAX_SPEND: u64 = 10_000_000;
-const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS / 2;
+const MAX_SPEND: u64 = 30_000_000;
+const ENGINE_CALL_LIMIT: u16 = MAX_LIVE_INFERENCE_CALLS - 200;
 const FINAL_REPORT_CALL: u16 = MAX_LIVE_INFERENCE_CALLS - 12;
 // A verified primary call and its consented backup can each wait minutes.
 // Leave time for that route, context compression, report formatting and cleanup.
@@ -80,9 +84,22 @@ const HTTP_EVIDENCE_BUDGET: usize = MAX_RESULT_BYTES - 1024 * 1024;
 const HTTP_RECORD_RESERVE: usize = 256 * 1024;
 // Discovery must leave room for browser login and the reviewer's own probes.
 // These are shares of the existing role limits, not additional allowances.
-const ENGINE_HTTP_LIMIT: usize = MAX_HTTP_REQUESTS / 2;
-const ENGINE_EVIDENCE_LIMIT: usize = HTTP_EVIDENCE_BUDGET / 2;
+const ENGINE_HTTP_LIMIT: usize = MAX_HTTP_REQUESTS - 500;
+const ENGINE_EVIDENCE_LIMIT: usize = HTTP_EVIDENCE_BUDGET - 2 * 1024 * 1024;
 pub type Progress = Mutex<LiveProgress>;
+
+/// Generated form data identifies an authorized test, not the internal engine.
+/// Reject before sending rather than changing a probe behind the report's back.
+fn engine_branded_data(body: &Value) -> bool {
+    let Some(data) = body.get("data").and_then(Value::as_str) else {
+        return false;
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(data) {
+        return value.to_string().to_ascii_lowercase().contains("artex");
+    }
+    url::form_urlencoded::parse(data.as_bytes())
+        .any(|(_, value)| value.to_ascii_lowercase().contains("artex"))
+}
 
 fn assessment_format() -> Value {
     let text = |max| json!({"type":"string","minLength":1,"maxLength":max});
@@ -164,7 +181,8 @@ impl Task {
             )
             .as_deref()
                 != Some(self.evidence.context.provider.as_str())
-            || self.evidence.context.reviewers.len() != 3
+            || self.evidence.context.reviewers.len()
+                != self.evidence.context.review_policy.team_size()
             || self.evidence.previous_reports.len() > 2
         {
             return Err("invalid live assignment".into());
@@ -181,6 +199,8 @@ impl Task {
 }
 #[derive(Default)]
 struct Counters {
+    inference_usage: Vec<InferenceUsage>,
+    report_only: bool,
     reserved: u64,
     calls: u16,
     evidence: Vec<HttpEvidence>,
@@ -191,6 +211,8 @@ struct Counters {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Probe {
+    #[serde(skip)]
+    account_change: bool,
     method: String,
     url: String,
     #[serde(default)]
@@ -241,7 +263,13 @@ pub struct LiveBroker {
     scope: LiveScope,
     deadline: Instant,
     final_report_reserve: Duration,
-    counters: Mutex<Counters>,
+    counters: Arc<Mutex<Counters>>,
+    account: Option<AccountSlot>,
+    reference: Option<Arc<LiveBroker>>,
+    password_change_attempted: std::sync::atomic::AtomicBool,
+    password_change_evidence: std::sync::atomic::AtomicU32,
+    password_login_evidence: std::sync::atomic::AtomicU32,
+    workflow: Mutex<Option<AssessmentWorkflow>>,
     access: access::Access,
     login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
     browser: Mutex<browser::BrowserState>,
@@ -249,6 +277,20 @@ pub struct LiveBroker {
     test_target: Option<SocketAddr>,
 }
 impl LiveBroker {
+    pub(super) fn accept_workflow(&self, data: &Value) -> bool {
+        let Ok(workflow) = serde_json::from_value::<AssessmentWorkflow>(data.clone()) else {
+            return false;
+        };
+        if !workflow.valid() {
+            return false;
+        }
+        if let Ok(mut saved) = self.workflow.lock() {
+            *saved = Some(workflow);
+            true
+        } else {
+            false
+        }
+    }
     pub(super) fn valid_tool_record(&self, data: &Value) -> bool {
         serde_json::from_value::<LiveToolRun>(data.clone()).is_ok_and(|run| {
             self.counters
@@ -264,7 +306,41 @@ impl LiveBroker {
         model_request: Option<LiveModelProgress>,
     ) {
         if let (Ok(count), Ok(mut current)) = (self.counters.lock(), progress.lock()) {
+            let mut workflow = self.workflow.lock().ok().and_then(|w| w.clone());
+            if let Some(workflow) = &mut workflow {
+                if self.scope.authentication.is_some() {
+                    let proof = self
+                        .browser
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.proof.clone())
+                        .or_else(|| {
+                            self.reference
+                                .as_ref()
+                                .and_then(|b| b.browser.lock().ok()?.proof.clone())
+                        });
+                    workflow.checks[5].state = if proof.is_some() {
+                        CheckState::Recorded
+                    } else if count.evidence.iter().any(|e| e.login || e.authenticated) {
+                        CheckState::Running
+                    } else {
+                        CheckState::Pending
+                    };
+                    workflow.checks[5].evidence_count = if proof.is_some() { 2 } else { 0 };
+                    if count.evidence.iter().any(|e| {
+                        e.authenticated
+                            && !e.login
+                            && proof.as_ref().is_none_or(|p| p.authenticated_id != e.id)
+                    }) {
+                        workflow.checks[6].state = CheckState::Running;
+                    }
+                }
+                if phase == LivePhase::Finishing {
+                    workflow.checks[7].state = CheckState::Running;
+                }
+            }
             *current = LiveProgress {
+                workflow,
                 phase,
                 http_requests: count.evidence.len() as u16,
                 inference_calls: count.calls,
@@ -296,6 +372,60 @@ impl LiveBroker {
         credentials: Option<&TestCredentials>,
         fallback: Option<(LiveProvider, &Path)>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        if scope.account_policy.is_some()
+            != matches!(credentials, Some(TestCredentials::SessionAccounts { .. }))
+        {
+            return Err("account_policy_credentials_mismatch".into());
+        }
+        Self::new_account_broker(provider, key_file, scope, deadline, credentials, fallback)
+    }
+    fn new_account_broker(
+        provider: LiveProvider,
+        key_file: &Path,
+        scope: LiveScope,
+        deadline: Instant,
+        credentials: Option<&TestCredentials>,
+        fallback: Option<(LiveProvider, &Path)>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        if let Some(TestCredentials::SessionAccounts { testing, reference }) = credentials {
+            if !credentials.unwrap().valid_for(&scope) {
+                return Err("invalid_test_credentials".into());
+            }
+            let first_credentials = TestCredentials::Session {
+                username: testing.username.clone(),
+                password: testing.password.clone(),
+            };
+            let second_credentials = TestCredentials::Session {
+                username: reference.username.clone(),
+                password: reference.password.clone(),
+            };
+            let mut first = Self::new_account_broker(
+                provider,
+                key_file,
+                scope.clone(),
+                deadline,
+                Some(&first_credentials),
+                fallback,
+            )?;
+            let mut second = Self::new_account_broker(
+                provider,
+                key_file,
+                scope,
+                deadline,
+                Some(&second_credentials),
+                fallback,
+            )?;
+            let first_inner = Arc::get_mut(&mut first).expect("new account broker");
+            let second_inner = Arc::get_mut(&mut second).expect("new reference broker");
+            first_inner.account = Some(AccountSlot::Testing);
+            second_inner.account = Some(AccountSlot::Reference);
+            second_inner.counters = first_inner.counters.clone();
+            first_inner
+                .access
+                .share_redactions(&mut second_inner.access);
+            first_inner.reference = Some(second);
+            return Ok(first);
+        }
         let key = read_provider_key(key_file)?;
         if fallback.is_some_and(|(secondary, _)| !provider.permits_secondary(secondary)) {
             return Err("unsupported primary and secondary model pair".into());
@@ -331,7 +461,13 @@ impl LiveBroker {
             deadline,
             final_report_reserve: (deadline.saturating_duration_since(Instant::now()) / 3)
                 .min(Duration::from_secs(FINAL_REPORT_SECONDS)),
-            counters: Mutex::new(Counters::default()),
+            counters: Arc::new(Mutex::new(Counters::default())),
+            account: None,
+            reference: None,
+            password_change_attempted: std::sync::atomic::AtomicBool::new(false),
+            password_change_evidence: std::sync::atomic::AtomicU32::new(0),
+            password_login_evidence: std::sync::atomic::AtomicU32::new(0),
+            workflow: Mutex::new(None),
             access,
             login_state: tokio::sync::Mutex::new(None),
             browser: Mutex::new(browser::BrowserState::default()),
@@ -513,6 +649,16 @@ impl LiveBroker {
                     .await
                     .map_err(|_| "agent_disconnected")?;
             }
+            usage::observe_bytes(
+                &mut self
+                    .counters
+                    .lock()
+                    .map_err(|_| "counter_unavailable")?
+                    .inference_usage,
+                self.provider,
+                &bytes,
+                stream,
+            );
             if let Some(cost) = reported_cost(&bytes, stream, self.provider) {
                 let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
                 count.reserved = count
@@ -580,6 +726,16 @@ impl LiveBroker {
                     .map_err(|_| "agent_disconnected")?;
             }
         }
+        usage::observe_bytes(
+            &mut self
+                .counters
+                .lock()
+                .map_err(|_| "counter_unavailable")?
+                .inference_usage,
+            self.provider,
+            &usage_bytes,
+            body["stream"] == true,
+        );
         if let Some(cost) = reported_cost(&usage_bytes, body["stream"] == true, self.provider) {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
             count.reserved = count
@@ -614,7 +770,8 @@ impl LiveBroker {
             8192,
         )
         .ok_or("provider_budget_reached")?;
-        if count.calls >= FINAL_REPORT_CALL
+        if count.report_only
+            || count.calls >= FINAL_REPORT_CALL
             || count.evidence.len() >= MAX_HTTP_REQUESTS
             || count.evidence_bytes + HTTP_RECORD_RESERVE > HTTP_EVIDENCE_BUDGET
             || self.deadline.saturating_duration_since(Instant::now()) <= self.final_report_reserve
@@ -634,23 +791,41 @@ impl LiveBroker {
             ) {
                 body["response_format"] = assessment_format();
             }
-            body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report because a request, evidence, time or model allowance is exhausted or nearly spent. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
+            body["messages"].as_array_mut().ok_or("invalid_model_messages")?.push(json!({"role":"user","content":"The relay is reserving the remaining time and inference allowance for your final report because a request, evidence, time or model allowance is exhausted or nearly spent. Tools are now closed for this role. Return the required JSON assessment now using only evidence already collected. Every finding MUST include a nonempty evidence_ids array of exact current-role HTTP IDs. Never omit this field, invent IDs or use prior-role IDs. If you cannot support a claim, move it to limitations. Required shape: {\"summary\":\"...\",\"findings\":[{\"title\":\"...\",\"severity\":\"info\",\"support\":\"needs_review\",\"explanation\":\"...\",\"reproduction\":\"...\",\"suggested_action\":\"...\",\"evidence_ids\":[1]}],\"limitations\":[]}. Use your actual IDs, never the example ID. Explicitly list unfinished checks and uncertainty. Do not request another tool or claim an unperformed test."}));
         }
         Ok(())
     }
 
     async fn http(&self, body: Value) -> Result<Value, &'static str> {
-        let probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
+        let mut probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
+        let replacement = self.prepare_password_change(&mut probe)?;
         self.probe_url(&probe, false)?;
         if probe.authenticated {
             self.ensure_session().await?;
         }
-        self.exchange(probe, false).await
+        let reply = self.exchange(probe, false).await?;
+        if let Some(password) = replacement
+            && reply["evidence"]["status"]
+                .as_u64()
+                .is_some_and(|s| (200..300).contains(&s))
+        {
+            self.password_change_evidence.store(
+                reply["evidence"]["id"]
+                    .as_u64()
+                    .expect("recorded HTTP evidence") as u32,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.access.replace_browser_password(password)?;
+        }
+        Ok(reply)
     }
 
-    async fn engine_http(&self, body: Value) -> Result<Value, &'static str> {
+    async fn engine_http(&self, mut body: Value) -> Result<Value, &'static str> {
         if !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1) {
             return Err("engine_not_selected");
+        }
+        if engine_branded_data(&body) {
+            return Err("use_authorized_security_test_data_instead_of_engine_branding");
         }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
@@ -660,7 +835,83 @@ impl LiveBroker {
                 return Err("engine_http_budget_reached");
             }
         }
+        // Anonymous is the default. A separately labelled authenticated mirror
+        // may opt in only after the broker has verified paired access evidence.
+        let authenticated = body.get("authenticated") == Some(&json!(true));
+        if authenticated {
+            let protected = self
+                .verified_access()
+                .ok_or("authenticated_access_not_verified")?;
+            let target = public_url(body["url"].as_str().ok_or("invalid_probe")?)?;
+            if target.origin() != public_url(&protected)?.origin() {
+                return Err("authenticated_origin_mismatch");
+            }
+        }
+        body.as_object_mut()
+            .ok_or("invalid_probe")?
+            .insert("authenticated".into(), json!(authenticated));
         self.http(body).await
+    }
+
+    fn login_rejected(&self) -> bool {
+        self.counters.lock().ok().is_some_and(|count| {
+            count
+                .evidence
+                .iter()
+                .rev()
+                .find(|item| item.login && item.method == "POST" && item.account == self.account)
+                .is_some_and(|item| matches!(item.status, Some(401 | 403)))
+        })
+    }
+
+    fn verified_access(&self) -> Option<String> {
+        self.scope.authentication?;
+        let state = self.browser.lock().ok()?;
+        if self.scope.browser_login.is_some() && state.verified_origin.is_none() {
+            return None;
+        }
+        let proof = state.proof.clone();
+        drop(state);
+        let count = self.counters.lock().ok()?;
+        let url =
+            if self.scope.browser_login.is_some() {
+                let proof = proof?;
+                if !proof.valid(&self.scope, &count.evidence) {
+                    return None;
+                }
+                count
+                    .evidence
+                    .iter()
+                    .find(|e| e.id == proof.authenticated_id)?
+                    .url
+                    .clone()
+            } else {
+                let url = format!(
+                    "{}{}",
+                    self.scope.origins.first()?,
+                    self.scope.auth_check_path.as_ref()?
+                );
+                if !count.evidence.iter().any(|e| {
+                    e.url == url
+                        && e.method == "GET"
+                        && e.authenticated
+                        && e.error.is_none()
+                        && e.status.is_some_and(|s| (200..300).contains(&s))
+                }) || !count.evidence.iter().any(|e| {
+                    e.url == url && e.method == "GET" && self.scope.denies_anonymous_access(e)
+                }) {
+                    return None;
+                }
+                url
+            };
+        drop(count);
+        let parsed = public_url(&url).ok()?;
+        let browser = self.browser.lock().ok()?;
+        (self.access.authenticated(&parsed, true)
+            || (browser.verified_authorization.is_some()
+                && browser.verified_origin.as_deref()
+                    == Some(parsed.origin().ascii_serialization().as_str())))
+        .then_some(url)
     }
 
     fn probe_url(&self, probe: &Probe, login: bool) -> Result<url::Url, &'static str> {
@@ -671,6 +922,13 @@ impl LiveBroker {
         } else {
             self.scope.permits(&probe.method, &probe.url)?
         };
+        if self.account == Some(AccountSlot::Reference)
+            && probe.authenticated
+            && !login
+            && !matches!(probe.method.as_str(), "GET" | "HEAD" | "OPTIONS")
+        {
+            return Err("protected_reference_read_only");
+        }
         if let Some(data) = &probe.data {
             let content = probe
                 .headers
@@ -718,11 +976,22 @@ impl LiveBroker {
         {
             return Err("unsupported_probe_headers");
         }
+        if probe.authenticated {
+            safety::check_session_preservation(&url)?;
+        }
+        if !probe.account_change {
+            safety::check_account_write(&url, &probe.method, probe.data.as_deref())?;
+        } else if login || !probe.authenticated || !self.password_change_permitted() {
+            return Err("account_credential_changes_not_permitted");
+        }
         Ok(url)
     }
 
     async fn exchange(&self, probe: Probe, login: bool) -> Result<Value, &'static str> {
         let url = self.probe_url(&probe, login)?;
+        if let Some(data) = &probe.data {
+            safety::remember_body_secrets(&self.access, data)?;
+        }
         if Instant::now() >= self.deadline {
             return Err("role_deadline_reached");
         }
@@ -746,10 +1015,27 @@ impl LiveBroker {
         for (key, value) in &probe.headers {
             request = request.header(key, value);
         }
+        let browser_authorization = if !login && probe.authenticated {
+            let state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            if state.proof.is_some()
+                && state.verified_origin.as_deref()
+                    == Some(url.origin().ascii_serialization().as_str())
+            {
+                state.verified_authorization.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let authenticated = !login
             && self.scope.authentication.is_some()
-            && self.access.authenticated(&url, probe.authenticated);
+            && (self.access.authenticated(&url, probe.authenticated)
+                || browser_authorization.is_some());
         request = self.access.apply(request, &url, probe.authenticated);
+        if let Some(value) = browser_authorization {
+            request = request.header("authorization", value.as_str());
+        }
         if let Some(data) = &probe.data {
             request = request.body(data.clone());
         }
@@ -760,6 +1046,11 @@ impl LiveBroker {
             probe.data.as_ref().map(|v| self.access.redact(v))
         };
         let mut evidence = HttpEvidence {
+            account: if authenticated || login {
+                self.account
+            } else {
+                None
+            },
             request_body_excerpt: retained_body
                 .as_ref()
                 .map(|v| v.chars().take(2048).collect()),
@@ -793,8 +1084,39 @@ impl LiveBroker {
         match response {
             Err(_) => evidence.error = Some("target_request_failed".into()),
             Ok(mut response) => {
+                let json_response = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value
+                            .split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .ends_with("json")
+                    });
                 self.access
                     .remember(&url, response.headers(), probe.authenticated);
+                // Fresh anonymous login controls can receive cookies without
+                // installing them. Register those secrets before exposing any
+                // response text, including bodies that echo a cookie value.
+                let cookie_secrets = response
+                    .headers()
+                    .get_all(reqwest::header::SET_COOKIE)
+                    .iter()
+                    .try_for_each(|header| {
+                        let value = header
+                            .to_str()
+                            .map_err(|_| "uninspectable_cookie_response")?;
+                        if let Some((_, secret)) =
+                            value.split(';').next().unwrap_or("").split_once('=')
+                        {
+                            self.access
+                                .remember_secret(secret.trim_matches('"').into())?;
+                        }
+                        Ok::<(), &'static str>(())
+                    });
                 evidence.status = Some(response.status().as_u16());
                 if login {
                     login_redirect = response
@@ -831,6 +1153,22 @@ impl LiveBroker {
                             break;
                         }
                     }
+                }
+                // Ordinary probes can receive fresh JSON bearer tokens too.
+                // Register them before returning any body to tools or evidence.
+                let inspected = match serde_json::from_slice::<Value>(&received) {
+                    Ok(value) => browser::remember_tokens(&self.access, &value, 0),
+                    Err(_) if json_response && !received.is_empty() => {
+                        Err("uninspectable_json_response")
+                    }
+                    Err(_) => Ok(()),
+                };
+                if let Err(error) = cookie_secrets.and(inspected) {
+                    // Keep the attempted request and status, but never retain
+                    // a truncated/uninspectable JSON secret as ordinary text.
+                    evidence.error = Some(error.into());
+                    evidence.headers.clear();
+                    received.clear();
                 }
                 let (redacted, shortened) = if login {
                     (String::from_utf8_lossy(&received).into_owned(), false)
@@ -937,7 +1275,93 @@ impl LiveBroker {
             }
             return;
         }
+        if let Some(path) = request.path.strip_prefix("/patchriot/accounts/reference/") {
+            let result = if let Some(reference) = &self.reference {
+                match (request.method.as_str(), path) {
+                    ("POST", path) if path.starts_with("browser/") => {
+                        reference
+                            .browser_call(
+                                &format!("/patchriot/{path}"),
+                                request.body.clone().unwrap_or(Value::Null),
+                            )
+                            .await
+                    }
+                    ("POST", "http") => {
+                        reference
+                            .http(request.body.clone().unwrap_or(Value::Null))
+                            .await
+                    }
+                    ("POST", "artex/http") => {
+                        reference
+                            .engine_http(request.body.clone().unwrap_or(Value::Null))
+                            .await
+                    }
+                    _ => Err("unsupported_reference_operation"),
+                }
+            } else {
+                Err("reference_account_not_configured")
+            };
+            let (status, body) = match result {
+                Ok(body) => (200, body),
+                Err(reason) => (400, json!({"error":reason})),
+            };
+            reply_json(request.id, status, body, &output).await;
+            return;
+        }
         let (status, body) = match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/patchriot/access") => {
+                let protected_url = self.verified_access();
+                (
+                    200,
+                    json!({"verified":protected_url.is_some(),"protected_url":protected_url,
+                        "login_rejected":self.login_rejected(),
+                        "password_change_permitted":self.password_change_permitted(),
+                        "password_change_attempted":self.password_change_attempted.load(std::sync::atomic::Ordering::SeqCst),
+                        "password_change_control":self.password_change_control(),
+                        "accounts":([Some(self),self.reference.as_deref()].into_iter().flatten().filter_map(|broker| {
+                            let account=broker.account?; let url=broker.verified_access();
+                            Some(json!({"account":account,"verified":url.is_some(),"protected_url":url,
+                                "login_rejected":broker.login_rejected()}))
+                        }).collect::<Vec<_>>())}),
+                )
+            }
+            ("GET", "/patchriot/budget") => {
+                let count = self.counters.lock().expect("live counters poisoned");
+                (
+                    200,
+                    json!({
+                        "inference_usage": count.inference_usage,
+                        "http_remaining": MAX_HTTP_REQUESTS.saturating_sub(count.evidence.len()),
+                        "engine_http_remaining": ENGINE_HTTP_LIMIT.saturating_sub(count.evidence.len()),
+                        "model_calls_remaining": MAX_LIVE_INFERENCE_CALLS.saturating_sub(count.calls),
+                        "engine_model_calls_remaining": ENGINE_CALL_LIMIT.saturating_sub(count.calls),
+                        "engine_evidence_bytes_remaining": ENGINE_EVIDENCE_LIMIT.saturating_sub(count.evidence_bytes + HTTP_RECORD_RESERVE),
+                        "remaining_seconds": self.deadline.saturating_duration_since(Instant::now()).as_secs(),
+                        "remaining_cost_allowance_microusd": MAX_SPEND.saturating_sub(count.reserved),
+                        "reviewer_http_reserve": MAX_HTTP_REQUESTS - ENGINE_HTTP_LIMIT,
+                    }),
+                )
+            }
+            ("POST", "/patchriot/report/validate") => {
+                let raw = request
+                    .body
+                    .as_ref()
+                    .and_then(|v| v.get("report"))
+                    .and_then(Value::as_str);
+                let mut count = self.counters.lock().expect("live counters poisoned");
+                count.report_only |= request
+                    .body
+                    .as_ref()
+                    .is_some_and(|v| v.get("repair") == Some(&Value::Bool(true)));
+                let valid = raw
+                    .filter(|raw| raw.len() <= 32 * 1024)
+                    .and_then(parse_assessment)
+                    .is_some_and(|a| a.valid_for(&count.evidence));
+                (
+                    200,
+                    json!({"valid":valid,"schema":assessment_format()["json_schema"]["schema"]}),
+                )
+            }
             ("GET", "/v1/models") => (
                 200,
                 json!({"object":"list","data":[{"id":self.provider.model(),"object":"model","context_length":200000}]}),
@@ -948,6 +1372,10 @@ impl LiveBroker {
                     Err(e) => (400, json!({"error":e})),
                 }
             }
+            ("POST", "/patchriot/password/verify") => match self.verify_changed_password().await {
+                Ok(v) => (200, v),
+                Err(e) => (400, json!({"error":e})),
+            },
             ("POST", ENGINE_HTTP) => {
                 match self.engine_http(request.body.unwrap_or(Value::Null)).await {
                     Ok(v) => (200, v),
@@ -1010,8 +1438,10 @@ impl LiveBroker {
             .and_then(|s| s.trim().strip_suffix("```"))
             .unwrap_or(raw)
             .trim();
-        let assessment = parse_assessment(cleaned);
         let count = self.counters.lock().expect("live counters poisoned");
+        // Keep raw text and HTTP receipts even when a model invents/omits a
+        // citation. An invalid structured finding must not lose the whole role.
+        let assessment = parse_assessment(cleaned).filter(|a| a.valid_for(&count.evidence));
         let (mut tool_runs, tools_valid) = tool_records(&report.events, &count.evidence);
         for run in &mut tool_runs {
             run.arguments
@@ -1024,8 +1454,20 @@ impl LiveBroker {
                 run.output_excerpt = cleaned;
             }
         }
+        tool_runs.retain(|run| run.tool != "patchriot-coverage");
+        tool_runs.push(coverage::record(&self.scope, &count.evidence, &tool_runs));
         let passed = passed && tools_valid;
         let mut result = PentestResult {
+            account_access: [Some(self), self.reference.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|broker| {
+                    let account = broker.account?;
+                    let proof = broker.browser.lock().ok()?.proof.clone()?;
+                    Some(AccountAccessProof { account, proof })
+                })
+                .collect(),
+            workflow: None,
             kind: PentestResultKind::PentestAgentV1,
             scope_sha256: self.scope.hash().unwrap_or_default(),
             execution: LiveExecution {
@@ -1041,6 +1483,7 @@ impl LiveBroker {
                 inference_calls: count.calls,
                 http_requests: count.evidence.len() as u16,
                 cost_upper_microusd: count.reserved,
+                inference_usage: count.inference_usage.clone(),
                 cleanup_confirmed: cleanup,
                 failure_reason: if !tools_valid {
                     Some("invalid_tool_records".into())
@@ -1062,7 +1505,13 @@ impl LiveBroker {
                 .browser
                 .lock()
                 .ok()
-                .and_then(|state| state.proof.clone()),
+                .and_then(|state| state.proof.clone())
+                .or_else(|| {
+                    self.reference
+                        .as_ref()
+                        .and_then(|reference| reference.browser.lock().ok()?.proof.clone())
+                })
+                .map(Box::new),
             raw_summary: {
                 let redacted = self.access.redact(raw);
                 let raw = redacted.as_str();
@@ -1073,9 +1522,17 @@ impl LiveBroker {
                 raw[..end].to_owned()
             },
         };
+        if let Some(mut workflow) = self.workflow.lock().ok().and_then(|w| w.clone()) {
+            workflow.finish(&self.scope, &result);
+            result.workflow = Some(workflow.into());
+        }
         result.omit_binary_excerpts();
         if !result.valid(&self.scope) {
             result.assessment = None;
+            if let Some(mut workflow) = result.workflow.take() {
+                workflow.finish(&self.scope, &result);
+                result.workflow = Some(workflow);
+            }
         }
         result
     }
@@ -1118,7 +1575,7 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
         if let Ok(run) = parsed {
             bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
-            if records.len() < 20 && bytes <= 256 * 1024 && run.valid(evidence) {
+            if records.len() < 31 && bytes <= 512 * 1024 && run.valid(evidence) {
                 if run.tool == "artex-engine" {
                     records.retain(|previous: &LiveToolRun| {
                         !(previous.tool == run.tool
@@ -1133,6 +1590,26 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         valid = false;
     }
     (records, valid)
+}
+
+async fn reply_json(id: u64, status: u16, body: Value, output: &mpsc::Sender<Frame>) {
+    let bytes = serde_json::to_vec(&body).expect("JSON body");
+    let _ = output
+        .send(Frame::Start {
+            id,
+            status,
+            content_type: "application/json",
+        })
+        .await;
+    for chunk in bytes.chunks(4096) {
+        let _ = output
+            .send(Frame::Chunk {
+                id,
+                hex: hex::encode(chunk),
+            })
+            .await;
+    }
+    let _ = output.send(Frame::End { id }).await;
 }
 
 /// Provider usage is a billing observation, not proof of an invoice. Charge
@@ -1391,6 +1868,7 @@ mod tests {
                 session_login: None,
                 wallet_login: None,
                 browser_login: None,
+                account_policy: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],
@@ -1555,7 +2033,10 @@ for _ in range(270): print(frame,flush=True)
         }
         // The spend and provider-call cap are still enforced by model(), as
         // covered by the exhausted-budget regression below.
-        assert_eq!(Bridge::Live(broker.clone()).max_requests(), 800);
+        assert_eq!(
+            Bridge::Live(broker.clone()).max_requests(),
+            MAX_HTTP_REQUESTS + usize::from(MAX_LIVE_INFERENCE_CALLS) + 100
+        );
         broker.counters.lock().unwrap().calls = MAX_LIVE_INFERENCE_CALLS;
         let (tx, _rx) = mpsc::channel(4);
         let request = Request {
@@ -1968,6 +2449,235 @@ for _ in range(270): print(frame,flush=True)
         task.evidence.context.provider = "abliteration.ai".into();
         assert!(task.input().is_err());
     }
+    #[tokio::test]
+    async fn generated_login_tokens_are_redacted_before_http_evidence_and_tool_output() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for body in [
+                r#"{"access_token":"fixture-fresh-token","refreshToken":"fixture-refresh-token","password":"fixture-created-password","status":"ok"}"#,
+                r#"{"access_token":"fixture-uninspectable-token""#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 8192];
+                let length = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..length]);
+                assert!(request.contains("fixture-created-password"));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut broker = broker();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.test_target = Some(address);
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        let reply = broker.http(json!({"method":"POST","url":"https://example.com/login",
+            "headers":{"Content-Type":"application/json"},"data":r#"{"email":"test@example.invalid","password":"fixture-created-password"}"#,
+            "authenticated":false})).await.unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        let retained = serde_json::to_string(&broker.counters.lock().unwrap().evidence).unwrap();
+        for secret in [
+            "fixture-created-password",
+            "fixture-fresh-token",
+            "fixture-refresh-token",
+        ] {
+            assert!(!reply.to_string().contains(secret));
+            assert!(!retained.contains(secret));
+            assert_eq!(broker.access.redact(secret), "REDACTED");
+        }
+        assert!(reply["body"].as_str().unwrap().contains("ok"));
+        let incomplete = broker.http(json!({"method":"POST","url":"https://example.com/login",
+            "headers":{"Content-Type":"application/json"},"data":r#"{"password":"fixture-created-password"}"#,
+            "authenticated":false})).await.unwrap();
+        assert_eq!(incomplete["evidence"]["status"], 200);
+        assert_eq!(
+            incomplete["evidence"]["error"],
+            "uninspectable_json_response"
+        );
+        assert_eq!(incomplete["body"], "");
+        assert!(
+            !incomplete
+                .to_string()
+                .contains("fixture-uninspectable-token")
+        );
+        assert_eq!(broker.counters.lock().unwrap().evidence.len(), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_and_discovery_cannot_change_account_credentials() {
+        let mut broker = broker();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        let input = json!({"method":"POST","url":"https://example.com/account",
+            "headers":{"Content-Type":"application/json"},"data":r#"{"current_password":"fixture-old","new_password":"fixture-new"}"#});
+        assert_eq!(
+            broker.http(input.clone()).await,
+            Err("account_credential_changes_not_permitted")
+        );
+        assert_eq!(
+            broker.engine_http(input).await,
+            Err("account_credential_changes_not_permitted")
+        );
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_engine_never_inherits_supplied_grey_credentials() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let length = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..length]).to_lowercase();
+            assert!(!request.contains("authorization:"));
+            assert!(!request.contains("cookie:"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+        });
+        let scope=serde_json::from_value::<LiveScope>(json!({"origins":["https://owned.example"],
+            "methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1",
+            "tools":["artex_engine_v1","authenticated_http_v1"],"authentication":"basic","auth_check_path":"/private"})).unwrap().normalized().unwrap();
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key.path(), "synthetic-fixture-provider-key").unwrap();
+        let credentials = TestCredentials::Basic {
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+        };
+        let mut broker = LiveBroker::new_with_credentials(
+            LiveProvider::Abliteration,
+            key.path(),
+            scope,
+            Instant::now() + Duration::from_secs(30),
+            Some(&credentials),
+            None,
+        )
+        .unwrap();
+        Arc::get_mut(&mut broker).unwrap().test_target = Some(address);
+        assert_eq!(
+            broker
+                .engine_http(
+                    json!({"method":"GET","url":"https://owned.example/","authenticated":true})
+                )
+                .await
+                .unwrap_err(),
+            "authenticated_access_not_verified"
+        );
+        let reply = broker
+            .engine_http(json!({"method":"GET","url":"https://owned.example/"}))
+            .await
+            .unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        assert!(!broker.counters.lock().unwrap().evidence[0].authenticated);
+        server.await.unwrap();
+    }
+    #[test]
+    fn structured_progress_does_not_invent_login_activity() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.authentication = Some(TestAuthKind::Basic);
+        let checks = CheckId::ALL
+            .into_iter()
+            .map(|id| CheckProgress {
+                id,
+                state: CheckState::Pending,
+                evidence_count: 0,
+                source_role: None,
+            })
+            .collect();
+        let workflow = AssessmentWorkflow { version: 1, checks };
+        assert!(broker.accept_workflow(&serde_json::to_value(workflow).unwrap()));
+        let progress = Progress::default();
+        broker.update_progress(&progress, LivePhase::Investigating, 0, None);
+        assert_eq!(
+            progress.lock().unwrap().workflow.as_ref().unwrap().checks[5].state,
+            CheckState::Pending
+        );
+        assert!(!broker.accept_workflow(&json!({"version":1,"checks":[]})));
+    }
+    #[tokio::test]
+    async fn engine_generated_identity_is_rejected_before_target_io() {
+        let mut broker = broker();
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        for data in [
+            r#"{"name":"ARTEX Test","email":"artex.test@example.com"}"#,
+            r#"{"name":"\u0041RTEX Test"}"#,
+            "name=%41rTeX+Test",
+        ] {
+            assert_eq!(
+                broker
+                    .engine_http(
+                        json!({"method":"POST","url":"https://example.com/contact","data":data})
+                    )
+                    .await
+                    .unwrap_err(),
+                "use_authorized_security_test_data_instead_of_engine_branding"
+            );
+            assert!(broker.counters.lock().unwrap().evidence.is_empty());
+        }
+        assert!(!engine_branded_data(
+            &json!({"data":r#"{"name":"Authorized security test","email":"security-test@example.com"}"#})
+        ));
+    }
+
+    #[tokio::test]
+    async fn report_check_rejects_missing_and_invented_citations_and_closes_repair_tools() {
+        let broker = broker();
+        let finding = json!({"title":"Owned fixture", "severity":"info", "support":"needs_review",
+            "explanation":"Unverified", "reproduction":"GET /", "suggested_action":"Review"});
+        for ids in [None, Some(json!([])), Some(json!([999]))] {
+            let mut finding = finding.clone();
+            if let Some(ids) = ids {
+                finding["evidence_ids"] = ids;
+            }
+            let raw =
+                json!({"summary":"Owned test", "findings":[finding], "limitations":[]}).to_string();
+            let (tx, mut rx) = mpsc::channel(8);
+            broker
+                .respond(
+                    Request {
+                        id: 1,
+                        method: "POST".into(),
+                        path: "/patchriot/report/validate".into(),
+                        body: Some(json!({"report":raw,"repair":true})),
+                    },
+                    tx,
+                )
+                .await;
+            let mut bytes = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                if let Frame::Chunk { hex, .. } = frame {
+                    bytes.extend(hex::decode(hex).unwrap());
+                }
+            }
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["valid"],
+                false
+            );
+        }
+        let mut body = json!({"messages":[],"tools":[{"type":"function"}]});
+        broker.finish_before_limit(&mut body).unwrap();
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body["messages"].to_string().contains("evidence_ids"));
+    }
+
     #[tokio::test]
     async fn full_engine_requires_consent_and_keeps_the_reviewers_budget() {
         let mut broker = broker();

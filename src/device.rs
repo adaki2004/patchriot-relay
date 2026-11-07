@@ -193,6 +193,23 @@ fn write_agent_report(directory: &Path, report: &serde_json::Value) -> Result<()
     Ok(())
 }
 
+// Keep one bounded, private recovery artifact per device. This is diagnostic
+// evidence from interrupted work, and never an outbox that can revive a lease.
+fn preserve_interrupted_result(directory: &Path, result: &CompleteWork) -> Result<(), Error> {
+    let bytes = serde_json::to_vec(result)?;
+    if bytes.len() as u64 > MAX_STATE {
+        return Err("interrupted result exceeded its limit".into());
+    }
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(&bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(directory.join("last-interrupted-work.json"))?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn read_key(directory: &Path) -> Result<DeviceKey, Error> {
     let file = private_open(&directory.join("device.key"), false)?;
     if file.metadata()?.len() != 32 {
@@ -238,10 +255,15 @@ fn client() -> Result<reqwest::blocking::Client, Error> {
 #[derive(Debug)]
 struct RemoteError {
     status: u16,
+    code: Option<&'static str>,
 }
 impl std::fmt::Display for RemoteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "dispatcher returned HTTP {}", self.status)
+        write!(f, "dispatcher returned HTTP {}", self.status)?;
+        if let Some(code) = self.code {
+            write!(f, " ({code})")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for RemoteError {}
@@ -304,9 +326,23 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         })
     })?;
     if !response.status().is_success() {
-        return Err(Box::new(RemoteError {
-            status: response.status().as_u16(),
-        }));
+        let status = response.status().as_u16();
+        // Log only known protocol codes. Server bodies can contain private
+        // content and must never be forwarded to the operator's journal.
+        let mut bytes = Vec::new();
+        let _ = response.take(4096).read_to_end(&mut bytes);
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+        let code = [
+            "device_not_ready",
+            "lease_no_longer_active",
+            "invalid_live_progress",
+            "stale_renewal",
+            "private_work_not_allowed",
+            "selected_tool_unavailable",
+        ]
+        .into_iter()
+        .find(|code| value.as_ref().and_then(|v| v["error"].as_str()) == Some(*code));
+        return Err(Box::new(RemoteError { status, code }));
     }
     // Treat even a configured server's output as bounded input; redirects are disabled.
     let mut bytes = Vec::new();
@@ -541,7 +577,8 @@ fn send_result(directory: &Path, client: &reqwest::blocking::Client) -> Result<(
                 .is_some_and(|e| [404, 409].contains(&e.status)) =>
         {
             // A cancelled, superseded or expired lease cannot be resurrected by
-            // an outbox retry. Discard only this saved result, never reinterpret it.
+            // an outbox retry. Preserve its evidence before removing the outbox.
+            preserve_interrupted_result(directory, result)?;
             clear_assignment(directory)?;
             eprintln!("saved result no longer has an active lease");
         }
@@ -841,6 +878,16 @@ fn agent_work(
     settings: &crate::agent::Settings,
     assignment: &WorkAssignment,
 ) -> Result<(), Error> {
+    if assignment.pentest.is_some()
+        && directory
+            .join(format!("live-{}.started", assignment.lease_id))
+            .try_exists()?
+    {
+        // Leave the original lease to expire without resetting its progress,
+        // purchasing inference again or crashing the device's service.
+        eprintln!("live role already started; waiting for its lease to close");
+        return Ok(());
+    }
     let progress = assignment
         .pentest
         .as_ref()
@@ -848,7 +895,7 @@ fn agent_work(
     let snapshot = || {
         progress
             .as_ref()
-            .and_then(|p| p.lock().ok().map(|p| p.clone()))
+            .and_then(|p| p.try_lock().ok().map(|p| p.clone()))
     };
     // Renew before spawning even when a cached poll reply contains an assignment.
     // The server must confirm that it is still this device's active lease.
@@ -886,10 +933,17 @@ fn agent_work(
             let mut heartbeat_at = Instant::now() + Duration::from_secs(10);
             let mut renew_at = Instant::now() + Duration::from_secs(20);
             while !done.load(Ordering::Relaxed) {
-                if stop.load(Ordering::Relaxed)
-                    || window.stopped_at(Instant::now())
-                    || !locally_ready(directory, assignment.lease_id)
-                {
+                let reason = if stop.load(Ordering::Relaxed) {
+                    Some("operator_stop")
+                } else if window.stopped_at(Instant::now()) {
+                    Some("lease_window_expired")
+                } else if !locally_ready(directory, assignment.lease_id) {
+                    Some("local_assignment_unavailable")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    eprintln!("lease monitor stopped: {reason}");
                     window.stop();
                     break;
                 }
@@ -899,7 +953,13 @@ fn agent_work(
                         Err(error) if !terminal_remote_error(&error) => {
                             eprintln!("heartbeat retry pending")
                         }
-                        _ => {
+                        Ok(_) => {
+                            eprintln!("lease monitor stopped: heartbeat_device_unavailable");
+                            window.stop();
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("lease monitor stopped: heartbeat_rejected: {error}");
                             window.stop();
                             break;
                         }
@@ -907,17 +967,31 @@ fn agent_work(
                     heartbeat_at = Instant::now() + Duration::from_secs(10);
                 }
                 if Instant::now() >= renew_at {
+                    let renewal_started = Instant::now();
                     match renew(directory, client, assignment.lease_id, snapshot()) {
                         Ok((started, reply)) => {
-                            window.extend_at(started, reply.valid_for_seconds, Instant::now())
+                            window.extend_at(started, reply.valid_for_seconds, Instant::now());
+                            if window.stopped_at(Instant::now()) {
+                                eprintln!(
+                                    "lease monitor stopped: renewal_arrived_after_local_expiry"
+                                );
+                                break;
+                            }
                         }
                         Err(error) if !terminal_remote_error(&error) => {
                             eprintln!("lease renewal retry pending")
                         }
-                        _ => {
+                        Err(error) => {
+                            eprintln!("lease monitor stopped: renewal_rejected: {error}");
                             window.stop();
                             break;
                         }
+                    }
+                    if renewal_started.elapsed() >= Duration::from_secs(2) {
+                        eprintln!(
+                            "lease renewal delayed: duration_ms={}",
+                            renewal_started.elapsed().as_millis()
+                        );
                     }
                     renew_at = Instant::now() + Duration::from_secs(10);
                 }
@@ -1013,6 +1087,13 @@ fn agent_work(
                 || window.stopped_at(Instant::now())
                 || !locally_ready(directory, assignment.lease_id)
             {
+                preserve_interrupted_result(
+                    directory,
+                    &CompleteWork {
+                        lease_id: assignment.lease_id,
+                        result: check.result,
+                    },
+                )?;
                 clear_assignment(directory)?;
                 eprintln!("agent stopped; lease ended or work was cancelled");
                 return Ok(());
@@ -1289,6 +1370,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interrupted_paid_lease_waits_without_renewing_or_restarting_inference() {
+        let directory = tempfile::tempdir().unwrap();
+        let lease_id = Uuid::new_v4();
+        let marker = directory.path().join(format!("live-{lease_id}.started"));
+        fs::write(&marker, b"").unwrap();
+        let assignment = WorkAssignment {
+            lease_id,
+            review_id: Uuid::new_v4(),
+            role: ReviewRole::Investigator,
+            scenario: FixtureScenario::LiveHttpV1,
+            expires_at: i64::MAX,
+            mode: ReviewMode::PentestAgent,
+            website: None,
+            source: None,
+            pentest: Some(pentests::PentestAssignment {
+                pentest_id: Uuid::new_v4(),
+                scope_sha256: "a".repeat(64),
+            }),
+        };
+        let settings = serde_json::from_value(serde_json::json!({
+            "docker_socket":"/unavailable", "image":"unavailable",
+            "model_url":"http://127.0.0.1:1", "model":"fixture", "model_digest":"fixture"
+        }))
+        .unwrap();
+        // No config, device key, model or Docker exists. Repeated ordinary
+        // agent_work entry must return before touching any of them.
+        for _ in 0..2 {
+            agent_work(
+                directory.path(),
+                &client().unwrap(),
+                &Arc::new(AtomicBool::new(false)),
+                &settings,
+                &assignment,
+            )
+            .unwrap();
+        }
+        assert!(marker.exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn transport_errors_can_retry_but_invalid_replies_cannot_restart_agent_work() {
         use std::net::TcpListener;
         let directory = tempfile::tempdir().unwrap();
@@ -1307,6 +1429,8 @@ mod tests {
             (503, "{}", 2, true),
             (429, "{}", 2, true),
             (403, "{}", 2, false),
+            (409, "{\"error\":\"device_not_ready\"}", 28, false),
+            (400, "{\"error\":\"private_response\"}", 28, false),
             (200, "{\"partial\":", 50, true),
             (200, "not json", 8, false),
         ] {
@@ -1359,6 +1483,10 @@ mod tests {
                 retryable,
                 "status {status}"
             );
+            if status == 409 {
+                assert!(error.to_string().contains("device_not_ready"));
+            }
+            assert!(!error.to_string().contains("private_response"));
             server.join().unwrap();
         }
         assert!(!retryable_dispatcher_error(&"model profile changed".into()));
@@ -1425,6 +1553,18 @@ mod tests {
             "assessment":null, "evidence":[], "raw_summary":""
         }))
         .unwrap();
+        // The inference SDK enables serde_json arbitrary_precision. Fractional
+        // observed costs must survive the untagged WorkResult outbox reader.
+        result.execution.inference_usage = vec![patchriot_protocol::pentests::InferenceUsage {
+            provider: "abliteration.ai".into(),
+            model: "abliterated-model-large-v2".into(),
+            responses: 1,
+            usd_cost_responses: 1,
+            diem_cost_responses: 1,
+            provider_reported_usd: 0.32495331000000005,
+            provider_reported_diem: 0.0,
+            ..Default::default()
+        }];
         // Escaped characters and many records are realistic HTML/tool output.
         // Fill to the wire limit, not an arbitrary 'large enough' test size.
         for id in 1..=500 {
@@ -1455,6 +1595,19 @@ mod tests {
             lease_id,
             result: WorkResult::Pentest(result),
         };
+        preserve_interrupted_result(&state, &expected).unwrap();
+        let recovery_path = state.join("last-interrupted-work.json");
+        let recovered: CompleteWork =
+            serde_json::from_slice(&fs::read(&recovery_path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&recovered).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&recovery_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(read_config(&state).unwrap().pending_result.is_none());
         let mut config = read_config(&state).unwrap();
         config.device_id = Some(Uuid::new_v4());
         config.pending_result = Some(expected.clone());
@@ -1653,7 +1806,7 @@ mod tests {
             agent_execution_deadline(start, &renewal, 3600).unwrap(),
             start + Duration::from_secs(539)
         );
-        for invalid in [0, 599, 3601, u64::MAX] {
+        for invalid in [0, 599, 10801, u64::MAX] {
             assert!(agent_execution_deadline(start, &renewal, invalid).is_err());
         }
     }

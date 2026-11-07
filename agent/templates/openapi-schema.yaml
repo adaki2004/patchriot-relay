@@ -1,0 +1,19 @@
+id: patchriot-openapi-schema-observation
+info:
+  name: API schema discovery
+  author: patchriot
+  severity: info
+  description: Recorded surface observation. Establish sensitivity, intended access and a missing-path control before reporting a vulnerability.
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/openapi.json"
+    redirects: false
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '"(openapi|swagger)"\s*:\s*"[23]\.'

@@ -59,6 +59,8 @@ class BaselineTests(unittest.TestCase):
     def test_clean_soft404_and_failed_sites_do_not_become_confirmed_findings(self):
         clean, _ = self.run_fixture()
         self.assertNotIn("finding", [c["status"] for c in clean.values()])
+        self.assertNotIn("No test account", json.dumps(clean))
+        self.assertIn("runs anonymously", json.dumps(clean))
         ambiguous, _ = self.run_fixture(soft404=True)
         self.assertEqual(ambiguous["git-config"]["status"], "inconclusive")
         failed, _ = self.run_fixture(broken=True)

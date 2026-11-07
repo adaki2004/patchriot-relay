@@ -72,7 +72,7 @@ fn temporary_storage(engine: bool) -> [(&'static str, &'static str); 3] {
     let mut mounts = TMPFS;
     if engine {
         // The selected engine needs a disposable PostgreSQL data directory.
-        // Still memory-backed, non-executable, and inside the same 2 GiB cap.
+        // Still memory-backed, non-executable, and inside the container memory cap.
         mounts[2].1 = "rw,nosuid,nodev,noexec,size=536870912,uid=65534,gid=65534";
     }
     mounts
@@ -138,7 +138,8 @@ impl Settings {
         let image = docker.inspect("image", &self.image)?;
         if image["Id"] != self.image
             || ![
-                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+                "17", "18", "19", "20", "21",
             ]
             .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
@@ -147,7 +148,8 @@ impl Settings {
             )
             || self.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
                 && ![
-                    "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                    "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+                    "17", "18", "19", "20", "21",
                 ]
                 .contains(
                     &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
@@ -156,7 +158,7 @@ impl Settings {
                 )
         {
             return Err(
-                "website reviews require adapter 2–15; longer CPU budgets require adapter 3–15"
+                "website reviews require adapter 2–21; longer CPU budgets require adapter 3–21"
                     .into(),
             );
         }
@@ -185,19 +187,36 @@ impl Settings {
             )
         ) && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("11" | "12" | "13" | "14" | "15")
+            Some("11" | "12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
         ) {
-            return Err("Venice live tests require adapter 11–15".into());
+            return Err("Venice live tests require adapter 11–21".into());
         }
         if self.live_provider_key_file.is_none()
             || image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
+                Some(
+                    "5" | "6"
+                        | "7"
+                        | "8"
+                        | "9"
+                        | "10"
+                        | "11"
+                        | "12"
+                        | "13"
+                        | "14"
+                        | "15"
+                        | "16"
+                        | "17"
+                        | "18"
+                        | "19"
+                        | "20"
+                        | "21"
+                )
             )
         {
             return Err(
-                "live tests require the inspected adapter 5–15 and a private provider key file"
+                "live tests require the inspected adapter 5–21 and a private provider key file"
                     .into(),
             );
         }
@@ -212,7 +231,7 @@ impl Settings {
         Ok(
             if matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("12" | "13" | "14" | "15")
+                Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
             ) {
                 let mut tools = vec![
                     patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1,
@@ -225,9 +244,15 @@ impl Settings {
                 ];
                 if matches!(
                     image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                    Some("13" | "14" | "15")
+                    Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
                 ) {
                     tools.push(patchriot_protocol::pentests::LiveToolProfile::BrowserLoginV1);
+                }
+                if matches!(
+                    image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+                    Some("20" | "21")
+                ) {
+                    tools.push(patchriot_protocol::pentests::LiveToolProfile::MultiAccountV1);
                 }
                 tools
             } else if matches!(
@@ -262,7 +287,25 @@ impl Settings {
         if image["Id"] != self.image
             || !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
+                Some(
+                    "4" | "5"
+                        | "6"
+                        | "7"
+                        | "8"
+                        | "9"
+                        | "10"
+                        | "11"
+                        | "12"
+                        | "13"
+                        | "14"
+                        | "15"
+                        | "16"
+                        | "17"
+                        | "18"
+                        | "19"
+                        | "20"
+                        | "21"
+                )
             )
         {
             return Err("source reviews require the inspected adapter 4 image".into());
@@ -285,7 +328,7 @@ impl Settings {
         if !(DEFAULT_AGENT_ATTEMPT_SECONDS..=MAX_AGENT_ATTEMPT_SECONDS)
             .contains(&settings.max_attempt_seconds)
         {
-            return Err("max_attempt_seconds must be 600..3600".into());
+            return Err("max_attempt_seconds must be 600..10800".into());
         }
         if settings.live_provider_key_file.is_some() {
             if patchriot_protocol::pentests::LiveProvider::from_model(&settings.model)
@@ -624,7 +667,7 @@ async fn supervise(
                 }
                 if let (Bridge::Live(broker), Some(progress)) = (&broker, progress) {
                     let model_request = active_model.map(|(since, purpose)| patchriot_protocol::pentests::LiveModelProgress {
-                        purpose, elapsed_seconds: since.elapsed().as_secs().min(3600) as u32,
+                        purpose, elapsed_seconds: since.elapsed().as_secs().min(MAX_AGENT_ATTEMPT_SECONDS) as u32,
                     });
                     broker.update_progress(progress, live_phase, completed_tools, model_request);
                 }
@@ -724,7 +767,18 @@ async fn supervise(
                         }
                         Ok(Wire::Event { event, data })
                             if (["phase", "tool_start", "tool_complete", "result"].contains(&event.as_str())
-                                || matches!(&broker, Bridge::Live(_)) && event == "live_tool") && !final_seen => {
+                                || matches!(&broker, Bridge::Live(_)) && ["live_tool", "workflow"].contains(&event.as_str())) && !final_seen => {
+                            if event == "workflow" {
+                                // Only the pinned pre-investigation pipeline may
+                                // publish the public checklist. Model tool output
+                                // cannot replace it after agent_ready.
+                                if live_phase != patchriot_protocol::pentests::LivePhase::ScopedTools
+                                    || !matches!(&broker, Bridge::Live(b) if b.accept_workflow(&data["workflow"])) {
+                                    report.outcome = "invalid_protocol";
+                                    report.failure_reason = Some("invalid_workflow_event");
+                                    break 'running;
+                                }
+                            }
                             if event == "result" {
                                 final_seen = true;
                                 live_phase = patchriot_protocol::pentests::LivePhase::Finishing;
@@ -831,7 +885,15 @@ async fn supervise(
 
 #[cfg(test)]
 fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: bool) -> bool {
-    browser_policy(container, image, args, seconds, engine, false)
+    browser_policy(container, image, args, seconds, engine, false, false)
+}
+
+fn container_resources(browser: bool, paired: bool) -> (u64, u64) {
+    match (browser, paired) {
+        (true, true) => (4_294_967_296, 512),
+        (true, false) => (2_147_483_648, 256),
+        (false, _) => (2_147_483_648, 128),
+    }
 }
 
 fn browser_policy(
@@ -841,10 +903,13 @@ fn browser_policy(
     seconds: u64,
     engine: bool,
     browser: bool,
+    paired: bool,
 ) -> bool {
+    let (memory, pids) = container_resources(browser, paired);
     let h = &container["HostConfig"];
     let c = &container["Config"];
-    container["Image"] == image
+    (!paired || browser)
+        && container["Image"] == image
         && container["State"]["Status"] == "created"
         && h["NetworkMode"] == "none"
         && h["ReadonlyRootfs"] == true
@@ -854,10 +919,10 @@ fn browser_policy(
         && no_entries(&h["CapAdd"])
         && security_options(&h["SecurityOpt"], browser)
         && (!browser || container["AppArmorProfile"] == "patchriot-browser-v1")
-        && h["Memory"] == 2_147_483_648u64
-        && h["MemorySwap"] == 2_147_483_648u64
+        && h["Memory"] == memory
+        && h["MemorySwap"] == memory
         && h["NanoCpus"] == 2_000_000_000u64
-        && h["PidsLimit"] == if browser { 256 } else { 128 }
+        && h["PidsLimit"] == pids
         && (!browser || h["ShmSize"] == 268435456u64)
         && h["CgroupnsMode"] == "private"
         && h["PidMode"] == ""
@@ -939,7 +1004,8 @@ pub fn run(
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
         || image["Config"]["User"] != "65534:65534"
         || ![
-            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+            "17", "18", "19", "20", "21",
         ]
         .contains(
             &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
@@ -948,7 +1014,8 @@ pub fn run(
         )
         || website.is_some()
             && ![
-                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+                "17", "18", "19", "20", "21",
             ]
             .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
@@ -958,14 +1025,47 @@ pub fn run(
         || source.is_some()
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
+                Some(
+                    "4" | "5"
+                        | "6"
+                        | "7"
+                        | "8"
+                        | "9"
+                        | "10"
+                        | "11"
+                        | "12"
+                        | "13"
+                        | "14"
+                        | "15"
+                        | "16"
+                        | "17"
+                        | "18"
+                        | "19"
+                        | "20"
+                        | "21"
+                )
             )
         || live
             .as_ref()
             .is_some_and(|task| !task.evidence.context.scope.tools.is_empty())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("7" | "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
+                Some(
+                    "7" | "8"
+                        | "9"
+                        | "10"
+                        | "11"
+                        | "12"
+                        | "13"
+                        | "14"
+                        | "15"
+                        | "16"
+                        | "17"
+                        | "18"
+                        | "19"
+                        | "20"
+                        | "21"
+                )
             )
         || live.as_ref().is_some_and(|task| {
             task.evidence
@@ -976,21 +1076,47 @@ pub fn run(
                 .any(|tool| *tool != patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
         }) && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
+            Some(
+                "8" | "9"
+                    | "10"
+                    | "11"
+                    | "12"
+                    | "13"
+                    | "14"
+                    | "15"
+                    | "16"
+                    | "17"
+                    | "18"
+                    | "19"
+                    | "20"
+                    | "21"
+            )
         )
         || live
             .as_ref()
             .is_some_and(|task| task.evidence.context.scope.session_login.is_some())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("10" | "11" | "12" | "13" | "14" | "15")
+                Some(
+                    "10" | "11"
+                        | "12"
+                        | "13"
+                        | "14"
+                        | "15"
+                        | "16"
+                        | "17"
+                        | "18"
+                        | "19"
+                        | "20"
+                        | "21"
+                )
             )
         || live
             .as_ref()
             .is_some_and(|task| task.evidence.context.scope.wallet_login.is_some())
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-                Some("12" | "13" | "14" | "15")
+                Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
             )
         || live.as_ref().is_some_and(|task| {
             task.evidence
@@ -1000,11 +1126,12 @@ pub fn run(
                 .contains(&patchriot_protocol::pentests::LiveToolProfile::ActiveWebV2)
         }) && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("12" | "13" | "14" | "15")
+            Some("12" | "13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
         )
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
             && ![
-                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+                "18", "19", "20", "21",
             ]
             .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
@@ -1017,13 +1144,22 @@ pub fn run(
         return Err("build the pinned agent/Dockerfile image before this check".into());
     }
     let browser = live.is_some_and(|task| task.evidence.context.scope.browser_login.is_some());
+    let paired = live.is_some_and(|task| task.evidence.context.scope.account_policy.is_some());
     if browser
         && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
-            Some("13" | "14" | "15")
+            Some("13" | "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21")
         )
     {
-        return Err("browser login requires the inspected adapter 13–15 image".into());
+        return Err("browser login requires the inspected adapter 13–21 image".into());
+    }
+    if paired
+        && !matches!(
+            image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
+            Some("20" | "21")
+        )
+    {
+        return Err("multiple test accounts require the inspected adapter 20–21 image".into());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1143,14 +1279,8 @@ pub fn run(
             "no-new-privileges",
             "--user",
             "65534:65534",
-            "--memory",
-            "2g",
-            "--memory-swap",
-            "2g",
             "--cpus",
             "2",
-            "--pids-limit",
-            "128",
             "--init",
             "--cgroupns",
             "private",
@@ -1165,6 +1295,15 @@ pub fn run(
         ]
         .map(str::to_owned),
     );
+    let (memory, pids) = container_resources(browser, paired);
+    command.extend([
+        "--memory".into(),
+        memory.to_string(),
+        "--memory-swap".into(),
+        memory.to_string(),
+        "--pids-limit".into(),
+        pids.to_string(),
+    ]);
     let engine = live.is_some_and(|task| {
         task.evidence
             .context
@@ -1183,11 +1322,6 @@ pub fn run(
             "--security-opt=apparmor=patchriot-browser-v1".into(),
             "--shm-size=256m".into(),
         ]);
-        let pids = command
-            .iter()
-            .position(|arg| arg == "--pids-limit")
-            .ok_or("missing process limit")?;
-        command[pids + 1] = "256".into();
         Some(file)
     } else {
         None
@@ -1212,6 +1346,7 @@ pub fn run(
             settings.max_attempt_seconds,
             engine,
             browser,
+            paired,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -1548,6 +1683,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn python_report_validation_events_reach_the_real_supervisor_before_result() {
+        let mut command = std::process::Command::new("python3");
+        command.current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/agent"));
+        command.args(["-c", "import adapter; adapter.report_validation(valid=False, repaired=False); adapter.report_validation(valid=True, repaired=True); adapter.event('result', completed=True, final_response='{}')"]);
+        let report = supervise(
+            command,
+            crate::inference::tests::broker(),
+            &|| false,
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.outcome, "completed");
+        assert_eq!(report.failure_reason, None);
+        assert_eq!(report.events.len(), 3);
+        assert_eq!(report.events[0]["data"]["name"], "report_validation");
+        assert_eq!(report.events[1]["data"]["repaired"], true);
+    }
+
+    #[tokio::test]
     async fn malformed_or_replayed_requests_cannot_continue_execution() {
         let cancelled = AtomicBool::new(false);
         let request = r#"printf '%s\n' '{"type":"request","request":{"id":1,"method":"GET","path":"/api/version","body":null}}'"#;
@@ -1629,7 +1786,8 @@ mod tests {
             &["owned-model"],
             600,
             false,
-            true
+            true,
+            false
         ));
         for (path, change) in [
             ("/AppArmorProfile", json!("unconfined")),
@@ -1646,9 +1804,68 @@ mod tests {
             let mut changed = value.clone();
             *changed.pointer_mut(path).unwrap() = change;
             assert!(
-                !browser_policy(&changed, "owned-image", &["owned-model"], 600, false, true),
+                !browser_policy(
+                    &changed,
+                    "owned-image",
+                    &["owned-model"],
+                    600,
+                    false,
+                    true,
+                    false
+                ),
                 "{path}"
             );
+        }
+        for paired in [false, true] {
+            let (memory, pids) = container_resources(true, paired);
+            let mut configured = value.clone();
+            configured["HostConfig"]["Memory"] = json!(memory);
+            configured["HostConfig"]["MemorySwap"] = json!(memory);
+            configured["HostConfig"]["PidsLimit"] = json!(pids);
+            assert!(browser_policy(
+                &configured,
+                "owned-image",
+                &["owned-model"],
+                600,
+                false,
+                true,
+                paired
+            ));
+            assert!(!browser_policy(
+                &configured,
+                "owned-image",
+                &["owned-model"],
+                600,
+                false,
+                true,
+                !paired
+            ));
+            assert!(!browser_policy(
+                &configured,
+                "owned-image",
+                &["owned-model"],
+                600,
+                false,
+                false,
+                paired
+            ));
+            for field in ["Memory", "MemorySwap", "PidsLimit"] {
+                let mut excessive = configured.clone();
+                excessive["HostConfig"][field] =
+                    json!(configured["HostConfig"][field].as_u64().unwrap() + 1);
+                assert!(
+                    !browser_policy(
+                        &excessive,
+                        "owned-image",
+                        &["owned-model"],
+                        600,
+                        false,
+                        true,
+                        paired
+                    ),
+                    "{field}"
+                );
+            }
         }
         value["HostConfig"]["CapAdd"] = json!(["SYS_ADMIN"]);
         assert!(!browser_policy(
@@ -1657,7 +1874,35 @@ mod tests {
             &["owned-model"],
             600,
             false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires an inspection of an owned paired-account container"]
+    fn paired_browser_policy_accepts_real_docker_inspection() {
+        let path = std::env::var("PATCHRIOT_POLICY_FIXTURE_FILE").expect("inspection fixture path");
+        let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let container = &value[0];
+        let image = container["Image"].as_str().unwrap();
+        assert!(browser_policy(
+            container,
+            image,
+            &["owned-model", "--pentest"],
+            600,
+            true,
+            true,
             true
+        ));
+        assert!(!browser_policy(
+            container,
+            image,
+            &["owned-model", "--pentest"],
+            600,
+            true,
+            true,
+            false
         ));
     }
     #[test]
@@ -1749,7 +1994,7 @@ mod tests {
         );
         for value in [
             json!(599),
-            json!(3601),
+            json!(10801),
             json!("3600"),
             json!(-1),
             json!(null),

@@ -10,9 +10,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
-from browser_access import BrowserAccess, StaticAssetCache, configure_hermes_browser
+from browser_access import BrowserAccess, BrowserAccounts, StaticAssetCache, configure_hermes_browser
 
 ORIGIN = 'https://owned.example'
 ADDRESS = '0x1111111111111111111111111111111111111111'
@@ -438,6 +439,63 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cookies, {'first':'one', 'second':'two'})
         blocked=await page.evaluate("async()=>{try{await fetch('/account-data');return false;}catch{return true;}}")
         self.assertTrue(blocked, 'The page CSP must still block fetch')
+
+    async def test_hermes_browser_switches_between_isolated_account_profiles(self):
+        await self.start('session')
+        other = FixtureBrowser('session', str(Path(self.directory.name) / 'reference'),
+            os.environ.get('PATCHRIOT_BROWSER_EXECUTABLE', '/usr/bin/chromium'))
+        previous = os.environ.get('BROWSER_CDP_URL')
+        second_cdp = None
+        tasks = {'testing': 'patchriot-owned-testing-fixture', 'reference': 'patchriot-owned-reference-fixture'}
+        try:
+            second_cdp = await other.start()
+            configure_hermes_browser(self.browser.scope)
+            from tools.browser_tool import browser_navigate
+            for account, cdp, selected, untouched in [('testing', self.cdp, self.browser, other),
+                    ('reference', second_cdp, other, self.browser), ('testing', self.cdp, self.browser, other)]:
+                os.environ['BROWSER_CDP_URL'] = cdp
+                selected_count, other_count = len(selected.calls), len(untouched.calls)
+                result = await asyncio.to_thread(browser_navigate, ORIGIN + '/sign-in', task_id=tasks[account])
+                self.assertGreater(len(selected.calls), selected_count, result)
+                self.assertEqual(len(untouched.calls), other_count, result)
+            await self.browser.context.add_cookies([{'name':'account','value':'testing','url':ORIGIN}])
+            self.assertFalse(any(c['name'] == 'account' for c in await other.context.cookies()))
+        finally:
+            from tools.browser_tool_lifecycle import cleanup_browser
+            for account, cdp in [('testing', self.cdp), ('reference', second_cdp)]:
+                if cdp is not None:
+                    os.environ['BROWSER_CDP_URL'] = cdp
+                    await asyncio.to_thread(cleanup_browser, tasks[account])
+            await other.close()
+            if previous is None: os.environ.pop('BROWSER_CDP_URL', None)
+            else: os.environ['BROWSER_CDP_URL'] = previous
+
+    async def test_browser_exec_switches_accounts_with_default_and_named_daemons(self):
+        await self.start('session')
+        other = FixtureBrowser('session', str(Path(self.directory.name) / 'reference'),
+            os.environ.get('PATCHRIOT_BROWSER_EXECUTABLE', '/usr/bin/chromium'))
+        from tools.browser_use_cli import browser_exec, stop_harness_daemons
+        accounts = BrowserAccounts.__new__(BrowserAccounts)
+        with patch.dict(os.environ):
+            try:
+                second_cdp = await other.start()
+                accounts.runners = {'testing': SimpleNamespace(cdp=self.cdp),
+                    'reference': SimpleNamespace(cdp=second_cdp)}
+                configure_hermes_browser(self.browser.scope)
+                for session in ('', 'shared-fixture-name'):
+                    for account, selected, untouched in [('reference', other, self.browser),
+                            ('testing', self.browser, other), ('reference', other, self.browser)]:
+                        accounts.activate(account)
+                        selected_count, other_count = len(selected.calls), len(untouched.calls)
+                        result = await asyncio.to_thread(browser_exec,
+                            f'import time; new_tab({(ORIGIN + "/sign-in")!r}); time.sleep(1); print(page_info())',
+                            session=session, task_id='fixture-' + account)
+                        self.assertGreater(len(selected.calls), selected_count, result)
+                        self.assertEqual(len(untouched.calls), other_count, result)
+            finally:
+                await asyncio.to_thread(stop_harness_daemons)
+                await other.close()
+                Path('/work/default-account.json').unlink(missing_ok=True)
 
     async def test_hermes_browser_tool_attaches_to_the_scoped_context(self):
         # Exercise the actual pinned runtime tool, without asking any model.

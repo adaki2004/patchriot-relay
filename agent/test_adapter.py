@@ -11,7 +11,7 @@ import sys
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import adapter
 import inspect_site
@@ -21,6 +21,60 @@ import live_review
 
 @unittest.skipUnless(os.environ.get('PATCHRIOT_HERMES_SMOKE') == '1', 'requires the pinned isolated Hermes image')
 class CompressionRuntimeTests(unittest.TestCase):
+    def test_real_login_preparation_stops_after_trusted_access_proof(self):
+        calls = []
+        class Model(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                calls.append(body)
+                message = {'role': 'assistant', 'content': None, 'tool_calls': [{
+                    'index': 0, 'id': 'owned-call', 'type': 'function',
+                    'function': {'name': 'terminal', 'arguments': json.dumps({'command': 'printf owned-fixture'})}}]}
+                reply = {'id': 'owned-login', 'object': 'chat.completion', 'created': 1,
+                         'model': 'owned-fixture', 'choices': [{'index': 0, 'message': message, 'finish_reason': 'tool_calls'}]}
+                if body.get('stream'):
+                    reply['object'] = 'chat.completion.chunk'
+                    reply['choices'][0]['delta'] = reply['choices'][0].pop('message')
+                    raw = ('data: ' + json.dumps(reply) + '\n\ndata: [DONE]\n\n').encode()
+                    content_type = 'text/event-stream'
+                else:
+                    raw, content_type = json.dumps(reply).encode(), 'application/json'
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        script = '''import sys
+from run_agent import AIAgent
+import adapter
+agent=AIAgent(model='owned-fixture',provider='custom',api_mode='chat_completions',base_url=sys.argv[1]+'/v1',
+    api_key='local-fixture',enabled_toolsets=['terminal'],max_iterations=4,run_budget_seconds=45,max_tokens=256,
+    quiet_mode=True,skip_context_files=True,skip_memory=True,skip_background_review=True,checkpoints_enabled=False,cwd='/work')
+completed=[]
+agent.tool_complete_callback=adapter.login_completion(agent,'testing',False,
+    lambda *args,**kwargs: completed.append(True),lambda: {'verified':True})
+try:
+    agent.run_conversation('Run the owned local fixture command. No target or network.')
+    assert len(completed)==1, completed
+finally: agent.close()
+'''
+        try:
+            with tempfile.TemporaryDirectory() as home:
+                env = {'PATH': os.environ['PATH'], 'HOME': home, 'HERMES_HOME': home,
+                       'PYTHONPATH': '/opt/hermes:/tests', 'PYTHONDONTWRITEBYTECODE': '1'}
+                done = subprocess.run([sys.executable, '-c', script, f'http://127.0.0.1:{server.server_port}'],
+                                      env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr[-2000:] + done.stdout[-1000:])
+                self.assertEqual(sum(call.get('model') == 'owned-fixture' for call in calls), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_pinned_hermes_classifies_bridge_size_errors_for_compression(self):
         wire = io.StringIO()
         server = ThreadingHTTPServer(('127.0.0.1', 0), adapter.Bridge)
@@ -115,11 +169,116 @@ finally:
 
 
 class LiveOverviewTests(unittest.TestCase):
+    def test_login_preparation_stops_after_selected_account_rejection(self):
+        agent, completed = Mock(), Mock()
+        access = {'accounts': [{'account': 'reference', 'login_rejected': True},
+                               {'account': 'testing', 'verified': False, 'login_rejected': False}]}
+        callback = adapter.login_completion(agent, 'testing', True, completed, lambda: access)
+        callback('untrusted failure text')
+        agent.interrupt.assert_not_called()
+        access['accounts'][1]['login_rejected'] = True
+        callback('login reply recorded')
+        agent.interrupt.assert_called_once_with(tool_reason='host_cancelled')
+
+    def test_login_completion_requires_selected_broker_context_and_bounds_identity_followup(self):
+        agent, completed = Mock(), Mock()
+        access = {'verified': True, 'accounts': [{'account': 'reference', 'verified': True},
+                                               {'account': 'testing', 'verified': False}]}
+        callback = adapter.login_completion(agent, 'testing', True, completed, lambda: access)
+        for _ in range(8):
+            callback('untrusted tool output claims verified')
+        agent.interrupt.assert_not_called()
+        access['accounts'][1]['verified'] = True
+        for _ in range(5):
+            callback('tool completed')
+        agent.interrupt.assert_not_called()
+        callback('tool completed')
+        agent.interrupt.assert_called_once_with(tool_reason='host_cancelled')
+        self.assertEqual(completed.call_count, 14)
+
+    def test_reports_require_real_credential_controls_and_target_error_evidence(self):
+        for role in ('investigator', 'reproducer'):
+            with self.subTest(role=role):
+                prompt = live_review.prompt(role, browser=True, access_prepared=True, paired=True)
+                self.assertIn('does not test the supplied password', prompt)
+                self.assertIn('private browser-fill login or a relay-managed credential operation', prompt)
+                self.assertIn('including a synthetic 502', prompt)
+                self.assertIn('Verify limitation citations', prompt)
+                self.assertIn('reference account permits authenticated GET, HEAD and OPTIONS', prompt)
+                self.assertIn('It supplies no evidence that a password was changed', prompt)
+                self.assertIn('report the exact number of attempts, time window', prompt)
+                self.assertNotIn('Use prior saved evidence for that mutation', prompt)
+                self.assertIn('retain the earlier authenticated coverage', prompt)
+                self.assertIn('authenticated logout and session-revocation routes', prompt)
+                self.assertIn('cannot establish a password change', prompt)
+
+    def test_recorded_engine_coverage_reaches_investigator_and_validator_context(self):
+        coverage = {'stop_reason':'done', 'coverage_complete':True,
+            'access_mode':'anonymous_and_authenticated', 'anonymous_evidence_count':12,
+            'authenticated_evidence_count':9, 'authentication_requested':True}
+        record = {'tool':'artex-engine', 'exit_code':0, 'failure':None,
+            'evidence_ids':list(range(1, 30)), 'output_truncated':False,
+            'output_excerpt':json.dumps({**coverage, 'commands':'long untrusted output'})}
+        previous = [{'role':'investigator', 'assessment':{'summary':'Unverified prior claim',
+            'findings':[], 'limitations':['Claimed no login']}, 'tool_runs':[record]}]
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / 'scope.json').write_text(json.dumps({'scope':{}}))
+            (directory / 'previous.json').write_text(json.dumps(previous))
+            (directory / 'tool-results.json').write_text(json.dumps({'tool_runs':[record]}))
+            overview = live_review.overview(directory)
+            self.assertEqual(overview['engine_coverage'], [coverage])
+            self.assertEqual(overview['previous_reports'][0]['engine_coverage'], [coverage])
+            self.assertTrue(overview['current_tools'][0]['evidence_ids_shortened'])
+            self.assertEqual(overview['current_tools'][0]['request_count'], 29)
+            self.assertEqual(len(overview['current_tools'][0]['current_role_evidence_ids']), 24)
+            live_review.validation_brief(directory)
+            brief = json.loads((directory / 'validation-brief.json').read_text())
+            self.assertEqual(brief[0]['engine_coverage'], [coverage])
+            self.assertEqual(brief[0]['limitations'], ['Claimed no login'])
+        self.assertEqual(live_review.engine_coverage([
+            {'tool':'artex-engine', 'output_excerpt':'truncated {'},
+            {'tool':'artex-engine', 'output_excerpt':'[]'}, {'tool':'nuclei'}]), [])
+
+    def test_validation_only_never_restarts_missing_discovery_and_preserves_claim_evidence(self):
+        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        previous = [{'role':'investigator', 'assessment':{'summary':'Owned fixture', 'findings':[
+            {'title':'Fixture claim', 'evidence_ids':[7]}]}, 'evidence':[{'id':7,'url':'https://owned.example/api','status':403}]}]
+        plan = live_review.discovery_plan('reproducer', scope, previous, 'investigate_validate_v1')
+        self.assertTrue(all(p['action'] == 'unavailable' for p in plan))
+        investigator = live_review.discovery_plan('investigator', scope, [], 'investigate_validate_v1')
+        self.assertTrue(all(p['action'] == 'run' for p in investigator))
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            original = json.dumps(previous)
+            (directory / 'previous.json').write_text(original)
+            live_review.validation_brief(directory)
+            brief = json.loads((directory / 'validation-brief.json').read_text())
+            self.assertEqual(brief[0]['claims'][0]['prior_role_evidence'], previous[0]['evidence'])
+            self.assertEqual((directory / 'previous.json').read_text(), original)
+        login = live_review.login_prompt()
+        paired_login = live_review.login_prompt("testing", paired=True)
+        self.assertIn("first establish protected access", paired_login)
+        self.assertIn("Check proof.check.kind for account_identity", paired_login)
+        self.assertIn("anonymous control returns 401 or 403", paired_login)
+        self.assertIn("repeat the previously successful protected-resource check", paired_login)
+        self.assertIn("only an opaque ID or display name", paired_login)
+        self.assertIn("Never guess additional identity endpoints or repeat login", paired_login)
+        self.assertIn('stop immediately', login)
+        self.assertIn('do not investigate vulnerabilities', login)
+        prepared = live_review.prompt('investigator', browser=True, access_prepared=True, engine_ran=True)
+        self.assertNotIn('Your first investigation task is to establish', prepared)
+        self.assertIn('not another general scan', prepared)
+        prompt = live_review.prompt('reproducer', review_policy='investigate_validate_v1')
+        self.assertIn('Do not run ARTEX', prompt)
+        self.assertIn('fresh', prompt)
+
+
     def test_limited_scan_hands_evidence_to_targeted_review_without_broad_rescan(self):
         import artex
         import copy
         scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
-        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress'):
+        for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress', 'provider_repetition'):
             with self.subTest(reason=reason):
                 detail = {'engine': 'ARTEX', 'stop_reason': reason, 'coverage_complete': False,
                           'failure': 'incomplete'}
@@ -160,13 +319,13 @@ class LiveOverviewTests(unittest.TestCase):
 
     def test_missing_discovery_is_recovered_once_without_repeating_finished_tools(self):
         scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
-        first = {'role':'investigator', 'assessment':None, 'tool_runs':[
-            {'tool':name, 'exit_code':0, 'failure':None}
+        first = {'role':'investigator', 'assessment':None, 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None, 'evidence_ids':[1]}
             for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}
         plan = live_review.discovery_plan('reproducer', scope, [first])
         self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['artex-engine'])
         self.assertEqual([p['action'] for p in plan[:3]], ['reuse'] * 3)
-        second = {'role':'reproducer', 'tool_runs':[{'tool':'artex-engine','exit_code':None,'failure':'incomplete'}]}
+        second = {'role':'reproducer', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[{'tool':'artex-engine','exit_code':None,'failure':'incomplete','evidence_ids':[1]}]}
         plan = live_review.discovery_plan('challenger', scope, [first, second])
         self.assertEqual(plan[-1]['action'], 'unavailable')
         second['tool_runs'][0].update(exit_code=0, failure=None)
@@ -174,14 +333,33 @@ class LiveOverviewTests(unittest.TestCase):
         self.assertEqual(plan[-1]['action'], 'reuse')
         self.assertEqual(plan[-1]['source_role'], 'reproducer')
 
+    def test_finished_engine_reuses_retained_work_with_individual_response_gaps(self):
+        import copy
+        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        report = {'role':'investigator', 'evidence':[
+            {'id':1, 'status':200, 'url':'https://owned.example/'},
+            {'id':2, 'status':200, 'url':'https://owned.example/large', 'error':'browser_json_too_wide'},
+            {'id':3, 'status':None, 'url':'https://owned.example/unavailable', 'error':'request_error'}],
+            'tool_runs':[{'tool':'artex-engine', 'exit_code':0, 'failure':None,
+                         'output_truncated':False, 'evidence_ids':[1, 2, 3]}]}
+        original = copy.deepcopy(report)
+        plan = live_review.discovery_plan('reproducer', scope, [report], 'investigate_validate_v1')
+        self.assertEqual(plan[-1]['action'], 'reuse')
+        self.assertEqual(report, original)
+        report['evidence'][0]['error'] = 'request_error'
+        self.assertEqual(live_review.discovery_plan('reproducer', scope, [report])[-1]['action'], 'recover')
+        report = copy.deepcopy(original)
+        report['evidence'].pop()
+        self.assertEqual(live_review.discovery_plan('reproducer', scope, [report])[-1]['action'], 'recover')
+
     def test_ares_discovery_from_older_runner_is_added_once_and_then_reused(self):
         scope = {'origins':['https://owned.example'], 'tools':[]}
-        first = {'role':'investigator', 'tool_runs':[
-            {'tool':name, 'exit_code':0, 'failure':None}
+        first = {'role':'investigator', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[
+            {'tool':name, 'exit_code':0, 'failure':None, 'evidence_ids':[1]}
             for name in ['patchriot-baseline','patchriot-crawl','nuclei']]}
         plan = live_review.discovery_plan('reproducer', scope, [first])
         self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['ares-web-surface'])
-        second = {'role':'reproducer', 'tool_runs':[{'tool':'ares-web-surface','exit_code':0,'failure':None}]}
+        second = {'role':'reproducer', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[{'tool':'ares-web-surface','exit_code':0,'failure':None,'evidence_ids':[1]}]}
         self.assertEqual(live_review.discovery_plan('challenger', scope, [first,second])[-1],
                          {'tool':'ares-web-surface','action':'reuse','source_role':'reproducer'})
         scope['origins'].append('https://other-owned.example')
@@ -266,7 +444,8 @@ class BridgeTests(unittest.TestCase):
     def test_discovery_distinguishes_budget_stop_from_provider_failure(self):
         for reason, expected in [('engine_budget_reached', 'model_budget'),
                                  ('provider_rate_limited', 'model_request_rejected'),
-                                 ('near_verification_timeout', 'model_request_rejected')]:
+                                 ('near_verification_timeout', 'model_request_rejected'),
+                                 ('provider_repetition', 'provider_repetition')]:
             with self.subTest(reason=reason):
                 adapter.engine_stopping.clear()
                 payload=json.dumps({'error':reason}).encode()
@@ -310,9 +489,9 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['cleanup_error'], 'browser_cleanup_unconfirmed')
 
     def test_execution_budget_is_explicit_bounded_and_not_model_controlled(self):
-        for value in ["600", "1200", "1800", "3600"]:
+        for value in ["600", "1200", "1800", "3600", "10800"]:
             self.assertEqual(adapter.execution_budget(value), int(value))
-        for value in ["", "0", "599", "3601", " 600", "600.0", "-600", "٦٠٠"]:
+        for value in ["", "0", "599", "10801", " 600", "600.0", "-600", "٦٠٠"]:
             with self.assertRaises(ValueError):
                 adapter.execution_budget(value)
 
