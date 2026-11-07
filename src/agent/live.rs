@@ -5,6 +5,7 @@ use patchriot_protocol::{ReviewRole, pentests::*, website_reviews::WebsiteRunSta
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
 mod access;
+mod accounts;
 mod browser;
 mod login;
 mod near;
@@ -209,6 +210,8 @@ struct Counters {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Probe {
+    #[serde(skip)]
+    account_change: bool,
     method: String,
     url: String,
     #[serde(default)]
@@ -259,7 +262,10 @@ pub struct LiveBroker {
     scope: LiveScope,
     deadline: Instant,
     final_report_reserve: Duration,
-    counters: Mutex<Counters>,
+    counters: Arc<Mutex<Counters>>,
+    account: Option<AccountSlot>,
+    reference: Option<Arc<LiveBroker>>,
+    password_change_attempted: std::sync::atomic::AtomicBool,
     workflow: Mutex<Option<AssessmentWorkflow>>,
     access: access::Access,
     login_state: tokio::sync::Mutex<Option<Result<(), &'static str>>>,
@@ -300,7 +306,16 @@ impl LiveBroker {
             let mut workflow = self.workflow.lock().ok().and_then(|w| w.clone());
             if let Some(workflow) = &mut workflow {
                 if self.scope.authentication.is_some() {
-                    let proof = self.browser.lock().ok().and_then(|s| s.proof.clone());
+                    let proof = self
+                        .browser
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.proof.clone())
+                        .or_else(|| {
+                            self.reference
+                                .as_ref()
+                                .and_then(|b| b.browser.lock().ok()?.proof.clone())
+                        });
                     workflow.checks[5].state = if proof.is_some() {
                         CheckState::Recorded
                     } else if count.evidence.iter().any(|e| e.login || e.authenticated) {
@@ -354,6 +369,60 @@ impl LiveBroker {
         credentials: Option<&TestCredentials>,
         fallback: Option<(LiveProvider, &Path)>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        if scope.account_policy.is_some()
+            != matches!(credentials, Some(TestCredentials::SessionAccounts { .. }))
+        {
+            return Err("account_policy_credentials_mismatch".into());
+        }
+        Self::new_account_broker(provider, key_file, scope, deadline, credentials, fallback)
+    }
+    fn new_account_broker(
+        provider: LiveProvider,
+        key_file: &Path,
+        scope: LiveScope,
+        deadline: Instant,
+        credentials: Option<&TestCredentials>,
+        fallback: Option<(LiveProvider, &Path)>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        if let Some(TestCredentials::SessionAccounts { testing, reference }) = credentials {
+            if !credentials.unwrap().valid_for(&scope) {
+                return Err("invalid_test_credentials".into());
+            }
+            let first_credentials = TestCredentials::Session {
+                username: testing.username.clone(),
+                password: testing.password.clone(),
+            };
+            let second_credentials = TestCredentials::Session {
+                username: reference.username.clone(),
+                password: reference.password.clone(),
+            };
+            let mut first = Self::new_account_broker(
+                provider,
+                key_file,
+                scope.clone(),
+                deadline,
+                Some(&first_credentials),
+                fallback,
+            )?;
+            let mut second = Self::new_account_broker(
+                provider,
+                key_file,
+                scope,
+                deadline,
+                Some(&second_credentials),
+                fallback,
+            )?;
+            let first_inner = Arc::get_mut(&mut first).expect("new account broker");
+            let second_inner = Arc::get_mut(&mut second).expect("new reference broker");
+            first_inner.account = Some(AccountSlot::Testing);
+            second_inner.account = Some(AccountSlot::Reference);
+            second_inner.counters = first_inner.counters.clone();
+            first_inner
+                .access
+                .share_redactions(&mut second_inner.access);
+            first_inner.reference = Some(second);
+            return Ok(first);
+        }
         let key = read_provider_key(key_file)?;
         if fallback.is_some_and(|(secondary, _)| !provider.permits_secondary(secondary)) {
             return Err("unsupported primary and secondary model pair".into());
@@ -389,7 +458,10 @@ impl LiveBroker {
             deadline,
             final_report_reserve: (deadline.saturating_duration_since(Instant::now()) / 3)
                 .min(Duration::from_secs(FINAL_REPORT_SECONDS)),
-            counters: Mutex::new(Counters::default()),
+            counters: Arc::new(Mutex::new(Counters::default())),
+            account: None,
+            reference: None,
+            password_change_attempted: std::sync::atomic::AtomicBool::new(false),
             workflow: Mutex::new(None),
             access,
             login_state: tokio::sync::Mutex::new(None),
@@ -720,12 +792,21 @@ impl LiveBroker {
     }
 
     async fn http(&self, body: Value) -> Result<Value, &'static str> {
-        let probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
+        let mut probe: Probe = serde_json::from_value(body).map_err(|_| "invalid_probe")?;
+        let replacement = self.prepare_password_change(&mut probe)?;
         self.probe_url(&probe, false)?;
         if probe.authenticated {
             self.ensure_session().await?;
         }
-        self.exchange(probe, false).await
+        let reply = self.exchange(probe, false).await?;
+        if let Some(password) = replacement
+            && reply["evidence"]["status"]
+                .as_u64()
+                .is_some_and(|s| (200..300).contains(&s))
+        {
+            self.access.replace_browser_password(password)?;
+        }
+        Ok(reply)
     }
 
     async fn engine_http(&self, mut body: Value) -> Result<Value, &'static str> {
@@ -866,7 +947,11 @@ impl LiveBroker {
         {
             return Err("unsupported_probe_headers");
         }
-        safety::check_account_write(&url, &probe.method, probe.data.as_deref())?;
+        if !probe.account_change {
+            safety::check_account_write(&url, &probe.method, probe.data.as_deref())?;
+        } else if login || !probe.authenticated || !self.password_change_permitted() {
+            return Err("account_credential_changes_not_permitted");
+        }
         Ok(url)
     }
 
@@ -929,6 +1014,11 @@ impl LiveBroker {
             probe.data.as_ref().map(|v| self.access.redact(v))
         };
         let mut evidence = HttpEvidence {
+            account: if authenticated || login {
+                self.account
+            } else {
+                None
+            },
             request_body_excerpt: retained_body
                 .as_ref()
                 .map(|v| v.chars().take(2048).collect()),
@@ -1133,12 +1223,51 @@ impl LiveBroker {
             }
             return;
         }
+        if let Some(path) = request.path.strip_prefix("/patchriot/accounts/reference/") {
+            let result = if let Some(reference) = &self.reference {
+                match (request.method.as_str(), path) {
+                    ("POST", path) if path.starts_with("browser/") => {
+                        reference
+                            .browser_call(
+                                &format!("/patchriot/{path}"),
+                                request.body.clone().unwrap_or(Value::Null),
+                            )
+                            .await
+                    }
+                    ("POST", "http") => {
+                        reference
+                            .http(request.body.clone().unwrap_or(Value::Null))
+                            .await
+                    }
+                    ("POST", "artex/http") => {
+                        reference
+                            .engine_http(request.body.clone().unwrap_or(Value::Null))
+                            .await
+                    }
+                    _ => Err("unsupported_reference_operation"),
+                }
+            } else {
+                Err("reference_account_not_configured")
+            };
+            let (status, body) = match result {
+                Ok(body) => (200, body),
+                Err(reason) => (400, json!({"error":reason})),
+            };
+            reply_json(request.id, status, body, &output).await;
+            return;
+        }
         let (status, body) = match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/patchriot/access") => {
                 let protected_url = self.verified_access();
                 (
                     200,
-                    json!({"verified":protected_url.is_some(),"protected_url":protected_url}),
+                    json!({"verified":protected_url.is_some(),"protected_url":protected_url,
+                        "password_change_permitted":self.password_change_permitted(),
+                        "password_change_attempted":self.password_change_attempted.load(std::sync::atomic::Ordering::SeqCst),
+                        "accounts":([Some(self),self.reference.as_deref()].into_iter().flatten().filter_map(|broker| {
+                            let account=broker.account?; let url=broker.verified_access();
+                            Some(json!({"account":account,"verified":url.is_some(),"protected_url":url}))
+                        }).collect::<Vec<_>>())}),
                 )
             }
             ("GET", "/patchriot/budget") => {
@@ -1268,6 +1397,15 @@ impl LiveBroker {
         }
         let passed = passed && tools_valid;
         let mut result = PentestResult {
+            account_access: [Some(self), self.reference.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|broker| {
+                    let account = broker.account?;
+                    let proof = broker.browser.lock().ok()?.proof.clone()?;
+                    Some(AccountAccessProof { account, proof })
+                })
+                .collect(),
             workflow: None,
             kind: PentestResultKind::PentestAgentV1,
             scope_sha256: self.scope.hash().unwrap_or_default(),
@@ -1306,7 +1444,13 @@ impl LiveBroker {
                 .browser
                 .lock()
                 .ok()
-                .and_then(|state| state.proof.clone()),
+                .and_then(|state| state.proof.clone())
+                .or_else(|| {
+                    self.reference
+                        .as_ref()
+                        .and_then(|reference| reference.browser.lock().ok()?.proof.clone())
+                })
+                .map(Box::new),
             raw_summary: {
                 let redacted = self.access.redact(raw);
                 let raw = redacted.as_str();
@@ -1385,6 +1529,26 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         valid = false;
     }
     (records, valid)
+}
+
+async fn reply_json(id: u64, status: u16, body: Value, output: &mpsc::Sender<Frame>) {
+    let bytes = serde_json::to_vec(&body).expect("JSON body");
+    let _ = output
+        .send(Frame::Start {
+            id,
+            status,
+            content_type: "application/json",
+        })
+        .await;
+    for chunk in bytes.chunks(4096) {
+        let _ = output
+            .send(Frame::Chunk {
+                id,
+                hex: hex::encode(chunk),
+            })
+            .await;
+    }
+    let _ = output.send(Frame::End { id }).await;
 }
 
 /// Provider usage is a billing observation, not proof of an invoice. Charge
@@ -1643,6 +1807,7 @@ mod tests {
                 session_login: None,
                 wallet_login: None,
                 browser_login: None,
+                account_policy: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
                 methods: vec!["GET".into(), "HEAD".into(), "OPTIONS".into()],

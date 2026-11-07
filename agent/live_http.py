@@ -32,9 +32,20 @@ def retain_evidence(reply):
     return reply
 
 
-def request(method, url, headers=None, data=None, authenticated=True, *, discovery=False):
+def default_account():
+    try:
+        account = json.loads(Path('/work/default-account.json').read_text())
+        if account in ('testing', 'reference'): return account
+    except (OSError, ValueError): pass
+    return 'testing'
+
+
+def request(method, url, headers=None, data=None, authenticated=True, *, discovery=False, account=None):
     body = json.dumps({"method": method.upper(), "url": url, "headers": headers or {}, "data": data, "authenticated": authenticated}).encode()
     path = "/patchriot/artex/http" if discovery else "/patchriot/http"
+    account = account or default_account()
+    if account not in ('testing', 'reference'): raise ValueError('Unknown account context')
+    if account == 'reference': path = path.replace('/patchriot/', '/patchriot/accounts/reference/', 1)
     req = Request(os.environ["PATCHRIOT_BRIDGE_URL"] + path, data=body,
                   headers={"Content-Type": "application/json"})
     try:
@@ -50,13 +61,14 @@ if __name__ == "__main__":
     parser.add_argument("method", choices=["GET", "HEAD", "OPTIONS", "POST"])
     parser.add_argument("url")
     parser.add_argument("--data", help="Approved POST body: JSON or URL-encoded form, at most 16 KiB")
+    parser.add_argument("--account", choices=["testing", "reference"])
     parser.add_argument("--anonymous", action="store_true", help="Omit the test account and session cookies for a control request")
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--save-body", help="Save response text under /work for analysis")
     parser.add_argument("--body-chars", type=int, default=8192, choices=range(0,32769), metavar="0..32768")
     args = parser.parse_args()
     headers = dict(value.split(":", 1) for value in args.header)
-    result = request(args.method, args.url, {k.strip(): v.strip() for k, v in headers.items()}, data=args.data, authenticated=not args.anonymous)
+    result = request(args.method, args.url, {k.strip(): v.strip() for k, v in headers.items()}, data=args.data, authenticated=not args.anonymous, account=args.account)
     body = result.get("body", "")
     if args.save_body:
         path = Path(args.save_body).resolve()

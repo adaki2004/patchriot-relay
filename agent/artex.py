@@ -137,7 +137,7 @@ def task_body(scope, targets, seconds, role, allowance=None):
               'Do not repeat the whole public suite per context. Start signed-in coverage with the protected resource already verified by the relay: ' +
               scope.get('_protected_url', '') + '. Credentials, cookies and tokens are deliberately unavailable to you; do not request, read or export them. '
               'A failed authenticated response is a coverage gap, not proof of a vulnerability. ')
-    return {
+    body = {
         'name': 'Approved website assessment',
         'description': 'Authorized website assessment through scoped local mirrors.\n' + mapping,
         'goal': (
@@ -178,6 +178,20 @@ def task_body(scope, targets, seconds, role, allowance=None):
         'seed_first_intent': True,
         'coverage_enabled': True,
     }
+    if scope.get('account_policy') is not None:
+        body['goal'] += ('\nKeep testing and reference account contexts distinct. Establish actual object ownership and requesting identity before a cross-account finding. '
+            'Different logins alone do not prove different tenants or a vulnerability. Never request password or settings changes for the reference account. ')
+    if scope.get('_password_change_permitted') is True:
+        body['goal'] = body['goal'].replace('Never change passwords, initiate or confirm password recovery,', 'Never initiate or confirm password recovery,')
+        body['goal'] += ('\nThe requester explicitly permits one self-service password-change attempt on the TESTING account, after other useful checks. '
+            'Both distinct account identities were verified by the relay. Use ONLY the testing authenticated mirror, the observed self-service password endpoint, '
+            "and the application’s actual current_password/old_password and new_password field names. "
+            'Use the literal markers {{PATCHRIOT_CURRENT_PASSWORD}} and {{PATCHRIOT_NEW_PASSWORD}} as their values; '
+            'the relay supplies private values. A confirmation field may use the new-password marker. JSON or form bodies only. '
+            'Do not add an account ID/email, use admin/user-ID routes, retry a rejected attempt or reset/recover an account. '
+            'Unsupported paths/field layouts remain gaps. An HTTP success alone does not prove the password changed; do not overstate session-revocation findings. '
+            'Continue through the preserved reference account if testing-account access becomes unavailable.')
+    return body
 
 
 def stop_process(process):
@@ -377,15 +391,27 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
             signed = []
             engine_scope = dict(scope)
             engine_scope['_authentication_requested'] = bool(scope.get('authentication') or (access or {}).get('requested'))
-            if scope.get('authentication') and access and access.get('verified') is True:
+            requested_accounts = (access or {}).get('accounts') or [dict(account='testing', **{key: (access or {}).get(key) for key in ('verified', 'protected_url')})]
+            mapping, protected = {}, []
+            if scope.get('authentication'):
                 from urllib.parse import urlsplit
-                parsed = urlsplit(access.get('protected_url', ''))
-                origin = f'{parsed.scheme}://{parsed.netloc}'
-                if origin not in scope['origins']:
-                    raise ValueError('verified access is outside scope')
-                signed = [stack.enter_context(ScopeMirror(origin, deadline,
-                    fetch=authenticated_fetch or partial(request, discovery=True, authenticated=True), methods=scope['methods']))]
-                engine_scope.update(_authenticated_targets={origin: signed[0].url}, _protected_url=access['protected_url'])
+                for context in requested_accounts:
+                    if context.get('verified') is not True: continue
+                    account = context.get('account', 'testing')
+                    if account not in ('testing', 'reference'): raise ValueError('invalid account context')
+                    parsed = urlsplit(context.get('protected_url', ''))
+                    origin = f'{parsed.scheme}://{parsed.netloc}'
+                    if origin not in scope['origins']:
+                        raise ValueError('verified access is outside scope')
+                    mirror = stack.enter_context(ScopeMirror(origin, deadline,
+                        fetch=authenticated_fetch or partial(request, discovery=True, authenticated=True, account=account), methods=scope['methods']))
+                    signed.append(mirror)
+                    label = origin if len(requested_accounts) == 1 else f'{origin} ({account} account)'
+                    mapping[label] = mirror.url
+                    protected.append(f"{account}: {context['protected_url']}")
+                if mapping:
+                    engine_scope.update(_authenticated_targets=mapping, _protected_url='; '.join(protected),
+                        _password_change_permitted=(access or {}).get('password_change_permitted') is True)
             engine = stack.enter_context(Engine(directory / 'artex-state', os.environ.get('PATCHRIOT_BRIDGE_URL', ''), deadline, model))
             def refresh_budget():
                 from report_finish import bridge
@@ -406,9 +432,12 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
                     authenticated_target_mapping=engine_scope.get('_authenticated_targets', {}),
                     anonymous_evidence_count=sum(len(m.refs) for m in mirrors),
                     authenticated_evidence_count=sum(len(m.refs) for m in signed))
-                if signed and (not any(m.refs for m in signed) or not any(m.refs for m in mirrors)):
+                if signed and (any(not m.refs for m in signed) or not any(m.refs for m in mirrors)):
                     result['coverage_complete'] = False
                     result.setdefault('collection_errors', []).append('access_context_untested')
+                if scope.get('account_policy') is not None and len(signed) != 2:
+                    result['coverage_complete'] = False
+                    result.setdefault('collection_errors', []).append('account_context_unverified')
                 code = 0
                 if not result['coverage_complete']:
                     failure = 'incomplete'

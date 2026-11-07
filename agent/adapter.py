@@ -326,10 +326,13 @@ def main():
                               emit=lambda result: event("live_tool", run=result), role=role, workflow=workflow,
                               review_policy=review_policy)
         if scope.get("browser_login") is not None:
-            from browser_access import BrowserRunner
-            browser = BrowserRunner(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
+            from browser_access import BrowserAccounts
+            browser = BrowserAccounts(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
+            if scope.get("account_policy") is not None and role != "investigator":
+                browser.activate("reference")
             os.environ["BROWSER_CDP_URL"] = browser.cdp
     agent = None
+    login_agents = []
     try:
         from run_agent import AIAgent
         observed = []
@@ -338,7 +341,7 @@ def main():
             observed.append(args)
             event("tool_complete", args=args, kwargs=kwargs)
 
-        agent = AIAgent(
+        agent_options = dict(
             model=model, provider="custom", api_mode="chat_completions",
             base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-bridge",
             # The relay asks for the final report before its 2400-call ceiling.
@@ -353,6 +356,7 @@ def main():
             tool_start_callback=lambda *a, **k: event("tool_start", args=a, kwargs=k),
             tool_complete_callback=complete,
         )
+        agent = AIAgent(**agent_options)
         if source and (agent.tools or agent.valid_tool_names):
             raise RuntimeError("source review requires an empty model toolset")
         access_prepared, engine_ran = False, False
@@ -364,8 +368,16 @@ def main():
                 # Login uses the existing private browser helper, not the engine.
                 # The broker's paired evidence, never this model answer, grants access.
                 access_prepared = True
-                agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
-                agent.run_conversation(live_review.login_prompt())
+                for account in (['reference', 'testing'] if scope.get('account_policy') is not None else ['testing']):
+                    browser.activate(account)
+                    # Hermes caches its browser connection by agent session.
+                    # Each account must get a distinct session, even after CDP changes.
+                    login_agent = agent
+                    if account == 'reference':
+                        login_agent = AIAgent(**agent_options)
+                        login_agents.append(login_agent)
+                    login_agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
+                    login_agent.run_conversation(live_review.login_prompt(account=account, paired=scope.get('account_policy') is not None))
             elif scope.get('authentication') and scope.get('auth_check_path'):
                 from live_http import request
                 protected = scope['origins'][0] + scope['auth_check_path']
@@ -377,7 +389,7 @@ def main():
             engine_deadline = started + budget - min(900, budget / 3)
             workflow.begin("artex-engine")
             try:
-                result = artex.run(scope if access.get('verified') else public_scope(scope),
+                result = artex.run(scope if access.get('verified') or any(a.get('verified') for a in access.get('accounts', [])) else public_scope(scope),
                     role, engine_deadline, model=model, access=access,
                     stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
                     emit=lambda result: event("live_tool", run=result))
@@ -398,7 +410,7 @@ def main():
         )
         if live:
             live_review.validation_brief(Path('/work'))
-            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran, paired=scope.get("account_policy") is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         if live:
             import report_finish
@@ -427,6 +439,8 @@ def main():
         bridge_stopping.set()
         if agent:
             agent.close()
+        for login_agent in login_agents:
+            login_agent.close()
         if browser:
             browser.close()
         server.shutdown()

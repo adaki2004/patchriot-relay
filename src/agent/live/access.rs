@@ -5,13 +5,14 @@ use reqwest::{
     cookie::{CookieStore, Jar},
     header::{HeaderMap, HeaderValue, SET_COOKIE},
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 pub(super) struct Access {
     authorization: Option<Zeroizing<String>>,
     login_account: Option<(Zeroizing<String>, Zeroizing<String>)>,
-    secrets: Mutex<Vec<Zeroizing<String>>>,
+    replacement_password: Mutex<Option<Zeroizing<String>>>,
+    secrets: Arc<Mutex<Vec<Zeroizing<String>>>>,
     supplied_secret_count: usize,
     cookies: Jar,
     cookie_bytes: Mutex<usize>,
@@ -20,12 +21,58 @@ pub(super) struct Access {
 impl Access {
     /// Delivered to the isolated browser controller for filling the supplied
     /// account. Never include this response in a model transcript or report.
+    pub fn share_redactions(&mut self, other: &mut Self) {
+        let mut combined = self.secrets.lock().expect("secret store poisoned").clone();
+        combined.extend(
+            other
+                .secrets
+                .lock()
+                .expect("secret store poisoned")
+                .iter()
+                .cloned(),
+        );
+        self.supplied_secret_count = combined.len();
+        other.supplied_secret_count = combined.len();
+        self.secrets = Arc::new(Mutex::new(combined));
+        other.secrets = self.secrets.clone();
+    }
     pub fn browser_credentials(&self) -> Result<serde_json::Value, &'static str> {
         let (username, password) = self
             .login_account
             .as_ref()
             .ok_or("test_account_unavailable")?;
-        Ok(serde_json::json!({"username":username.as_str(),"password":password.as_str()}))
+        let replacement = self
+            .replacement_password
+            .lock()
+            .map_err(|_| "credential_unavailable")?;
+        Ok(
+            serde_json::json!({"username":username.as_str(),"password":replacement.as_deref().map(String::as_str).unwrap_or(password.as_str())}),
+        )
+    }
+    pub fn current_browser_password(&self) -> Result<Zeroizing<String>, &'static str> {
+        let replacement = self
+            .replacement_password
+            .lock()
+            .map_err(|_| "credential_unavailable")?;
+        replacement
+            .clone()
+            .or_else(|| {
+                self.login_account
+                    .as_ref()
+                    .map(|(_, password)| password.clone())
+            })
+            .ok_or("test_account_unavailable")
+    }
+    pub fn replace_browser_password(
+        &self,
+        password: Zeroizing<String>,
+    ) -> Result<(), &'static str> {
+        self.remember_secret(password.to_string())?;
+        *self
+            .replacement_password
+            .lock()
+            .map_err(|_| "credential_unavailable")? = Some(password);
+        Ok(())
     }
     pub fn browser_principal(&self) -> Option<&str> {
         self.login_account
@@ -62,7 +109,8 @@ impl Access {
         scope: &LiveScope,
         credentials: Option<&TestCredentials>,
     ) -> Result<Self, &'static str> {
-        if scope.authentication != credentials.map(TestCredentials::kind)
+        if matches!(credentials, Some(TestCredentials::SessionAccounts { .. }))
+            || scope.authentication != credentials.map(TestCredentials::kind)
             || credentials.is_some_and(|c| !c.valid())
         {
             return Err("invalid_test_credentials");
@@ -78,7 +126,7 @@ impl Access {
                 secrets.push(Zeroizing::new(token.clone()));
                 Some(format!("Bearer {token}"))
             }
-            TestCredentials::Wallet {} => None,
+            TestCredentials::Wallet {} | TestCredentials::SessionAccounts { .. } => None,
             TestCredentials::Session { password, .. } => {
                 secrets.push(Zeroizing::new(password.clone()));
                 None
@@ -89,6 +137,7 @@ impl Access {
             secrets.push(Zeroizing::new(header.split_once(' ').unwrap().1.to_owned()));
         }
         Ok(Self {
+            replacement_password: Mutex::new(None),
             authorization: authorization.map(Zeroizing::new),
             login_account: match credentials {
                 Some(TestCredentials::Session { username, password }) => Some((
@@ -98,7 +147,7 @@ impl Access {
                 _ => None,
             },
             supplied_secret_count: secrets.len(),
-            secrets: Mutex::new(secrets),
+            secrets: Arc::new(Mutex::new(secrets)),
             cookies: Jar::default(),
             cookie_bytes: Mutex::new(0),
             sessions: scope.methods.iter().any(|m| m == "POST") || credentials.is_some(),
@@ -366,6 +415,7 @@ mod tests {
             session_login: None,
             wallet_login: None,
             browser_login: None,
+            account_policy: None,
         };
         let credentials = TestCredentials::Bearer {
             token: "synthetic-bearer-for-tests".into(),

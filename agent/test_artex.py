@@ -24,6 +24,38 @@ SCOPE = {'origins': ['https://owned.example'], 'objective': 'Owned fixture only'
 
 
 class EngineTests(unittest.TestCase):
+    def test_two_accounts_share_one_engine_with_distinct_authenticated_mirrors(self):
+        from urllib.request import urlopen
+        for missing in (None, 'testing', 'reference'):
+            starts, calls = [], []
+            def request(method, url, headers=None, authenticated=False, account=None, **kwargs):
+                calls.append((authenticated, account))
+                return {'evidence': {'id': len(calls), 'status': 200}, 'body': account or 'public'}
+            class FakeEngine:
+                def __init__(self, *_): starts.append(1)
+                def __enter__(self): return self
+                def __exit__(self, *_): pass
+                def assess(self, scope, targets, role, **kwargs):
+                    urlopen(targets[0] + '/private').read()
+                    self.assertions = scope['_authenticated_targets']
+                    for label, target in self.assertions.items():
+                        if missing and f'({missing} account)' in label: continue
+                        urlopen(target + '/private').read()
+                    return {'coverage_complete': True, 'stop_reason': 'done', 'findings': []}
+            with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine), patch('live_http.request', request):
+                scope = dict(SCOPE, authentication='session', account_policy={'allow_password_changes': False})
+                receipt = artex.run(scope, 'investigator', time.monotonic() + 10, Path(folder),
+                    access={'accounts': [{'account': account, 'verified': True,
+                        'protected_url': 'https://owned.example/private'} for account in ('testing', 'reference')]})
+                result = json.loads((Path(folder) / 'artex-results.json').read_text())
+            self.assertEqual(starts, [1])
+            self.assertEqual(calls[0], (False, None))
+            expected = [(True, account) for account in ('testing', 'reference') if account != missing]
+            self.assertCountEqual(calls[1:], expected)
+            self.assertEqual(result['coverage_complete'], missing is None)
+            self.assertEqual(len(result['authenticated_target_mapping']), 2)
+            self.assertEqual(len(receipt['evidence_ids']), len(calls))
+
     def test_combined_investigation_uses_one_engine_and_two_isolated_contexts(self):
         from urllib.request import urlopen
         for use_private in (True, False):

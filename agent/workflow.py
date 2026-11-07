@@ -13,7 +13,7 @@ IDS = [*TOOLS.values(), 'authentication', 'authenticated_checks', 'evidence_revi
 
 def public_scope(scope):
     result = {key: copy.deepcopy(value) for key, value in scope.items()
-              if key not in ('authentication', 'auth_check_path', 'session_login', 'wallet_login', 'browser_login')}
+              if key not in ('authentication', 'auth_check_path', 'session_login', 'wallet_login', 'browser_login', 'account_policy')}
     result['tools'] = [t for t in scope.get('tools', []) if t in ('artex_engine_v1', 'active_web_v1', 'active_web_v2')]
     result['objective'] = ('Map and assess the approved public surface using anonymous requests. '
         'Run the recorded public checklist, investigate concrete leads and compare controls. '
