@@ -302,29 +302,55 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
     payload: T,
     maximum: u64,
 ) -> Result<R, Error> {
-    let signed_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs()
-        .try_into()?;
-    let request = sign(key, &config.audience, path, signed_at, payload)?;
-    let url = validate_url(&config.dispatcher)?.join(path)?;
-    let outgoing = client.post(url).json(&request);
-    // A completed live report may contain 4 MiB of evidence. Keep the short
-    // heartbeat timeout, but allow its upload more time while leases renew.
-    let outgoing = if path.ends_with("/work/complete") {
-        outgoing.timeout(Duration::from_secs(30))
-    } else {
-        outgoing
-    };
-    let response = outgoing.send().map_err(|error| {
-        DispatcherConnectionError(if error.is_timeout() {
-            "request timed out"
-        } else if error.is_connect() {
-            "connection failed"
+    let completion = path.ends_with("/work/complete");
+    // Negotiate via a distinct endpoint: old servers return 404 before seeing
+    // any result. Only that response enables the original signed JSON transport.
+    // A lost response is retried from the durable outbox with the same payload.
+    let compressed_path = format!("{path}-gzip");
+    let mut compressed = completion;
+    let response = loop {
+        let request_path = if compressed { &compressed_path } else { path };
+        let signed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            .try_into()?;
+        let request = sign(key, &config.audience, request_path, signed_at, &payload)?;
+        let url = validate_url(&config.dispatcher)?.join(request_path)?;
+        let outgoing = if compressed {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            serde_json::to_writer(&mut encoder, &request)?;
+            encoder.flush()?;
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+                .body(encoder.finish()?)
         } else {
-            "request failed"
-        })
-    })?;
+            client.post(url).json(&request)
+        };
+        // Reports can reach 32 MiB. Allow slow links without extending heartbeat
+        // deadlines or the server's 120-second signature freshness window.
+        let outgoing = if completion {
+            outgoing.timeout(Duration::from_secs(90))
+        } else {
+            outgoing
+        };
+        let response = outgoing.send().map_err(|error| {
+            DispatcherConnectionError(if error.is_timeout() {
+                "request timed out"
+            } else if error.is_connect() {
+                "connection failed"
+            } else {
+                "request failed"
+            })
+        })?;
+        if compressed && response.status() == reqwest::StatusCode::NOT_FOUND {
+            compressed = false;
+            continue;
+        }
+        break response;
+    };
     if !response.status().is_success() {
         let status = response.status().as_u16();
         // Log only known protocol codes. Server bodies can contain private
@@ -1493,6 +1519,85 @@ mod tests {
     }
 
     #[test]
+    fn completion_falls_back_only_for_an_old_endpoint_and_resigns_the_path() {
+        use std::net::TcpListener;
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("relay");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        initialize(
+            &state,
+            &HashMap::from([
+                ("--dispatcher", url.as_str()),
+                ("--audience", "test"),
+                ("--label", "Owned fixture"),
+                ("--compute-group", "owned"),
+            ]),
+        )
+        .unwrap();
+        let config = read_config(&state).unwrap();
+        let key = read_key(&state).unwrap();
+        let server = std::thread::spawn(move || {
+            for (path, status) in [("/work/complete-gzip", 404), ("/work/complete", 200)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let (end, length) = loop {
+                    let mut buffer = [0; 8192];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0 && bytes.len() < 16384);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        assert!(headers.starts_with(&format!("POST {path} ")));
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break (end + 4, length);
+                        }
+                    }
+                };
+                let decoded = if status == 404 {
+                    let mut decoded = Vec::new();
+                    flate2::read::GzDecoder::new(&bytes[end..end + length])
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                    decoded
+                } else {
+                    bytes[end..end + length].to_vec()
+                };
+                let signed: SignedRequest<serde_json::Value> =
+                    serde_json::from_slice(&decoded).unwrap();
+                patchriot_protocol::verify(&signed, "test", path, signed.signed_at).unwrap();
+                assert_eq!(signed.payload, serde_json::json!({"saved":"unchanged"}));
+                let body = "{}";
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        post::<_, serde_json::Value>(
+            &client,
+            &config,
+            &key,
+            "/work/complete",
+            serde_json::json!({"saved":"unchanged"}),
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn structured_website_outbox_survives_restart_and_oversized_writes_are_atomic() {
         let directory = tempfile::tempdir().unwrap();
         let finding = serde_json::json!({"title":"Observed fixture", "support":"needs_live_test", "explanation":"x".repeat(1200), "suggested_action":"x".repeat(800), "citations":[{"resource_sha256":"a".repeat(64),"quote":"x".repeat(300)}]});
@@ -1663,9 +1768,30 @@ mod tests {
                         }
                     }
                 };
-                let signed: serde_json::Value =
-                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
-                requests.push(signed["payload"].clone());
+                assert!(
+                    std::str::from_utf8(&bytes[..end])
+                        .unwrap()
+                        .contains("/work/complete-gzip ")
+                );
+                assert!(
+                    length < MAX_RESULT_BYTES / 20,
+                    "repeated evidence should compress"
+                );
+                let mut decoded = Vec::new();
+                flate2::read::GzDecoder::new(&bytes[end..end + length])
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+                let signed: SignedRequest<CompleteWork> = serde_json::from_slice(&decoded).unwrap();
+                let path = std::str::from_utf8(&bytes[..end])
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                patchriot_protocol::verify(&signed, "test", path, signed.signed_at).unwrap();
+                requests.push(serde_json::to_value(signed.payload).unwrap());
                 let body = if status == 503 {
                     "{}"
                 } else {

@@ -8,6 +8,7 @@ description = "Local execution controls for Patchriot agents"
 publish = false
 
 [dependencies]
+flate2 = "1"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 getrandom = "0.4"
 hex = "0.4.3"
