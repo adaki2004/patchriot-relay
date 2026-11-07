@@ -62,6 +62,9 @@ The browser reuses explicitly public, immutable scripts, styles, fonts and image
 
 Completed reports are saved before upload. Temporary delivery failures retry the same report while its lease stays active; they never rerun paid inference. Large report uploads have a separate 30-second timeout. Expired or cancelled work cannot be revived by a retry.
 
+Interrupted execution and rejected delivery preserve one bounded recovery file, `last-interrupted-work.json`, in the private device state directory with mode `0600`. It contains the lease ID, collected evidence and execution/cost receipt. It is an operator diagnostic artifact and requires operator-managed deletion after recovery. The relay keeps the paid-start marker and waits for the lease to close when a restarted process receives that assignment again.
+
+
 > **DON’T TRUST! VERIFY!** Read this source and its dependencies—or ask your own security agent to review them. Inspect the container, network and permission settings before pairing a machine or sharing private work.
 
 ## Joining the managed service
