@@ -17,6 +17,50 @@ import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_binary_body_is_unavailable_but_original_broker_evidence_is_preserved(self):
+        record = {'id': 91, 'status': 200, 'headers': {
+            'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},
+            'body_excerpt': 'PK\x03\x04\ufffd', 'body_sha256': 'original-hash'}
+        with tempfile.TemporaryDirectory() as folder, patch.object(live_http, 'EVIDENCE_DIRECTORY', Path(folder)):
+            result = live_http.text_response({'evidence': record, 'body': 'PK\x03\x04\ufffd'}, 'GET')
+            self.assertEqual(result['body'], '')
+            self.assertEqual(result['body_unavailable'], 'binary_response_not_supported')
+            self.assertEqual(result['evidence'], record)
+            self.assertEqual(json.loads((Path(folder) / '91.json').read_text()), record)
+
+    def test_binary_mirror_returns_an_explicit_broker_gap_and_preserves_head_checks(self):
+        def fixture(*args, **kwargs):
+            return {'body': 'PK\x03\x04\ufffd', 'evidence': {'id': 7, 'status': 200,
+                'headers': {'Content-Type': 'application/zip', 'content-disposition': 'attachment; filename=test.zip'},
+                'authenticated': True, 'account': 'reference'}}
+        with tools.ScopeMirror('https://owned.example', time.monotonic()+5, fixture) as mirror:
+            for method in ('GET', 'HEAD'):
+                client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+                client.request(method, '/download')
+                response = client.getresponse(); body = response.read(); client.close()
+                self.assertEqual(response.getheader('X-Patchriot-Evidence-Id'), '7')
+                self.assertEqual(response.getheader('X-Patchriot-Authenticated'), 'true')
+                if method == 'GET':
+                    self.assertEqual(response.status, 502)
+                    self.assertEqual(response.getheader('X-Patchriot-Relay-Error'), 'binary_response_not_supported')
+                    self.assertEqual(response.getheader('Content-Type'), 'text/plain; charset=utf-8')
+                    self.assertIsNone(response.getheader('Content-Disposition'))
+                    self.assertNotIn(b'PK', body)
+                else:
+                    self.assertEqual(response.status, 200)
+                    self.assertIsNone(response.getheader('X-Patchriot-Relay-Error'))
+                    self.assertEqual(response.getheader('Content-Type'), 'application/zip')
+
+    def test_text_json_xml_and_svg_are_not_mistaken_for_binary_downloads(self):
+        for media, body in [('text/html', '<h1>hello</h1>'), ('application/javascript', 'const x=1;'),
+                            ('application/vnd.api+json', '{"ok":true}'), ('application/problem+json', '{}'),
+                            ('application/soap+xml', '<xml/>'), ('image/svg+xml', '<svg/>'),
+                            ('application/octet-stream', '[core]\nrepositoryformatversion = 0\n'),
+                            ('application/octet-stream', '{"ok":true}')]:
+            self.assertFalse(live_http.binary_response({'body': body, 'evidence': {'headers': {'content-type': media}}}))
+        for body in ('PK\x03\x04\ufffd', 'abc\0def', '%PDF-1.4'):
+            self.assertTrue(live_http.binary_response({'body': body, 'evidence': {'headers': {}}}))
+
     def test_mirror_exposes_broker_access_context_without_trusting_target_headers(self):
         cases = [({}, 'false', None),
                  ({'authenticated': True, 'account': 'testing'}, 'true', 'testing'),
