@@ -72,7 +72,7 @@ fn temporary_storage(engine: bool) -> [(&'static str, &'static str); 3] {
     let mut mounts = TMPFS;
     if engine {
         // The selected engine needs a disposable PostgreSQL data directory.
-        // Still memory-backed, non-executable, and inside the same 2 GiB cap.
+        // Still memory-backed, non-executable, and inside the container memory cap.
         mounts[2].1 = "rw,nosuid,nodev,noexec,size=536870912,uid=65534,gid=65534";
     }
     mounts
@@ -880,7 +880,15 @@ async fn supervise(
 
 #[cfg(test)]
 fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: bool) -> bool {
-    browser_policy(container, image, args, seconds, engine, false)
+    browser_policy(container, image, args, seconds, engine, false, false)
+}
+
+fn container_resources(browser: bool, paired: bool) -> (u64, u64) {
+    match (browser, paired) {
+        (true, true) => (4_294_967_296, 512),
+        (true, false) => (2_147_483_648, 256),
+        (false, _) => (2_147_483_648, 128),
+    }
 }
 
 fn browser_policy(
@@ -890,10 +898,13 @@ fn browser_policy(
     seconds: u64,
     engine: bool,
     browser: bool,
+    paired: bool,
 ) -> bool {
+    let (memory, pids) = container_resources(browser, paired);
     let h = &container["HostConfig"];
     let c = &container["Config"];
-    container["Image"] == image
+    (!paired || browser)
+        && container["Image"] == image
         && container["State"]["Status"] == "created"
         && h["NetworkMode"] == "none"
         && h["ReadonlyRootfs"] == true
@@ -903,10 +914,10 @@ fn browser_policy(
         && no_entries(&h["CapAdd"])
         && security_options(&h["SecurityOpt"], browser)
         && (!browser || container["AppArmorProfile"] == "patchriot-browser-v1")
-        && h["Memory"] == 2_147_483_648u64
-        && h["MemorySwap"] == 2_147_483_648u64
+        && h["Memory"] == memory
+        && h["MemorySwap"] == memory
         && h["NanoCpus"] == 2_000_000_000u64
-        && h["PidsLimit"] == if browser { 256 } else { 128 }
+        && h["PidsLimit"] == pids
         && (!browser || h["ShmSize"] == 268435456u64)
         && h["CgroupnsMode"] == "private"
         && h["PidMode"] == ""
@@ -1113,6 +1124,7 @@ pub fn run(
         return Err("build the pinned agent/Dockerfile image before this check".into());
     }
     let browser = live.is_some_and(|task| task.evidence.context.scope.browser_login.is_some());
+    let paired = live.is_some_and(|task| task.evidence.context.scope.account_policy.is_some());
     if browser
         && !matches!(
             image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
@@ -1121,9 +1133,7 @@ pub fn run(
     {
         return Err("browser login requires the inspected adapter 13–20 image".into());
     }
-    if live.is_some_and(|task| task.evidence.context.scope.account_policy.is_some())
-        && image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str() != Some("20")
-    {
+    if paired && image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str() != Some("20") {
         return Err("multiple test accounts require the inspected adapter 20 image".into());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1244,14 +1254,8 @@ pub fn run(
             "no-new-privileges",
             "--user",
             "65534:65534",
-            "--memory",
-            "2g",
-            "--memory-swap",
-            "2g",
             "--cpus",
             "2",
-            "--pids-limit",
-            "128",
             "--init",
             "--cgroupns",
             "private",
@@ -1266,6 +1270,15 @@ pub fn run(
         ]
         .map(str::to_owned),
     );
+    let (memory, pids) = container_resources(browser, paired);
+    command.extend([
+        "--memory".into(),
+        memory.to_string(),
+        "--memory-swap".into(),
+        memory.to_string(),
+        "--pids-limit".into(),
+        pids.to_string(),
+    ]);
     let engine = live.is_some_and(|task| {
         task.evidence
             .context
@@ -1284,21 +1297,6 @@ pub fn run(
             "--security-opt=apparmor=patchriot-browser-v1".into(),
             "--shm-size=256m".into(),
         ]);
-        let pids = command
-            .iter()
-            .position(|arg| arg == "--pids-limit")
-            .ok_or("missing process limit")?;
-        let paired = live.is_some_and(|task| task.evidence.context.scope.account_policy.is_some());
-        command[pids + 1] = if paired { "512" } else { "256" }.into();
-        if paired {
-            for flag in ["--memory", "--memory-swap"] {
-                let index = command
-                    .iter()
-                    .position(|arg| arg == flag)
-                    .ok_or("missing memory limit")?;
-                command[index + 1] = "4g".into();
-            }
-        }
         Some(file)
     } else {
         None
@@ -1323,6 +1321,7 @@ pub fn run(
             settings.max_attempt_seconds,
             engine,
             browser,
+            paired,
         ) {
             return Err("agent container policy rejected".into());
         }
@@ -1762,7 +1761,8 @@ mod tests {
             &["owned-model"],
             600,
             false,
-            true
+            true,
+            false
         ));
         for (path, change) in [
             ("/AppArmorProfile", json!("unconfined")),
@@ -1779,9 +1779,68 @@ mod tests {
             let mut changed = value.clone();
             *changed.pointer_mut(path).unwrap() = change;
             assert!(
-                !browser_policy(&changed, "owned-image", &["owned-model"], 600, false, true),
+                !browser_policy(
+                    &changed,
+                    "owned-image",
+                    &["owned-model"],
+                    600,
+                    false,
+                    true,
+                    false
+                ),
                 "{path}"
             );
+        }
+        for paired in [false, true] {
+            let (memory, pids) = container_resources(true, paired);
+            let mut configured = value.clone();
+            configured["HostConfig"]["Memory"] = json!(memory);
+            configured["HostConfig"]["MemorySwap"] = json!(memory);
+            configured["HostConfig"]["PidsLimit"] = json!(pids);
+            assert!(browser_policy(
+                &configured,
+                "owned-image",
+                &["owned-model"],
+                600,
+                false,
+                true,
+                paired
+            ));
+            assert!(!browser_policy(
+                &configured,
+                "owned-image",
+                &["owned-model"],
+                600,
+                false,
+                true,
+                !paired
+            ));
+            assert!(!browser_policy(
+                &configured,
+                "owned-image",
+                &["owned-model"],
+                600,
+                false,
+                false,
+                paired
+            ));
+            for field in ["Memory", "MemorySwap", "PidsLimit"] {
+                let mut excessive = configured.clone();
+                excessive["HostConfig"][field] =
+                    json!(configured["HostConfig"][field].as_u64().unwrap() + 1);
+                assert!(
+                    !browser_policy(
+                        &excessive,
+                        "owned-image",
+                        &["owned-model"],
+                        600,
+                        false,
+                        true,
+                        paired
+                    ),
+                    "{field}"
+                );
+            }
         }
         value["HostConfig"]["CapAdd"] = json!(["SYS_ADMIN"]);
         assert!(!browser_policy(
@@ -1790,7 +1849,35 @@ mod tests {
             &["owned-model"],
             600,
             false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires an inspection of an owned paired-account container"]
+    fn paired_browser_policy_accepts_real_docker_inspection() {
+        let path = std::env::var("PATCHRIOT_POLICY_FIXTURE_FILE").expect("inspection fixture path");
+        let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let container = &value[0];
+        let image = container["Image"].as_str().unwrap();
+        assert!(browser_policy(
+            container,
+            image,
+            &["owned-model", "--pentest"],
+            600,
+            true,
+            true,
             true
+        ));
+        assert!(!browser_policy(
+            container,
+            image,
+            &["owned-model", "--pentest"],
+            600,
+            true,
+            true,
+            false
         ));
     }
     #[test]
