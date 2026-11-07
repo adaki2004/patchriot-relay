@@ -1,7 +1,7 @@
 """Pinned web checks. Every target request crosses the relay's scope broker.
 
 Nuclei sees a loopback mirror of one approved HTTPS origin. Its container has no
-external network, and only our three installed templates are selected. Scanner
+external network, and only our six installed templates are selected. Scanner
 matches are leads; controls and another role must assess their actual impact.
 """
 import hashlib
@@ -367,7 +367,7 @@ def run(scope, previous, directory=Path("/work"), emit=lambda _: None, role="inv
         records.append(result)
         emit(result)
     result = {"profile": PROFILE, "role": role, "tool_runs": records, "discovery_plan": plan,
-              "limitations": ["Only three curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
+              "limitations": ["Six curated Nuclei templates; no general CVE, credential, authenticated, headless or network scan.",
                               "The scanner receives selected headers and decoded text through the broker; use recorded target requests as the source of evidence.",
                               "Scanner host/IP and curl snippets describe a loopback mirror, not the target's IP, TLS or exact upstream headers.",
                               "All matches are hypotheses until controls and review establish impact."]}

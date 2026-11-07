@@ -36,6 +36,23 @@ impl Access {
         self.secrets = Arc::new(Mutex::new(combined));
         other.secrets = self.secrets.clone();
     }
+    /// Fresh cookie jar sharing only redaction knowledge with the current role.
+    pub(super) fn fresh_session(&self) -> Result<Self, &'static str> {
+        let password = self.replacement_password()?;
+        Ok(Self {
+            authorization: None,
+            login_account: self
+                .login_account
+                .as_ref()
+                .map(|(name, _)| (name.clone(), password)),
+            replacement_password: Mutex::new(None),
+            secrets: self.secrets.clone(),
+            supplied_secret_count: self.supplied_secret_count,
+            cookies: Jar::default(),
+            cookie_bytes: Mutex::new(0),
+            sessions: true,
+        })
+    }
     pub fn browser_credentials(&self) -> Result<serde_json::Value, &'static str> {
         let (username, password) = self
             .login_account

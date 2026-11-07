@@ -24,25 +24,26 @@ pub(super) struct BrowserState {
     pub(super) verified_origin: Option<String>,
     pub(super) password_login: Option<accounts::PasswordLogin>,
     pub(super) password_login_attempted: bool,
+    pub(super) password_login_proof: Option<BrowserAccessProof>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BrowserRequest {
-    method: String,
-    url: String,
+pub(super) struct BrowserRequest {
+    pub(super) method: String,
+    pub(super) url: String,
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    pub(super) headers: BTreeMap<String, String>,
     #[serde(default)]
-    data: Option<String>,
+    pub(super) data: Option<String>,
     #[serde(default = "enabled")]
-    authenticated: bool,
+    pub(super) authenticated: bool,
     #[serde(default)]
-    login: bool,
+    pub(super) login: bool,
 }
-struct BrowserReply {
-    evidence: HttpEvidence,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(super) struct BrowserReply {
+    pub(super) evidence: HttpEvidence,
+    pub(super) headers: Vec<(String, String)>,
+    pub(super) body: Vec<u8>,
 }
 
 impl LiveBroker {
@@ -121,7 +122,7 @@ impl LiveBroker {
         }
     }
 
-    async fn browser_exchange(
+    pub(super) async fn browser_exchange(
         &self,
         mut input: BrowserRequest,
     ) -> Result<BrowserReply, &'static str> {
@@ -431,7 +432,7 @@ impl LiveBroker {
         }
         if input.login
             && evidence.error.is_none()
-            && evidence.status.is_some_and(|s| (200..300).contains(&s))
+            && evidence.status.is_some_and(|s| (200..400).contains(&s))
             && let Some(login) = accounts::PasswordLogin::learn(
                 &self.access,
                 &evidence.method,
@@ -480,7 +481,7 @@ impl LiveBroker {
         })
     }
 
-    async fn browser_check(&self, input: Value) -> Result<Value, &'static str> {
+    pub(super) async fn browser_check(&self, input: Value) -> Result<Value, &'static str> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Check {
@@ -953,6 +954,8 @@ mod tests {
                     head.contains("authorization: Bearer synthetic-reference-token");
                 let logged_in = head.contains("cookie: session=synthetic-session")
                     || head.contains("authorization: Bearer synthetic-browser-token")
+                    || head.contains("authorization: Bearer synthetic-new-login-token")
+                    || head.contains("cookie: session=synthetic-new-session")
                     || reference_account;
                 let (status, cookie, body) = if head.starts_with("POST /different/session ") {
                     assert_eq!(
@@ -1457,6 +1460,8 @@ mod tests {
         assert_eq!(result["evidence"]["status"], 200);
         assert_ne!(result["evidence"]["authenticated"], true);
         assert_eq!(result["password_login_control"]["account"], "testing");
+        assert_eq!(result["password_login_control"]["verified"], true);
+        assert!(broker.password_change_control()["fresh_session_proof"].is_object());
         assert_eq!(
             broker.password_change_control()["login_control_evidence_id"],
             result["evidence"]["id"]

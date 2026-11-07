@@ -9,9 +9,11 @@ const NEXT: &str = "{{PATCHRIOT_NEW_PASSWORD}}";
 
 /// A private replay of an observed login, with its password replaced by a
 /// marker. Models cannot choose the destination or submit replacement fields.
+#[derive(Clone)]
 pub(super) struct PasswordLogin {
     url: String,
     content_type: String,
+    headers: BTreeMap<String, String>,
     data: Zeroizing<String>,
 }
 
@@ -29,48 +31,155 @@ impl PasswordLogin {
             return None;
         }
         let content_type = headers.get("content-type")?.split(';').next()?.trim();
-        let mut fields: BTreeMap<String, String> = match content_type {
+        let mut fields: Value = match content_type {
             "application/json" => serde_json::from_str(raw).ok()?,
             "application/x-www-form-urlencoded" => {
                 let pairs: Vec<_> = url::form_urlencoded::parse(raw.as_bytes())
                     .into_owned()
                     .collect();
-                let fields: BTreeMap<_, _> = pairs.iter().cloned().collect();
+                let fields: BTreeMap<String, String> = pairs.iter().cloned().collect();
                 if fields.len() != pairs.len() {
                     return None;
                 }
-                fields
+                serde_json::to_value(fields).ok()?
             }
             _ => return None,
         };
         let principal = access.browser_principal()?;
         let password = access.current_browser_password().ok()?;
-        if !fields.values().any(|v| v == principal)
-            || fields
-                .values()
-                .filter(|v| v.as_str() == password.as_str())
-                .count()
-                != 1
-        {
+        let mut principals = 0;
+        let mut passwords = 0;
+        replace_login_password(
+            &mut fields,
+            principal,
+            &password,
+            &mut principals,
+            &mut passwords,
+            0,
+        )?;
+        if principals == 0 || passwords != 1 {
             return None;
-        }
-        for value in fields.values_mut() {
-            if value == password.as_str() {
-                *value = NEXT.into();
-            }
         }
         let data = if content_type == "application/json" {
             serde_json::to_string(&fields).ok()?
         } else {
             url::form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(fields)
+                .extend_pairs(
+                    fields
+                        .as_object()?
+                        .iter()
+                        .map(|(k, v)| (k, v.as_str().unwrap_or(""))),
+                )
                 .finish()
         };
+        let headers = headers
+            .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "content-type"
+                        | "origin"
+                        | "referer"
+                        | "x-csrf-token"
+                        | "x-xsrf-token"
+                        | "csrf-token"
+                )
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         Some(Self {
             url: url.into(),
             content_type: content_type.into(),
+            headers,
             data: Zeroizing::new(data),
         })
+    }
+
+    fn needs_csrf(&self) -> bool {
+        self.headers.keys().any(|key| csrf_name(key))
+            || self.data.to_ascii_lowercase().contains("csrf")
+    }
+
+    fn refreshed_probe(
+        &self,
+        password: &str,
+        html: &str,
+        cookies: &str,
+    ) -> Result<Probe, &'static str> {
+        use scraper::{Html, Selector};
+        if html.len() > 256 * 1024 || html.matches('<').count() > 4096 {
+            return Err("fresh_login_csrf_page_too_large");
+        }
+        let document = Html::parse_document(html);
+        let selector =
+            Selector::parse("input[type=hidden][name][value], meta[name][content]").unwrap();
+        let mut tokens = BTreeMap::<String, Vec<String>>::new();
+        for element in document.select(&selector) {
+            let name = element.value().attr("name").unwrap();
+            if csrf_name(name) {
+                let value = element
+                    .value()
+                    .attr("value")
+                    .or_else(|| element.value().attr("content"))
+                    .unwrap();
+                tokens
+                    .entry(normalized(name))
+                    .or_default()
+                    .push(value.into());
+            }
+        }
+        for pair in cookies.split(';') {
+            if let Some((name, value)) = pair.trim().split_once('=')
+                && csrf_name(name)
+            {
+                tokens
+                    .entry(normalized(name))
+                    .or_default()
+                    .push(value.into());
+            }
+        }
+        let resolve = |name: &str| -> Result<String, &'static str> {
+            let key = normalized(name).trim_start_matches('x').to_owned();
+            let mut values: Vec<_> = tokens
+                .iter()
+                .filter(|(k, _)| k.trim_start_matches('x') == key)
+                .flat_map(|(_, v)| v.iter())
+                .collect();
+            values.sort();
+            values.dedup();
+            if values.len() != 1 || values[0].is_empty() || values[0].len() > 2048 {
+                return Err("fresh_login_csrf_missing_or_ambiguous");
+            }
+            Ok(values[0].clone())
+        };
+        let mut probe = self.probe(password);
+        for (name, value) in &mut probe.headers {
+            if csrf_name(name) {
+                *value = resolve(name)?;
+            }
+        }
+        if self.content_type == "application/json" {
+            let mut body: Value = serde_json::from_str(probe.data.as_deref().unwrap())
+                .map_err(|_| "invalid_login_fields")?;
+            refresh_csrf_fields(&mut body, &resolve)?;
+            probe.data = Some(body.to_string());
+        } else {
+            let mut fields: BTreeMap<String, String> =
+                url::form_urlencoded::parse(probe.data.as_deref().unwrap().as_bytes())
+                    .into_owned()
+                    .collect();
+            for (name, value) in &mut fields {
+                if csrf_name(name) {
+                    *value = resolve(name)?;
+                }
+            }
+            probe.data = Some(
+                url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(fields)
+                    .finish(),
+            );
+        }
+        Ok(probe)
     }
 
     fn probe(&self, password: &str) -> Probe {
@@ -87,12 +196,115 @@ impl PasswordLogin {
         Probe {
             method: "POST".into(),
             url: self.url.clone(),
-            headers: BTreeMap::from([("content-type".into(), self.content_type.clone())]),
+            headers: self.headers.clone(),
             data: Some(self.data.replace(&marker, &replacement)),
             authenticated: false,
             account_change: false,
         }
     }
+}
+
+fn replace_login_password(
+    value: &mut Value,
+    principal: &str,
+    password: &str,
+    principals: &mut usize,
+    passwords: &mut usize,
+    depth: usize,
+) -> Option<()> {
+    if depth > 16 {
+        return None;
+    }
+    match value {
+        Value::String(text) => {
+            if text == principal {
+                *principals += 1;
+            }
+            if text == password {
+                *passwords += 1;
+                *text = NEXT.into();
+            }
+        }
+        Value::Object(fields) => {
+            for child in fields.values_mut() {
+                replace_login_password(
+                    child,
+                    principal,
+                    password,
+                    principals,
+                    passwords,
+                    depth + 1,
+                )?;
+            }
+        }
+        Value::Array(fields) => {
+            for child in fields {
+                replace_login_password(
+                    child,
+                    principal,
+                    password,
+                    principals,
+                    passwords,
+                    depth + 1,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+fn csrf_name(name: &str) -> bool {
+    let name = normalized(name);
+    name.contains("csrf") || name.contains("xsrf")
+}
+
+fn refresh_csrf_fields(
+    value: &mut Value,
+    resolve: &impl Fn(&str) -> Result<String, &'static str>,
+) -> Result<(), &'static str> {
+    match value {
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                if csrf_name(name) {
+                    *value = Value::String(resolve(name)?);
+                } else {
+                    refresh_csrf_fields(value, resolve)?;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                refresh_csrf_fields(value, resolve)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn fresh_access_token(value: &Value) -> Option<&str> {
+    let mut candidates = Vec::new();
+    fn collect<'a>(value: &'a Value, found: &mut Vec<&'a str>, depth: usize) {
+        if depth > 16 {
+            return;
+        }
+        if let Value::Object(fields) = value {
+            for (name, child) in fields {
+                if matches!(normalized(name).as_str(), "accesstoken" | "token") {
+                    if let Some(token) = child.as_str().filter(|v| !v.is_empty()) {
+                        found.push(token);
+                    }
+                } else {
+                    collect(child, found, depth + 1);
+                }
+            }
+        }
+    }
+    collect(value, &mut candidates, 0);
+    candidates.sort_unstable();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates[0])
 }
 
 fn normalized(value: &str) -> String {
@@ -150,7 +362,8 @@ impl LiveBroker {
         let login = self.password_login_evidence.load(Ordering::SeqCst);
         json!({"attempted":self.password_change_attempted.load(Ordering::SeqCst),
             "accepted_evidence_id":(accepted > 0).then_some(accepted),
-            "login_control_evidence_id":(login > 0).then_some(login)})
+            "login_control_evidence_id":(login > 0).then_some(login),
+            "fresh_session_proof":self.browser.lock().ok().and_then(|state| state.password_login_proof.clone())})
     }
 
     /// One isolated login control after an accepted authorized change. The
@@ -160,36 +373,172 @@ impl LiveBroker {
             return Err("account_credential_changes_not_permitted");
         }
         let password = self.access.replacement_password()?;
-        let probe = {
+        let (login, proof) = {
             let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
             let login = state
                 .password_login
                 .as_ref()
-                .ok_or("password_login_not_observed")?;
+                .ok_or("password_login_not_observed")?
+                .clone();
             let origin = public_url(&login.url)?.origin().ascii_serialization();
             if state.verified_origin.as_deref() != Some(origin.as_str()) {
                 return Err("authenticated_origin_mismatch");
             }
-            let probe = login.probe(&password);
-            self.probe_url(&probe, false)?;
+            self.probe_url(&login.probe(&password), false)?;
             if state.password_login_attempted {
                 return Err("password_login_already_attempted");
             }
+            let proof = state
+                .proof
+                .clone()
+                .ok_or("authenticated_identity_missing")?;
             state.password_login_attempted = true;
-            probe
+            (login, proof)
         };
-        // An anonymous exchange sends no prior cookie or bearer token and does
-        // not install its new session. Only redacted evidence leaves the relay.
-        let mut result = self.exchange(probe, false).await?;
-        self.password_login_evidence.store(
-            result["evidence"]["id"]
-                .as_u64()
-                .expect("recorded HTTP evidence") as u32,
-            Ordering::SeqCst,
-        );
-        result["password_login_control"] = json!({"account":"testing","fresh_session":true,
-            "interpretation":"Compare the observed login response with the original successful login. HTTP success alone does not establish authentication."});
+        let session = self.fresh_password_session()?;
+        session
+            .browser_call("/patchriot/browser/begin", json!({}))
+            .await?;
+        let mut probe = login.probe(&password);
+        if login.needs_csrf() {
+            let page = login.headers.get("referer").cloned().unwrap_or_else(|| {
+                format!(
+                    "{}{}",
+                    self.scope.origins[0],
+                    self.scope
+                        .browser_login
+                        .as_ref()
+                        .and_then(|b| b.entry_path.as_deref())
+                        .unwrap_or("/")
+                )
+            });
+            self.scope.permits("GET", &page)?;
+            let bootstrap = session
+                .browser_exchange(browser::BrowserRequest {
+                    method: "GET".into(),
+                    url: page,
+                    headers: BTreeMap::new(),
+                    data: None,
+                    authenticated: true,
+                    login: true,
+                })
+                .await?;
+            if bootstrap.evidence.error.is_some() || bootstrap.evidence.status != Some(200) {
+                return Err("fresh_login_csrf_page_unavailable");
+            }
+            let cookies = session.access.cookies(&public_url(&login.url)?, true);
+            probe = login.refreshed_probe(
+                &password,
+                &String::from_utf8_lossy(&bootstrap.body),
+                cookies.as_ref().and_then(|v| v.to_str().ok()).unwrap_or(""),
+            )?;
+            if let Some(cookie) = cookies {
+                probe.headers.insert(
+                    "cookie".into(),
+                    cookie
+                        .to_str()
+                        .map_err(|_| "invalid_session_cookie")?
+                        .into(),
+                );
+            }
+        }
+        let reply = session
+            .browser_exchange(browser::BrowserRequest {
+                method: probe.method,
+                url: probe.url,
+                headers: probe.headers,
+                data: probe.data,
+                authenticated: true,
+                login: true,
+            })
+            .await?;
+        self.password_login_evidence
+            .store(reply.evidence.id, Ordering::SeqCst);
+        let body = self.access.redact(&String::from_utf8_lossy(&reply.body));
+        let mut result = json!({"evidence":reply.evidence,"body":body,
+            "password_login_control":{"account":"testing","fresh_session":true,"verified":false}});
+        if reply.evidence.error.is_some()
+            || !reply
+                .evidence
+                .status
+                .is_some_and(|s| (200..400).contains(&s))
+        {
+            result["password_login_control"]["reason"] = json!("fresh_login_rejected");
+            return Ok(result);
+        }
+        let (resource, pointer) = {
+            let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+            let resource = count
+                .evidence
+                .iter()
+                .find(|e| e.id == proof.authenticated_id)
+                .ok_or("authenticated_resource_unavailable")?
+                .url
+                .clone();
+            let BrowserAccessCheck::AccountIdentity { json_pointer, .. } = proof.check else {
+                return Err("authenticated_identity_missing");
+            };
+            (resource, json_pointer)
+        };
+        let mut headers = BTreeMap::new();
+        if let Some(cookie) = session.access.cookies(&public_url(&resource)?, true) {
+            headers.insert(
+                "cookie",
+                cookie
+                    .to_str()
+                    .map_err(|_| "invalid_session_cookie")?
+                    .to_owned(),
+            );
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(&reply.body)
+            && let Some(token) = fresh_access_token(&value)
+        {
+            headers.insert("authorization", format!("Bearer {token}"));
+        }
+        let check = session
+            .browser_check(json!({"url":resource,"headers":headers,"json_pointer":pointer}))
+            .await;
+        match check {
+            Ok(check) => {
+                result["password_login_control"]["verified"] = check["verified"].clone();
+                result["password_login_control"]["proof"] = check["proof"].clone();
+                if check["verified"] == true {
+                    self.browser
+                        .lock()
+                        .map_err(|_| "browser_unavailable")?
+                        .password_login_proof = serde_json::from_value(check["proof"].clone()).ok();
+                }
+                result["verification_evidence"] = check["evidence"].clone();
+            }
+            Err(reason) => result["password_login_control"]["reason"] = json!(reason),
+        }
         Ok(result)
+    }
+
+    fn fresh_password_session(&self) -> Result<Self, &'static str> {
+        Ok(Self {
+            provider: self.provider,
+            client: self.client.clone(),
+            near: None,
+            key: self.key.clone(),
+            fallback_key: None,
+            fallback_provider: None,
+            scope: self.scope.clone(),
+            deadline: self.deadline,
+            final_report_reserve: self.final_report_reserve,
+            counters: self.counters.clone(),
+            account: self.account,
+            reference: None,
+            password_change_attempted: std::sync::atomic::AtomicBool::new(true),
+            password_change_evidence: std::sync::atomic::AtomicU32::new(0),
+            password_login_evidence: std::sync::atomic::AtomicU32::new(0),
+            workflow: Mutex::new(None),
+            access: self.access.fresh_session()?,
+            login_state: tokio::sync::Mutex::new(None),
+            browser: Mutex::new(browser::BrowserState::default()),
+            #[cfg(test)]
+            test_target: self.test_target,
+        })
     }
 
     pub(super) fn password_change_permitted(&self) -> bool {
@@ -312,6 +661,50 @@ impl LiveBroker {
 mod tests {
     use super::*;
     #[test]
+    fn nested_login_refreshes_csrf_and_retains_other_json_types() {
+        let scope: LiveScope = serde_json::from_value(json!({"origins":["https://owned.example"],
+            "methods":["GET","POST"],"authentication":"session","browser_login":{},
+            "tools":["authenticated_http_v1","browser_login_v1"]}))
+        .unwrap();
+        let credentials = TestCredentials::Session {
+            username: "fixture@example.com".into(),
+            password: "synthetic-password".into(),
+        };
+        let access = access::Access::new(&scope, Some(&credentials)).unwrap();
+        let headers = BTreeMap::from([
+            ("content-type".into(), "application/json".into()),
+            ("origin".into(), "https://owned.example".into()),
+            ("x-csrf-token".into(), "old-csrf".into()),
+        ]);
+        let login = PasswordLogin::learn(&access, "POST", "https://owned.example/session", &headers,
+            Some(r#"{"credentials":{"email":"fixture@example.com","secret":"synthetic-password"},"remember":true,"csrf_token":"old-csrf"}"#)).unwrap();
+        assert!(login.needs_csrf());
+        let probe = login
+            .refreshed_probe(
+                "Pr!fresh",
+                r#"<meta name="csrf-token" content="fresh-csrf">"#,
+                "",
+            )
+            .unwrap();
+        let body: Value = serde_json::from_str(probe.data.as_deref().unwrap()).unwrap();
+        assert_eq!(body["credentials"]["secret"], "Pr!fresh");
+        assert_eq!(body["remember"], true);
+        assert_eq!(body["csrf_token"], "fresh-csrf");
+        assert_eq!(probe.headers["x-csrf-token"], "fresh-csrf");
+        assert_eq!(probe.headers["origin"], "https://owned.example");
+        assert!(login.refreshed_probe("Pr!fresh", "", "").is_err());
+        assert!(login.refreshed_probe("Pr!fresh", r#"<meta name="csrf-token" content="one"><meta name="csrf-token" content="two">"#, "").is_err());
+        assert_eq!(
+            fresh_access_token(&json!({"token":"one","data":{"access_token":"two"}})),
+            None
+        );
+        assert_eq!(
+            fresh_access_token(&json!({"refresh_token":"refresh","data":{"access_token":"one"}})),
+            Some("one")
+        );
+    }
+
+    #[test]
     fn password_login_replays_only_observed_flat_credentials() {
         let scope: LiveScope = serde_json::from_value(json!({"origins":["https://owned.example"],
             "methods":["GET","POST"],"profile":"web_active_v2", "authentication":"session",
@@ -378,7 +771,6 @@ mod tests {
             r#"{"email":"other@example.com","password":"synthetic-password"}"#,
             r#"{"email":"fixture@example.com","password":"wrong-password"}"#,
             r#"{"email":"fixture@example.com","password":"synthetic-password","confirmation":"synthetic-password"}"#,
-            r#"{"credentials":{"email":"fixture@example.com","password":"synthetic-password"}}"#,
         ] {
             assert!(
                 PasswordLogin::learn(

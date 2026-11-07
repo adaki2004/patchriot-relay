@@ -1441,6 +1441,8 @@ impl LiveBroker {
                 run.output_excerpt = cleaned;
             }
         }
+        tool_runs.retain(|run| run.tool != "patchriot-coverage");
+        tool_runs.push(coverage::record(&self.scope, &count.evidence, &tool_runs));
         let passed = passed && tools_valid;
         let mut result = PentestResult {
             account_access: [Some(self), self.reference.as_deref()]
@@ -1560,7 +1562,7 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
         if let Ok(run) = parsed {
             bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
-            if records.len() < 20 && bytes <= 256 * 1024 && run.valid(evidence) {
+            if records.len() < 31 && bytes <= 512 * 1024 && run.valid(evidence) {
                 if run.tool == "artex-engine" {
                     records.retain(|previous: &LiveToolRun| {
                         !(previous.tool == run.tool

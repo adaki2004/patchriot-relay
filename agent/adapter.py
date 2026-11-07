@@ -387,6 +387,14 @@ def main():
                 request('GET', protected, authenticated=False)
             access = bridge('/patchriot/access')
             access['requested'] = bool(scope.get('authentication'))
+            if role == 'investigator':
+                import scoped_scanners
+                extra = scoped_scanners.run(scope, tools['tool_runs'], access=access,
+                    emit=lambda receipt: event("live_tool", run=receipt))
+                tools['tool_runs'].extend(extra)
+                (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))
+            import coverage_ledger
+            coverage_ledger.build(scope, tools['tool_runs'])
             event("phase", name="artex_engine")
             engine_deadline = started + budget - min(900, budget / 3)
             workflow.begin("artex-engine")
@@ -418,6 +426,12 @@ def main():
             import report_finish
             result = report_finish.finish(agent, result, started + budget - 30,
                 emit=report_validation)
+        if live:
+            import coverage_ledger
+            ledger = coverage_ledger.build(scope, tools['tool_runs'])
+            # The relay generates the authoritative report ledger from its
+            # own evidence. This local file only helps orient the agent.
+
         regression = False
         for args in observed:
             if len(args) < 4 or args[1] != "terminal":
