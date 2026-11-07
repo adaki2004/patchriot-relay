@@ -17,6 +17,25 @@ import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_mirror_exposes_broker_access_context_without_trusting_target_headers(self):
+        cases = [({}, 'false', None),
+                 ({'authenticated': True, 'account': 'testing'}, 'true', 'testing'),
+                 ({'authenticated': True, 'account': 'reference'}, 'true', 'reference'),
+                 ({'authenticated': True, 'account': 'invalid\r\nheader'}, 'true', None),
+                 ({'id': None}, 'unknown', None)]
+        for context, authenticated, account in cases:
+            with self.subTest(context=context):
+                def fixture(*args, **kwargs):
+                    return {'body': 'fixture', 'evidence': {'id': 7, 'status': 200,
+                        'headers': {'x-patchriot-authenticated': 'spoofed',
+                                    'x-patchriot-account': 'spoofed'}, **context}}
+                with tools.ScopeMirror('https://owned.example', time.monotonic()+5, fixture) as mirror:
+                    client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+                    client.request('GET', '/')
+                    response = client.getresponse(); response.read(); client.close()
+                    self.assertEqual(response.getheader('X-Patchriot-Authenticated'), authenticated)
+                    self.assertEqual(response.getheader('X-Patchriot-Account'), account)
+
     def test_crawl_discovers_literal_client_routes_without_executing_scripts(self):
         calls = []
         def fetch(method, url, headers=None, **kwargs):

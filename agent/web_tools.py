@@ -251,6 +251,15 @@ class ScopeMirror:
                         self.send_header("X-Patchriot-Relay-Error", error)
                     if type(evidence.get("id")) is int and evidence['id'] > 0:
                         self.send_header("X-Patchriot-Evidence-Id", str(evidence['id']))
+                        # HttpEvidence omits authenticated=false on the wire.
+                        # The broker may inject access even when curl supplies
+                        # no Authorization header to this local mirror.
+                        authenticated = evidence.get('authenticated', False) is True
+                        self.send_header("X-Patchriot-Authenticated", "true" if authenticated else "false")
+                        if authenticated and evidence.get('account') in ('testing', 'reference'):
+                            self.send_header("X-Patchriot-Account", evidence['account'])
+                    else:
+                        self.send_header("X-Patchriot-Authenticated", "unknown")
                     self.send_header("Content-Length", str(len(payload)))
                     self.send_header("Connection", "close")
                     self.end_headers()
