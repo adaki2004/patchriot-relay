@@ -263,16 +263,36 @@ fn run_probe(
         if report
             .process
             .as_ref()
-            .is_some_and(|p| p.outcome != Outcome::Completed)
+            .is_some_and(|p| !matches!(p.outcome, Outcome::Completed | Outcome::ProcessFailed))
         {
-            // Killing the attached CLI alone does not stop a container. Request
-            // SIGKILL before any diagnostic reads; removal below is the final
-            // cleanup check. It is fine if an OOM/finished process already exited.
+            // Killing the attached CLI alone does not stop a container after a
+            // timeout/cancellation/output limit. Ordinary nonzero exits first
+            // retain Docker's own exit/OOM state instead of racing it with kill.
             let _ = docker.control(&["container", "kill", &owned.name]);
         }
-        let state = docker
+        let mut state = docker
             .inspect("container", &owned.name)
             .map_err(|_| "container_state_unconfirmed")?;
+        // Docker can publish the attach exit before the daemon's OOM event has
+        // settled. Wait briefly for that evidence; exit 137 alone is NOT proof
+        // of memory enforcement, and the success check below still requires OOM.
+        if probe == "memory" {
+            for _ in 0..10 {
+                if state["State"]["OOMKilled"] == true && state["State"]["Running"] == false {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                state = docker
+                    .inspect("container", &owned.name)
+                    .map_err(|_| "container_state_unconfirmed")?;
+            }
+        }
+        if state["State"]["Running"] == true {
+            let _ = docker.control(&["container", "kill", &owned.name]);
+            state = docker
+                .inspect("container", &owned.name)
+                .map_err(|_| "container_state_unconfirmed")?;
+        }
         report.container_started = state["State"]["StartedAt"]
             .as_str()
             .is_some_and(|v| !v.is_empty() && !v.starts_with("0001-"));
