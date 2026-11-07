@@ -179,7 +179,7 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'X-Patchriot-Body-Truncated: true means the response is only a prefix, regardless of its local Content-Length. Do not repeatedly analyze it as a complete file. '
             'You may try a bounded byte-range read; if the target ignores Range, record the unavailable remainder as a coverage gap and continue. '
             'Binary responses are unavailable through this text-only broker. binary_response_not_supported is a transport limitation, not a target error. '
-            'Never reconstruct, brute-force, decompress or repair binary bytes from decoded text or redacted evidence; replacement characters have irreversibly lost bytes. Record the gap and continue other surfaces. '
+            'Never reconstruct, brute-force, decompress or repair binary bytes from decoded text or redacted evidence; replacement characters have irreversibly lost bytes. Record the gap and continue other surfaces. Decoded replacement characters cannot establish target-side file corruption; an incorrect MIME header is a separate observation, not proof that original bytes are damaged. '
             'Inspect the reachable application, use suitable installed tools, validate material leads with benign control requests and record your findings. '
             'The deliverable is a completed scoped assessment, not a requirement to find a vulnerability. '
             'Use /work/coverage-ledger.json and /work/tool-results.json to prioritize untested boundaries and inspect existing scanner leads. Simple curl, jq, Python and ffuf commands are available through the approved mirrors. Compare controls and avoid repeating finished public discovery. '
