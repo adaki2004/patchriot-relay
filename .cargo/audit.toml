@@ -1,0 +1,12 @@
+[advisories]
+# Reviewed 2026-11-07 against registry nearai-inference-sdk 0.2.1.
+# CI runs scripts/check-audit-scope.py before accepting these exceptions.
+# RUSTSEC-2023-0071 concerns RSA private-key operations. The SDK's sole JWT
+# production consumer rejects algorithms other than ES384 and verifies public
+# NVIDIA JWKS signatures. No RSA private-key operation is used by the relay.
+# RUSTSEC-2026-0387 affects secret-integer timing. The older bigint reaches this
+# same public-signature verification path through p256/p384. Relay wallet and
+# SDK ECDH use k256 0.14 with patched crypto-bigint 0.7.10.
+# These dependencies remain affected. Re-review on any guarded graph/source
+# change and remove the exceptions when upstream permits patched dependencies.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

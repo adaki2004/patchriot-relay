@@ -557,6 +557,8 @@ A long repeating response can stop Hermes before it writes a report. The relay c
 
 ## Additional scoped checks
 
+The dependency audit records two reviewed exceptions for the pinned NEAR SDK's JWT dependencies. Its production JWT consumer accepts ES384 and verifies NVIDIA public signatures. The RSA private-key operations covered by RUSTSEC-2023-0071 are unused. The older bigint covered by RUSTSEC-2026-0387 is confined to public-signature verification. Wallet signing and SDK ECDH use the patched bigint dependency. These upstream dependencies remain affected. CI checks the reviewed versions, reverse dependency paths and verification source before applying the exceptions. Reassess them when updating the SDK. [RSA advisory](https://rustsec.org/advisories/RUSTSEC-2023-0071), [bigint advisory](https://rustsec.org/advisories/RUSTSEC-2026-0387)
+
 Adapter 21 adds bounded HTTP method/origin controls, endpoint discovery from observed paths, a web scanner with passive analysis and a selected reflected-input rule for approved active GET queries, and API-schema-generated read cases. The signature stage uses six curated templates. Public discovery runs once. Verified account contexts add protected-resource checks under the same relay limits. Scanner output supplies leads for the existing investigator and fresh validator.
 
 The final coverage ledger is constructed by the relay from recorded requests. Each observation identifies its URL, method, account context and evidence. Unverified vulnerability classes remain explicit obligations. The displayed ledger is size-bounded and reports omitted units. Complete request evidence remains in the normal private report. Model-authored completion cannot close a coverage obligation.

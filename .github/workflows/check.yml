@@ -75,4 +75,5 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install 1.94.1 --profile minimal
       - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: python3 scripts/check-audit-scope.py
       - run: cargo audit
