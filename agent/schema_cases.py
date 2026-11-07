@@ -21,10 +21,15 @@ def check_references(value, depth=0):
 def generate(document, origin):
     import schemathesis
     from hypothesis import given, settings, Phase, HealthCheck
+    from hypothesis.errors import Unsatisfiable
     if schemathesis.__version__ != '4.33.1':
         raise ValueError('schema_version_mismatch')
+    if not isinstance(document, dict):
+        raise ValueError('schema_object_required')
     check_references(document)
-    schema = schemathesis.openapi.from_dict(document, config=schemathesis.Config())
+    graphql_mode = '__schema' in document or '__schema' in document.get('data', {})
+    schema = (schemathesis.graphql.from_dict(document, config=schemathesis.Config()) if graphql_mode
+              else schemathesis.openapi.from_dict(document, config=schemathesis.Config()))
     cases, gaps = [], []
     for result in schema.get_all_operations():
         if len(cases) >= 12:
@@ -34,26 +39,49 @@ def generate(document, origin):
         if operation is None:
             gaps.append('unsupported_schema_operation')
             continue
-        if operation.method.upper() not in ('GET', 'HEAD', 'OPTIONS'):
+        if graphql_mode and not operation.label.startswith(schema.client_schema.query_type.name + '.'):
+            gaps.append('graphql_mutation_requires_disposable_inputs')
+            continue
+        if not graphql_mode and operation.method.upper() not in ('GET', 'HEAD', 'OPTIONS'):
             gaps.append('schema_state_change_requires_disposable_inputs')
             continue
 
-        @settings(max_examples=3, derandomize=True, database=None, deadline=None,
-                  phases=[Phase.generate], suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much])
-        @given(case=operation.as_strategy())
-        def collect(case):
-            kwargs = schema.as_transport_kwargs(case, base_url=origin, headers={})
-            url = kwargs['url']
-            if kwargs.get('params'):
-                url += ('&' if '?' in url else '?') + urlencode(kwargs['params'], doseq=True)
-            # Schemas cannot introduce credentials or an outbound destination.
-            cases.append({'method': case.method.upper(), 'url': url})
+        modes = [schemathesis.GenerationMode.POSITIVE] if graphql_mode else list(schemathesis.GenerationMode)
+        for mode in modes:
+            @settings(max_examples=3, derandomize=True, database=None, deadline=None,
+                      phases=[Phase.generate], suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much])
+            @given(case=operation.as_strategy(generation_mode=mode))
+            def collect(case):
+                kwargs = schema.as_transport_kwargs(case, base_url=origin, headers={})
+                url = kwargs['url']
+                if kwargs.get('params'):
+                    url += ('&' if '?' in url else '?') + urlencode(kwargs['params'], doseq=True)
+                # Schemas cannot introduce credentials or an outbound destination.
+                generated = {'method': case.method.upper(), 'url': url, 'generation_mode': mode.value}
+                if not graphql_mode:
+                    responses = document.get('paths', {}).get(operation.path, {}).get(operation.method.lower(), {}).get('responses', {})
+                    generated['expected_statuses'] = list(responses)[:32]
+                if graphql_mode:
+                    from graphql import parse, OperationDefinitionNode, OperationType
+                    payload = kwargs.get('json', {})
+                    operations = [node for node in parse(payload.get('query', '')).definitions if isinstance(node, OperationDefinitionNode)]
+                    if len(operations) != 1 or operations[0].operation != OperationType.QUERY:
+                        raise ValueError('graphql_query_required')
+                    generated.update(url=origin, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
+                cases.append(generated)
 
-        collect()
+            try:
+                collect()
+            except Unsatisfiable:
+                gaps.append('schema_generation_mode_unavailable')
     return {'cases': cases[:12], 'gaps': sorted(set(gaps))}
 
 
 if __name__ == '__main__':
+    if sys.argv[1] == '--introspection-query':
+        from graphql import get_introspection_query
+        print(json.dumps({'query': get_introspection_query(descriptions=False)}))
+        raise SystemExit(0)
     raw = Path(sys.argv[1]).read_text()
     if len(raw) > 256 * 1024:
         raise ValueError('schema_size_limit')

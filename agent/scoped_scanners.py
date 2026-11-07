@@ -16,6 +16,7 @@ import threading
 import time
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 from live_http import request
 from web_tools import ScopeMirror, allowed, capture, fetch_checked, record
@@ -84,7 +85,12 @@ def discovery(client, urls, execute=capture):
     results = []
     for origin in client.scope['origins']:
         paths = sorted({urlsplit(u).path.lstrip('/') for u in urls if allowed(origin, u)})
-        paths = [p for p in paths if p and '\n' not in p][:12]
+        paths = [p for p in paths if p and '\n' not in p][:6]
+        variants = []
+        for path in paths:
+            if '.' not in path.rsplit('/', 1)[-1]:
+                variants.extend([path.rstrip('/') + '/', path.rstrip('/') + '.json'])
+        paths = list(dict.fromkeys(paths + variants))[:12]
         control = 'patchriot-missing-' + secrets.token_hex(10)
         control_reply = client('GET', origin + '/' + control)
         if not paths:
@@ -118,8 +124,13 @@ def zap(client, urls):
                                  env={**os.environ, 'JAVA_OPTS': '-Xmx512m'}, start_new_session=True)
         def api(component, kind, action, **params):
             url = f'http://127.0.0.1:{port}/JSON/{component}/{kind}/{action}/?' + urlencode(params)
-            with urlopen(Request(url, headers={'X-ZAP-API-Key': key}), timeout=10) as response:
-                value = json.load(response)
+            try:
+                with urlopen(Request(url, headers={'X-ZAP-API-Key': key}), timeout=10) as response:
+                    value = json.load(response)
+            except HTTPError as error:
+                with error:
+                    detail = json.loads(error.read(4096))
+                raise ValueError('scanner_api_' + str(detail.get('code', 'error'))) from None
             if 'code' in value and value.get('code') != 'OK':
                 raise ValueError('scanner_api_error')
             return value
@@ -146,7 +157,17 @@ def zap(client, urls):
                         local = mirror.url + urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
                         api('core', 'action', 'accessUrl', url=local, followRedirects='false')
                         if parsed.query and client.scope.get('profile') in ('web_active_v1', 'web_active_v2'):
-                            scan = api('ascan', 'action', 'scan', url=local, recurse='false', method='GET')['scan']
+                            # ZAP queues its site-tree insertion after accessUrl returns.
+                            # Retry only the explicit pre-start 'URL not found' result.
+                            indexed_by = min(client.deadline, time.monotonic() + 5)
+                            while True:
+                                try:
+                                    scan = api('ascan', 'action', 'scan', url=local, recurse='false', method='GET')['scan']
+                                    break
+                                except ValueError as error:
+                                    if str(error) != 'scanner_api_url_not_found' or time.monotonic() >= indexed_by:
+                                        raise
+                                    time.sleep(0.1)
                             while time.monotonic() < client.deadline and client.calls < client.limit:
                                 if api('ascan', 'view', 'status', scanId=scan)['status'] == '100':
                                     break
@@ -181,12 +202,23 @@ def zap(client, urls):
 
 
 def schema_checks(client, urls, execute=capture):
-    candidates = [u for u in urls if re.search(r'(openapi|swagger|api-docs)', urlsplit(u).path, re.I)]
+    candidates = [u for u in urls if re.search(r'(openapi|swagger|api-docs|graphql)', urlsplit(u).path, re.I)]
     results = []
     if not candidates:
         return {'state': 'inapplicable', 'reason': 'no_observed_api_schema'}
     for url in candidates[:2]:
-        reply = client('GET', url)
+        graphql_mode = 'graphql' in urlsplit(url).path.lower()
+        if graphql_mode:
+            if 'POST' not in client.scope['methods'] or client.account == 'reference':
+                client.gaps.append('graphql_post_not_permitted')
+                continue
+            query = execute([sys.executable, str(Path(__file__).with_name('schema_cases.py')), '--introspection-query'], timeout=5)
+            if query['failure'] or query['exit_code'] != 0:
+                client.gaps.append('graphql_introspection_unavailable')
+                continue
+            reply = client('POST', url, {'Content-Type': 'application/json'}, data=query['output'])
+        else:
+            reply = client('GET', url)
         if reply.get('body_truncated'):
             client.gaps.append('schema_truncated')
             continue
@@ -195,10 +227,13 @@ def schema_checks(client, urls, execute=capture):
         except ValueError:
             client.gaps.append('schema_unavailable')
             continue
+        if not isinstance(schema, dict):
+            client.gaps.append('schema_object_required')
+            continue
         with tempfile.TemporaryDirectory(prefix='patchriot-schema-') as directory:
             source = Path(directory) / 'schema.json'
             source.write_text(json.dumps(schema))
-            origin = urlsplit(url).scheme + '://' + urlsplit(url).netloc
+            origin = url if graphql_mode else urlsplit(url).scheme + '://' + urlsplit(url).netloc
             generated = execute([sys.executable, str(Path(__file__).with_name('schema_cases.py')), str(source), origin], timeout=25)
             if generated['failure'] or generated['exit_code'] != 0:
                 client.gaps.append('schema_generation_incomplete')
@@ -208,7 +243,9 @@ def schema_checks(client, urls, execute=capture):
                 response = client(case['method'], case['url'], case.get('headers'), data=case.get('data'))
                 evidence = response.get('evidence', {})
                 results.append({'evidence_id': evidence.get('id'), 'status': evidence.get('status'),
-                                'server_error': (evidence.get('status') or 0) >= 500})
+                                'server_error': (evidence.get('status') or 0) >= 500,
+                                'generation_mode': case.get('generation_mode'),
+                                'status_declared': str(evidence.get('status')) in case.get('expected_statuses', []) or 'default' in case.get('expected_statuses', []) or str(evidence.get('status', ''))[:1] + 'XX' in case.get('expected_statuses', [])})
             client.gaps.extend(cases['gaps'])
     return {'cases': results, 'interpretation': 'Server errors and schema anomalies require reproduction and demonstrated security impact.'}
 
@@ -219,7 +256,7 @@ def run(scope, records, access=None, fetch=request, emit=lambda value: None, dir
         try:
             evidence = json.loads(path.read_text())
             url = evidence.get('url', '')
-            if evidence.get('status') == 200 and re.search(r'(openapi|swagger|api-docs)', urlsplit(url).path, re.I) and any(allowed(origin, url) for origin in scope['origins']):
+            if evidence.get('status') == 200 and re.search(r'(openapi|swagger|api-docs|graphql)', urlsplit(url).path, re.I) and any(allowed(origin, url) for origin in scope['origins']):
                 urls.append(url)
         except (OSError, ValueError, TypeError):
             continue
@@ -242,6 +279,10 @@ def run(scope, records, access=None, fetch=request, emit=lambda value: None, dir
         ('zap', ZAP_VERSION, zap, 100), ('schemathesis', SCHEMA_VERSION, schema_checks, 45),
     ):
         started, observed = time.monotonic(), int(time.time())
+        if tool == 'ffuf':
+            detected = capture(['ffuf', '-V'], timeout=3)
+            match = re.search(r'\d+\.\d+(?:\.\d+)?', detected['output'])
+            version = match.group() if match else 'unavailable'
         refs, details, gaps = [], [], []
         for account in ([None] if tool == 'ffuf' else contexts):
             client = Requests(scope, time.monotonic() + seconds, fetch, account)
@@ -250,7 +291,7 @@ def run(scope, records, access=None, fetch=request, emit=lambda value: None, dir
                 if account is not None:
                     protected = [context['protected_url'] for context in accounts
                                  if context.get('account') == account and context.get('verified') and context.get('protected_url')]
-                    selected = protected + [url for url in urls if re.search(r'(openapi|swagger|api-docs)', urlsplit(url).path, re.I)]
+                    selected = protected + [url for url in urls if re.search(r'(openapi|swagger|api-docs|graphql)', urlsplit(url).path, re.I)]
                 detail = function(client, selected)
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                 detail = {'state': 'blocked', 'reason': type(error).__name__}

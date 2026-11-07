@@ -17,6 +17,17 @@ import ares_web
 
 
 class WebToolsTests(unittest.TestCase):
+    def test_crawl_discovers_literal_client_routes_without_executing_scripts(self):
+        calls = []
+        def fetch(method, url, headers=None, **kwargs):
+            calls.append(url)
+            body = '<script src="/app.js"></script>' if url.endswith('/') else "fetch('/api/items'); fetch('https://other.example/private')" if url.endswith('/app.js') else '{}'
+            content = 'text/javascript' if url.endswith('.js') else 'text/html' if url.endswith('/') else 'application/json'
+            return {'evidence': {'id': len(calls), 'status': 200, 'headers': {'content-type': content}}, 'body': body}
+        tools.crawl('https://owned.example', time.monotonic() + 5, fetch)
+        self.assertIn('https://owned.example/api/items', calls)
+        self.assertTrue(all(url.startswith('https://owned.example/') for url in calls))
+
     def test_password_control_uses_private_replay_and_retains_evidence(self):
         reply = {'evidence': {'id': 42, 'status': 200}, 'body': '{"ok":true}'}
         with tempfile.TemporaryDirectory() as folder, \

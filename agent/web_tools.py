@@ -154,6 +154,10 @@ def crawl(origin, deadline, fetch=request):
                 forms.extend(parser.forms[:20])
             except (ValueError, RecursionError):
                 pass
+        if "javascript" in content or urlsplit(url).path.endswith(('.js', '.mjs')):
+            # Static literals only. Target JavaScript is never executed here.
+            routes = re.findall(r"""(?:fetch|axios\.(?:get|post|put|patch|delete))\(\s*['"](/[^'"\s\\]{1,200})['"]""", body)
+            queue.extend(origin + path for path in routes[:8] if allowed(origin, origin + path))
         if url.endswith("robots.txt"):
             for line in body.splitlines()[:100]:
                 if line.lower().startswith(("allow:", "disallow:")):
@@ -161,7 +165,7 @@ def crawl(origin, deadline, fetch=request):
                     if path.startswith("/") and "*" not in path and "$" not in path:
                         queue.append(origin + path)
     output = json.dumps({"pages": pages, "forms_observed_not_submitted": forms[:20], "remaining_links": len(queue),
-                         "limitations": ["Static links only; no JavaScript execution, account login or form submission."]})
+                         "limitations": ["Static links and literal client API routes only; no JavaScript execution, account login or form submission."]})
     failure = "request_error" if any(p["error"] for p in pages) else ("timeout" if queue and time.monotonic() >= deadline else None)
     return record("patchriot-crawl", VERSION, [origin, "--max-pages", str(MAX_PAGES)], started, observed, refs, output,
                   1 if failure else 0, failure)

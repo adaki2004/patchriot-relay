@@ -921,6 +921,10 @@ mod tests {
     }
 
     async fn target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        target_login("both").await
+    }
+
+    async fn target_login(session_kind: &'static str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -968,12 +972,21 @@ mod tests {
                     }
                     (
                         200,
-                        if changed_password.is_some() {
+                        if changed_password.is_some() && session_kind == "bearer" {
+                            ""
+                        } else if changed_password.is_some() {
                             "Set-Cookie: session=synthetic-new-session; Path=/; Secure; HttpOnly\r\n"
                         } else {
                             "Set-Cookie: session=synthetic-session; Path=/; Secure; HttpOnly\r\n"
                         },
-                        json!({"ok":true,"access_token":"synthetic-new-login-token", "echo":"synthetic-new-session"}).to_string(),
+                        if session_kind == "cookie" {
+                            json!({"ok":true}).to_string()
+                        } else if session_kind == "bearer" {
+                            json!({"ok":true,"access_token":"synthetic-new-login-token"})
+                                .to_string()
+                        } else {
+                            json!({"ok":true,"access_token":"synthetic-new-login-token", "echo":"synthetic-new-session"}).to_string()
+                        },
                     )
                 } else if head.starts_with("POST /api/auth/change-password ") {
                     assert!(!reference_account);
@@ -1263,7 +1276,13 @@ mod tests {
 
     #[tokio::test]
     async fn two_accounts_isolate_access_and_require_explicit_verified_password_permission() {
-        let (address, server) = target().await;
+        for session_kind in ["both", "cookie", "bearer"] {
+            verify_password_session_fixture(session_kind).await;
+        }
+    }
+
+    async fn verify_password_session_fixture(session_kind: &'static str) {
+        let (address, server) = target_login(session_kind).await;
         let scope: LiveScope = serde_json::from_value(json!({"origins":["https://owned.example"],
             "methods":["GET","HEAD","OPTIONS","POST"], "profile":"web_active_v2",
             "tools":["active_web_v2","artex_engine_v1","authenticated_http_v1","browser_login_v1","multi_account_v1"],
@@ -1448,7 +1467,7 @@ mod tests {
         let observed_login = broker.browser.lock().unwrap().password_login.take();
         assert_eq!(
             broker.verify_changed_password().await.unwrap_err(),
-            "password_login_not_observed"
+            "password_login_replay_unavailable"
         );
         broker.browser.lock().unwrap().password_login = observed_login;
         let (first, second) = tokio::join!(

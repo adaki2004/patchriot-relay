@@ -17,3 +17,5 @@ Checked OWASP WSTG v4.2 identifiers (https://wstg.owasp.org/v4.2/):
 - WSTG-CLNT-07: cross-origin resource sharing.
 - WSTG-CONF-07: HTTP Strict Transport Security, not every missing security header.
 Use these stable identifiers when applicable. Omit an unverified identifier rather than inventing chapter numbers or copying a prior role's classification. This reference does not limit the permitted test topics.
+
+Additional scanner leads are in /work/tool-results.json. Inspect the referenced upstream evidence, scanner limitations and account context. A missing header, schema publication or reflected string alone does not demonstrate an exploit. Reproduce the minimum security impact, include a negative control, and retain rejected or unresolved hypotheses in the assessment explanation. The coverage ledger distinguishes recorded requests from unresolved vulnerability classes. Its deferred entries do not erase verified candidate-specific findings.

@@ -97,7 +97,11 @@ impl PasswordLogin {
 
     fn needs_csrf(&self) -> bool {
         self.headers.keys().any(|key| csrf_name(key))
-            || self.data.to_ascii_lowercase().contains("csrf")
+            || if self.content_type == "application/json" {
+                serde_json::from_str::<Value>(&self.data).is_ok_and(|value| csrf_in_value(&value))
+            } else {
+                url::form_urlencoded::parse(self.data.as_bytes()).any(|(name, _)| csrf_name(&name))
+            }
     }
 
     fn refreshed_probe(
@@ -254,6 +258,16 @@ fn replace_login_password(
     Some(())
 }
 
+fn csrf_in_value(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(name, value)| csrf_name(name) || csrf_in_value(value)),
+        Value::Array(values) => values.iter().any(csrf_in_value),
+        _ => false,
+    }
+}
+
 fn csrf_name(name: &str) -> bool {
     let name = normalized(name);
     name.contains("csrf") || name.contains("xsrf")
@@ -378,7 +392,7 @@ impl LiveBroker {
             let login = state
                 .password_login
                 .as_ref()
-                .ok_or("password_login_not_observed")?
+                .ok_or("password_login_replay_unavailable")?
                 .clone();
             let origin = public_url(&login.url)?.origin().ascii_serialization();
             if state.verified_origin.as_deref() != Some(origin.as_str()) {
