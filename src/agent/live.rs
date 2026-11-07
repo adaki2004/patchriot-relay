@@ -955,6 +955,9 @@ impl LiveBroker {
         {
             return Err("unsupported_probe_headers");
         }
+        if probe.authenticated {
+            safety::check_session_preservation(&url)?;
+        }
         if !probe.account_change {
             safety::check_account_write(&url, &probe.method, probe.data.as_deref())?;
         } else if login || !probe.authenticated || !self.password_change_permitted() {

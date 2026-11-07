@@ -124,6 +124,34 @@ class LiveOverviewTests(unittest.TestCase):
                 self.assertIn('including a synthetic 502', prompt)
                 self.assertIn('Verify limitation citations', prompt)
                 self.assertIn('reference account permits authenticated GET, HEAD and OPTIONS', prompt)
+                self.assertIn('retain the earlier authenticated coverage', prompt)
+                self.assertIn('authenticated logout and session-revocation routes', prompt)
+                self.assertIn('cannot establish a password change', prompt)
+
+    def test_recorded_engine_coverage_reaches_investigator_and_validator_context(self):
+        coverage = {'stop_reason':'done', 'coverage_complete':True,
+            'access_mode':'anonymous_and_authenticated', 'anonymous_evidence_count':12,
+            'authenticated_evidence_count':9, 'authentication_requested':True}
+        record = {'tool':'artex-engine', 'exit_code':0, 'failure':None,
+            'evidence_ids':[1, 2], 'output_truncated':False,
+            'output_excerpt':json.dumps({**coverage, 'commands':'long untrusted output'})}
+        previous = [{'role':'investigator', 'assessment':{'summary':'Unverified prior claim',
+            'findings':[], 'limitations':['Claimed no login']}, 'tool_runs':[record]}]
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / 'scope.json').write_text(json.dumps({'scope':{}}))
+            (directory / 'previous.json').write_text(json.dumps(previous))
+            (directory / 'tool-results.json').write_text(json.dumps({'tool_runs':[record]}))
+            overview = live_review.overview(directory)
+            self.assertEqual(overview['engine_coverage'], [coverage])
+            self.assertEqual(overview['previous_reports'][0]['engine_coverage'], [coverage])
+            live_review.validation_brief(directory)
+            brief = json.loads((directory / 'validation-brief.json').read_text())
+            self.assertEqual(brief[0]['engine_coverage'], [coverage])
+            self.assertEqual(brief[0]['limitations'], ['Claimed no login'])
+        self.assertEqual(live_review.engine_coverage([
+            {'tool':'artex-engine', 'output_excerpt':'truncated {'},
+            {'tool':'artex-engine', 'output_excerpt':'[]'}, {'tool':'nuclei'}]), [])
 
     def test_validation_only_never_restarts_missing_discovery_and_preserves_claim_evidence(self):
         scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}

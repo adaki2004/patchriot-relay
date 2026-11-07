@@ -110,6 +110,7 @@ class EngineTests(unittest.TestCase):
         scope['_password_change_permitted'] = True
         permitted = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')['goal']
         self.assertIn('one self-service password-change attempt', permitted)
+        self.assertIn('Authenticated logout and session-revocation routes are blocked', permitted)
         self.assertIn('{{PATCHRIOT_NEW_PASSWORD}}', permitted)
         self.assertNotIn('Supplied accounts and existing records are not disposable.', permitted)
         self.assertIn('Never initiate or confirm password recovery', permitted)

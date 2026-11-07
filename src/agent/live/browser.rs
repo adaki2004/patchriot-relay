@@ -1343,6 +1343,28 @@ mod tests {
         assert!(broker.http(reference_write.clone()).await.is_ok());
         reference_write["authenticated"] = json!(false);
         assert!(reference.http(reference_write).await.is_ok());
+        for method in ["GET", "POST"] {
+            let logout = json!({"method":method,"url":"https://owned.example/api/auth/logout","authenticated":true});
+            let count = broker.counters.lock().unwrap().evidence.len();
+            assert_eq!(
+                broker.http(logout.clone()).await.unwrap_err(),
+                "session_revocation_not_permitted"
+            );
+            assert_eq!(
+                broker.engine_http(logout.clone()).await.unwrap_err(),
+                "session_revocation_not_permitted"
+            );
+            assert_eq!(
+                broker
+                    .browser_call("/patchriot/browser/http", logout)
+                    .await
+                    .unwrap_err(),
+                "session_revocation_not_permitted"
+            );
+            assert_eq!(broker.counters.lock().unwrap().evidence.len(), count);
+        }
+        assert_eq!(reference.engine_http(json!({"method":"GET","url":"https://owned.example/sign-out","authenticated":true})).await.unwrap_err(), "session_revocation_not_permitted");
+        assert!(broker.http(json!({"method":"POST","url":"https://owned.example/api/auth/logout","authenticated":false})).await.is_ok());
         let result = broker.http(change.clone()).await.unwrap();
         assert_eq!(result["evidence"]["status"], 200);
         assert_eq!(result["evidence"]["account"], "testing");

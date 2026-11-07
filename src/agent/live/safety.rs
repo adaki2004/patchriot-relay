@@ -84,6 +84,46 @@ fn mutation_json(value: &Value) -> bool {
     }
 }
 
+pub(super) fn check_session_preservation(url: &url::Url) -> Result<(), &'static str> {
+    let action = |value: &str| {
+        matches!(
+            normalized(value).as_str(),
+            "logout"
+                | "logoff"
+                | "signout"
+                | "signoff"
+                | "endsession"
+                | "destroysession"
+                | "revokesession"
+                | "revokesessions"
+                | "invalidatesession"
+                | "invalidatesessions"
+        )
+    };
+    let path = url::form_urlencoded::parse(format!("path={}", url.path()).as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default();
+    // GET logout routes also destroy access. Keep anonymous controls available,
+    // but never send the prepared account session to recognizable revocation.
+    if path.split('/').any(action)
+        || [
+            "sessionrevoke",
+            "sessionsrevoke",
+            "sessiondestroy",
+            "sessionsinvalidate",
+        ]
+        .iter()
+        .any(|suffix| normalized(&path).ends_with(suffix))
+        || url.query_pairs().any(|(key, value)| {
+            matches!(normalized(&key).as_str(), "action" | "operation") && action(&value)
+        })
+    {
+        return Err("session_revocation_not_permitted");
+    }
+    Ok(())
+}
+
 pub(super) fn check_account_write(
     url: &url::Url,
     method: &str,
@@ -150,6 +190,40 @@ pub(super) fn remember_body_secrets(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_preservation_covers_encoded_routes_and_explicit_actions() {
+        for path in [
+            "/api/auth/logout",
+            "/sign-out",
+            "/api/%6cogout",
+            "/logoff/confirm",
+            "/api/sessions/revoke",
+            "/account?action=sign_out",
+            "/api/revoke-sessions",
+        ] {
+            assert_eq!(
+                check_session_preservation(
+                    &format!("https://owned.example{path}").parse().unwrap()
+                ),
+                Err("session_revocation_not_permitted"),
+                "{path}"
+            );
+        }
+        for path in [
+            "/login",
+            "/api/session",
+            "/api/account/password",
+            "/docs?topic=logout",
+        ] {
+            assert!(
+                check_session_preservation(
+                    &format!("https://owned.example{path}").parse().unwrap()
+                )
+                .is_ok()
+            );
+        }
+    }
 
     #[test]
     fn credential_mutations_are_blocked_without_blocking_login_or_public_form_controls() {
