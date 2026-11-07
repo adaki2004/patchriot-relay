@@ -44,6 +44,7 @@ def receipt_summary(result, full_output):
         return value
     summary = {key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
+        'collection_errors',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping'
     ) if key in result}
@@ -307,16 +308,29 @@ class Engine:
             except urllib.error.HTTPError as error:
                 if error.code != 409:
                     raise
-        return {
+        result = {
             'engine': 'ARTEX', 'commit': VERSION, 'stop_reason': reason,
             'coverage_complete': reason in ('completed', 'done'),
             'distinct_target_observations': observed,
             'seconds_without_target_progress': int(time.monotonic() - last_target_progress),
             'target_mapping': dict(zip(scope['origins'], targets)),
-            'outcome': self.client.call('/api/tasks/' + identifier + '/outcome'),
-            'findings': self.client.call('/api/exploration/findings?task=' + identifier),
-            'commands': self.client.call('/api/commands?task=' + identifier + '&size=100'),
+            'collection_errors': [],
         }
+        # A large command transcript or one unavailable endpoint must not erase
+        # the task outcome and findings already collected from the engine.
+        for key, path in [
+            ('outcome', '/api/tasks/' + identifier + '/outcome'),
+            ('findings', '/api/exploration/findings?task=' + identifier),
+            ('commands', '/api/commands?task=' + identifier + '&size=100'),
+        ]:
+            try:
+                result[key] = self.client.call(path)
+            except (OSError, ValueError):
+                result[key] = {'unavailable': True}
+                result['collection_errors'].append(key)
+                if key in ('outcome', 'findings'):
+                    result['coverage_complete'] = False
+        return result
 
     def __exit__(self, *_):
         try:
@@ -381,10 +395,15 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         'A budget-limited run may contain useful findings while leaving goals unfinished. Review its stop reason and the later agents’ control requests.',
         'Discovery stops after fifteen minutes without a new target observation or distinct successful tool result. Heartbeats, tool errors and repeated command/output pairs do not reset that timer. Local analysis is activity, not proof of target coverage; the hard time and spending limits still apply.',
     ]
+    if result.get('collection_errors'):
+        result['limitations'].append(
+            'Engine result collection was incomplete for: ' + ', '.join(result['collection_errors']) +
+            '. Available outcome, findings and broker evidence were retained.')
     # The full file is for this role. Its handoff must remain valid JSON even
     # when upstream commands include long scripts or page responses.
     output = json.dumps({key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
+        'collection_errors',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'outcome', 'findings', 'commands'
     ) if key in result}, ensure_ascii=True)

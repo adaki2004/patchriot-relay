@@ -211,6 +211,31 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(clock[0], 1665 if terminal else 1800)
                 self.assertEqual(('/api/tasks/7/control', {'action': 'pause'}) in calls, terminal is None)
 
+    def test_late_collection_failure_preserves_outcome_and_other_findings(self):
+        for failed in ['commands', 'findings', 'outcome']:
+            with self.subTest(failed=failed):
+                class FakeClient:
+                    def call(self, path, body=None):
+                        if path == '/api/tasks':
+                            return {'id': 7}
+                        if path == '/api/tasks/7':
+                            return {'status': 'done'}
+                        if failed in path:
+                            raise ValueError('engine API response exceeds limit')
+                        return {'saved': path}
+                engine = object.__new__(artex.Engine)
+                engine.client = FakeClient()
+                engine.deadline = time.monotonic() + 600
+                engine.profile_id = 1
+                result = engine.assess(SCOPE, ['http://127.0.0.1:1234'], 'investigator')
+                self.assertEqual(result['stop_reason'], 'done')
+                self.assertEqual(result['collection_errors'], [failed])
+                self.assertEqual(result['coverage_complete'], failed == 'commands')
+                for key in ['commands', 'findings', 'outcome']:
+                    self.assertEqual('saved' in result[key], key != failed)
+                summary = json.loads(artex.receipt_summary(result, json.dumps(result)))
+                self.assertEqual(summary['collection_errors'], [failed])
+
     def test_engine_http_uses_the_discovery_route_and_other_probes_keep_their_route(self):
         import live_http
         seen = []
