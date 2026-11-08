@@ -402,7 +402,7 @@ class ImageSmoke(unittest.TestCase):
         Run in a network=none, non-root container with disposable /work. The
         scripted model is only an integration fixture, not a quality evaluation.
         """
-        requested, seen_tools, calls = [], [], []
+        requested, seen_tools, calls, refusals = [], [], [], []
         def fixture(method, url, headers):
             requested.append((method, url))
             return {'body': 'OWNED FIXTURE RESPONSE', 'evidence': {'id': len(requested), 'status': 200,
@@ -417,6 +417,13 @@ class ImageSmoke(unittest.TestCase):
                 if length > 512 * 1024:
                     return self.send_error(413)
                 body = json.loads(self.rfile.read(length))
+                if not refusals:
+                    refusals.append(True)
+                    self.send_response(429)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"provider_rate_limited"}')
+                    return
                 calls.append(self.path)
                 names = [t['function']['name'] for t in body.get('tools', [])]
                 seen_tools.extend(names)
@@ -527,6 +534,7 @@ class ImageSmoke(unittest.TestCase):
                 self.assertIsNotNone(engine.process.poll(), 'engine process must be stopped')
                 self.assertIsNotNone(engine.pg.poll(), 'database process must be stopped')
             self.assertIn(('GET', 'https://owned.example/'), requested)
+            self.assertEqual(refusals, [True], 'The shipped SDK recovers an explicit rate refusal')
             self.assertIn('set_goals', seen_tools)
             self.assertIn('Bash', seen_tools)
             self.assertTrue(all(p == '/patchriot/artex/v1/chat/completions' for p in calls))

@@ -424,6 +424,7 @@ class BridgeTests(unittest.TestCase):
         adapter.bridge_stopping.clear()
         adapter.engine_stopping.clear()
         adapter.engine_stop_reason = None
+        adapter.engine_recovery = adapter.EngineRecovery()
 
     def tearDown(self):
         adapter.bridge_stopping.clear()
@@ -443,7 +444,6 @@ class BridgeTests(unittest.TestCase):
 
     def test_discovery_distinguishes_budget_stop_from_provider_failure(self):
         for reason, expected in [('engine_budget_reached', 'model_budget'),
-                                 ('provider_rate_limited', 'provider_rate_limited'),
                                  ('near_verification_timeout', 'near_verification_timeout'),
                                  ('provider_repetition', 'provider_repetition'),
                                  ('model_request_too_large', 'model_request_too_large'),
@@ -635,7 +635,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result[0], 400)
         self.assertFalse(adapter.engine_stopping.is_set())
 
-    def test_provider_rate_limit_ends_discovery_without_replaying_or_closing_the_reviewer(self):
+    def test_rate_refusal_allows_upstream_retry_but_three_refusals_stop_discovery(self):
         frames = [
             {'type':'start','id':1,'status':429,'content_type':'application/json'},
             {'type':'chunk','id':1,'hex':b'{"error":"provider_rate_limited"}'.hex()},
@@ -645,13 +645,35 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result[0], 429)
         self.assertEqual(json.loads(result[2])['error'], 'provider_rate_limited')
         self.assertEqual(len(wire), 1, 'Do not replay a paid request')
-        self.assertTrue(adapter.engine_stopping.is_set())
+        self.assertFalse(adapter.engine_stopping.is_set())
         self.assertFalse(adapter.bridge_stopping.is_set())
+        for attempt in range(2):
+            result, wire = self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+            self.assertEqual(len(wire), 1)
+            self.assertEqual(adapter.engine_stopping.is_set(), attempt == 1)
+        self.assertEqual(adapter.engine_stop_reason, 'provider_rate_limited')
+        self.assertEqual(adapter.engine_recovery.snapshot()['unrecovered_rate_limit_responses'], 3)
         frames[0]['status'] = 200
         frames[1]['hex'] = b'{"choices":[]}'.hex()
         result, wire = self.exchange(frames, 'POST', '/v1/chat/completions', '{}')
         self.assertEqual(result[0], 200)
         self.assertEqual(wire[0]['request']['path'], '/v1/chat/completions')
+
+    def test_rate_limit_recovery_retains_counts_and_has_a_total_cap(self):
+        frames = [{'type':'start','id':1,'status':429,'content_type':'application/json'},
+                  {'type':'chunk','id':1,'hex':b'{"error":"provider_rate_limited"}'.hex()},
+                  {'type':'end','id':1}]
+        ok = [dict(frame) for frame in frames]
+        ok[0]['status'] = 200
+        ok[1]['hex'] = b'{"choices":[]}'.hex()
+        for _ in range(6):
+            self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+            self.assertFalse(adapter.engine_stopping.is_set())
+            self.exchange(ok, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+        self.assertEqual(adapter.engine_recovery.snapshot(), {'rate_limit_responses':6,
+            'successful_replies_after_rate_limit':6, 'unrecovered_rate_limit_responses':0})
+        self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+        self.assertTrue(adapter.engine_stopping.is_set())
 
     def test_phase_name_is_data_and_events_remain_bounded(self):
         wire = io.StringIO()

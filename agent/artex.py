@@ -44,7 +44,7 @@ def receipt_summary(result, full_output):
         return value
     summary = {key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
-        'collection_errors', 'password_change_control',
+        'collection_errors', 'password_change_control', 'model_recovery',
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
@@ -416,7 +416,8 @@ class Engine:
 
 
 def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
-        stop=lambda: False, emit=lambda _: None, access=None, authenticated_fetch=None):
+        stop=lambda: False, emit=lambda _: None, access=None, authenticated_fetch=None,
+        recovery=lambda: {}):
     from web_tools import ScopeMirror, record
     from live_http import request
     from functools import partial
@@ -531,6 +532,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError):
         failure = 'request_error'
     result['failure'] = failure
+    result['model_recovery'] = recovery()
     result['limitations'] = [
         'This is the full upstream planner/worker engine under the approved web profile; it does not run every installed skill or optional external tool.',
         'Only recorded broker requests establish that a target was contacted. Engine findings and command counts are not independent verification.',
@@ -546,7 +548,7 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
     # when upstream commands include long scripts or page responses.
     output = json.dumps({key: result[key] for key in (
         'engine', 'commit', 'stop_reason', 'coverage_complete', 'failure',
-        'collection_errors', 'password_change_control',
+        'collection_errors', 'password_change_control', 'model_recovery',
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
