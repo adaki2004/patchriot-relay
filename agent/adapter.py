@@ -21,6 +21,14 @@ transaction_lock = threading.Lock()
 bridge_stopping = threading.Event()
 engine_stopping = threading.Event()
 engine_stop_reason = None
+# Only fixed broker codes may enter a retained receipt. Never copy a provider
+# error body: it can contain prompts, target responses or account material.
+ENGINE_REJECTION_REASONS = frozenset({
+    'provider_rate_limited', 'provider_unavailable', 'provider_stream_interrupted',
+    'provider_repetition', 'near_verification_timeout', 'model_history_limit',
+    'model_messages_empty', 'model_message_role', 'model_message_content',
+    'model_request_too_large', 'invalid_tools',
+})
 request_id = 0
 
 
@@ -208,7 +216,7 @@ class Bridge(BaseHTTPRequestHandler):
         """
         global engine_stop_reason
         if self.path == '/patchriot/artex/v1/chat/completions':
-            engine_stop_reason = 'model_request_rejected'
+            engine_stop_reason = 'model_request_too_large'
             engine_stopping.set()
         body = json.dumps({'error':{'type':'invalid_request_error', 'code':'request_too_large',
             'message':'Request exceeds the bridge size limit. Compact the conversation before retrying.'}}).encode()
@@ -285,8 +293,8 @@ class Bridge(BaseHTTPRequestHandler):
                                     reason = json.loads(error_body).get('error')
                                     if reason == 'engine_budget_reached':
                                         engine_stop_reason = 'model_budget'
-                                    elif reason == 'provider_repetition':
-                                        engine_stop_reason = 'provider_repetition'
+                                    elif isinstance(reason, str) and reason in ENGINE_REJECTION_REASONS:
+                                        engine_stop_reason = reason
                                 except (ValueError, AttributeError):
                                     pass
                                 engine_stopping.set()

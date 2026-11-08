@@ -443,9 +443,13 @@ class BridgeTests(unittest.TestCase):
 
     def test_discovery_distinguishes_budget_stop_from_provider_failure(self):
         for reason, expected in [('engine_budget_reached', 'model_budget'),
-                                 ('provider_rate_limited', 'model_request_rejected'),
-                                 ('near_verification_timeout', 'model_request_rejected'),
-                                 ('provider_repetition', 'provider_repetition')]:
+                                 ('provider_rate_limited', 'provider_rate_limited'),
+                                 ('near_verification_timeout', 'near_verification_timeout'),
+                                 ('provider_repetition', 'provider_repetition'),
+                                 ('model_request_too_large', 'model_request_too_large'),
+                                 ('model_message_content', 'model_message_content'),
+                                 ('private target material must not be retained', 'model_request_rejected'),
+                                 ({'secret':'private'}, 'model_request_rejected')]:
             with self.subTest(reason=reason):
                 adapter.engine_stopping.clear()
                 payload=json.dumps({'error':reason}).encode()
@@ -605,7 +609,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result[0], 413)
         self.assertEqual(wire, [])
         self.assertTrue(adapter.engine_stopping.is_set())
-        self.assertEqual(adapter.engine_stop_reason, 'model_request_rejected')
+        self.assertEqual(adapter.engine_stop_reason, 'model_request_too_large')
         self.assertFalse(adapter.bridge_stopping.is_set())
 
     def test_discovery_budget_stops_only_the_engine_and_keeps_the_bridge_open(self):
