@@ -52,12 +52,14 @@ def receipt_summary(result, full_output):
     ) if key in result}
     commands = result.get('commands', {})
     entries = commands.get('commands', []) if isinstance(commands, dict) else commands
+    findings = result.get('findings')
     summary.update(receipt_schema=1, details_summarized=True,
                    full_output_sha256=hashlib.sha256(full_output.encode()).hexdigest(),
                    details_available_during_role='/work/artex-results.json',
                    commands_returned=len(entries) if isinstance(entries, list) else 0,
                    outcome_preview=preview(result.get('outcome')),
-                   findings_preview=preview(result.get('findings')),
+                   findings_returned=len(findings) if isinstance(findings, list) else None,
+                   findings_preview=findings_preview(findings),
                    facts_preview=facts_preview(result.get('facts')))
     encoded = json.dumps(summary, ensure_ascii=True)
     from web_tools import MAX_OUTPUT
@@ -69,6 +71,21 @@ def receipt_summary(result, full_output):
         summary['facts_preview'] = {'omitted': True}
         encoded = json.dumps(summary, ensure_ascii=True)
     return encoded
+
+
+def findings_preview(findings):
+    """Prioritize lead content over the upstream DTO's first metadata fields.
+
+    These are engine claims, not independently confirmed vulnerabilities. Keep
+    exact total separately so a shortened or unavailable preview is never zero.
+    """
+    if not isinstance(findings, list):
+        return {'unavailable': True}
+    limits = {'id': 80, 'name': 160, 'vulnclass': 100, 'severity': 30,
+              'status': 30, 'summary': 400, 'evidence': 300}
+    return [{key: item[key][:limit] for key, limit in limits.items()
+             if isinstance(item.get(key), str)}
+            for item in findings[:6] if isinstance(item, dict)]
 
 
 def facts_preview(facts):

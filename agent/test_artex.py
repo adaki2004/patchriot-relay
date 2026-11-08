@@ -158,6 +158,25 @@ class EngineTests(unittest.TestCase):
     def test_exhausted_upstream_planner_stops_even_if_task_is_queued(self):
         self.assertTrue(artex.should_stop({'status': 'queued', 'llm_failover_state': 'chain_exhausted'}))
         self.assertTrue(artex.should_stop({'status': 'completed'}))
+
+    def test_native_lead_handoff_uses_content_fields_and_preserves_total(self):
+        lead = {**{f'metadata_{i}': i for i in range(8)}, 'id':'17', 'severity':'low',
+                'summary':'Owned unverified lead', 'evidence':'Owned control observation',
+                'report':'Long private transcript ' * 10000}
+        result = {'findings':[lead] * 9, 'coverage_complete':False, 'stop_reason':'interrupted',
+                  'model_recovery':{'rate_limit_responses':1,'successful_replies_after_rate_limit':1,'unrecovered_rate_limit_responses':0}}
+        receipt = json.loads(artex.receipt_summary(result, json.dumps(result)))
+        self.assertEqual(receipt['findings_returned'], 9)
+        self.assertEqual(len(receipt['findings_preview']), 6)
+        self.assertEqual(receipt['findings_preview'][0]['summary'], 'Owned unverified lead')
+        self.assertEqual(receipt['findings_preview'][0]['evidence'], 'Owned control observation')
+        self.assertNotIn('metadata_0', receipt['findings_preview'][0])
+        self.assertNotIn('report', receipt['findings_preview'][0])
+        self.assertFalse(receipt['coverage_complete'])
+        self.assertEqual(receipt['model_recovery'], result['model_recovery'])
+        missing = json.loads(artex.receipt_summary({'findings':{'unavailable':True}}, '{}'))
+        self.assertIsNone(missing['findings_returned'])
+        self.assertTrue(missing['findings_preview']['unavailable'])
         self.assertFalse(artex.should_stop({'status': 'running'}))
 
     def test_missing_engine_and_deadline_are_visible_without_fake_findings(self):
