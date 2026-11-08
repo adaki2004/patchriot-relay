@@ -129,6 +129,27 @@ class ScopedScannerTests(unittest.TestCase):
             self.assertEqual(len(result['evidence_ids']), 2)
             self.assertTrue(all(call[3]['discovery'] is False for call in self.calls))
 
+    def test_follow_up_retains_safe_failure_reason_and_partial_requests(self):
+        for message, expected in [('scanner_api_url_not_found', 'scanner_api_url_not_found'),
+                                  ('private token=secret', 'ValueError')]:
+            with tempfile.TemporaryDirectory() as folder:
+                directory = Path(folder)
+                (directory / 'http-evidence').mkdir()
+                (directory / 'http-evidence/1.json').write_text(json.dumps({
+                    'id': 1, 'url': 'https://owned.example/search?q=sample', 'method': 'GET', 'status': 200}))
+                def fail(client, urls):
+                    client('GET', urls[0])
+                    raise ValueError(message)
+                with patch.object(scanners, 'zap', fail):
+                    run = scanners.follow_up(self.scope, [], {'evidence_ids':[1]}, {},
+                        time.monotonic()+120, self.fetch, directory=directory)
+                detail = json.loads(run['output_excerpt'])
+                self.assertEqual(run['failure'], 'incomplete')
+                self.assertEqual(detail['contexts'][0]['result']['reason'], expected)
+                self.assertEqual(detail['contexts'][0]['requests'], 1)
+                self.assertEqual(len(run['evidence_ids']), 1)
+                self.assertNotIn('secret', run['output_excerpt'])
+
     def test_engine_handoff_rejects_unavailable_or_unsafe_seeds_and_caps_work(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
