@@ -211,7 +211,11 @@ def login_prompt(account="testing", paired=False):
         "then return a short status and stop. If access fails, return the limitation without retries. "
         + (f"You are establishing the {account} account in its separate browser context. Use --account {account} for browser_access.py calls. "
            "Establish protected access first. An observed username/email identity field can additionally enable distinct-account verification for password-change permission. " if paired else "")
-        + browser_instructions)
+        + browser_instructions
+        + " If the account API returns 200 anonymously and exposes only an opaque ID or display name, "
+          "do not guess identity fields or keep searching for an email endpoint. "
+          "Choose another GET resource already observed in the signed-in browser and check it without --json-pointer. "
+          "An authenticated success with an anonymous 401/403 establishes protected access even when identity comparison is unavailable.")
 
 
 def prompt(role, browser=False, review_policy=None, access_prepared=False, engine_ran=False, paired=False):
