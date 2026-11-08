@@ -1,4 +1,5 @@
 """Evidence-indexed coverage, including explicit gaps for unverified test classes."""
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -46,10 +47,11 @@ def build(scope, runs, directory=Path('/work')):
                               'class': category, 'state': 'deferred', 'evidence_ids': [],
                               'reason': 'Review candidate-specific controls and remaining paths. Recorded traffic alone cannot establish complete coverage.'}
     values = sorted(units.values(), key=lambda unit: (unit['state'] == 'tested', unit['id']))
+    unit_counts = dict(Counter(unit['state'] for unit in values))
     omitted = max(0, len(values) - 40)
     # Keep the public report bounded. The complete request evidence is separate.
     values = values[:40]
-    result = {'version': 1, 'units': values, 'omitted_units': omitted,
+    result = {'version': 1, 'summary_state': 'recorded', 'unit_counts': unit_counts, 'units': values, 'omitted_units': omitted,
               'tool_time_ms': sum(r['duration_ms'] for r in runs),
               'cost_source': 'provider_usage_in_execution_receipt'}
     (directory / 'coverage-ledger.json').write_text(json.dumps(result))
@@ -59,4 +61,4 @@ def build(scope, runs, directory=Path('/work')):
     (directory / 'coverage-ledger.json').write_text(json.dumps(result))
     refs = sorted({ref for unit in values for ref in unit['evidence_ids']})
     return record('patchriot-coverage', '1', ['recorded-evidence'], time.monotonic(), int(time.time()),
-                  refs, json.dumps(result), failure='incomplete' if omitted else None)
+                  refs, json.dumps(result))

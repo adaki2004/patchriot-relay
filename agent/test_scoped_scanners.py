@@ -77,6 +77,25 @@ class ScopedScannerTests(unittest.TestCase):
             self.assertEqual(sum(u['state'] == 'deferred' for u in data['units']), 4)
             self.assertFalse(run['output_truncated'])
 
+    def test_large_coverage_summary_is_not_a_failed_execution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            evidence_dir = directory / 'http-evidence'
+            evidence_dir.mkdir()
+            for identifier in range(1, 81):
+                evidence = {'id': identifier, 'url': f'https://owned.example/item/{identifier}',
+                            'method': 'GET', 'status': 200, 'error': None}
+                (evidence_dir / f'{identifier}.json').write_text(json.dumps(evidence))
+            run = coverage_ledger.build(self.scope, [], directory)
+            data = json.loads(run['output_excerpt'])
+            self.assertIsNone(run['failure'])
+            self.assertEqual(run['exit_code'], 0)
+            self.assertEqual(data['summary_state'], 'recorded')
+            self.assertEqual(data['unit_counts'], {'tested': 80, 'deferred': 4})
+            self.assertEqual(data['omitted_units'] + len(data['units']), 84)
+            self.assertEqual(sum(u['state'] == 'deferred' for u in data['units']), 4)
+            self.assertEqual(len(list(evidence_dir.glob('*.json'))), 80)
+
     def test_engine_handoff_preserves_context_and_skips_already_scanned_inputs(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
