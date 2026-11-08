@@ -413,6 +413,11 @@ def main():
                         complete, lambda: bridge('/patchriot/access'))
                     login_agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
                     login_agent.run_conversation(live_review.login_prompt(account=account, paired=scope.get('account_policy') is not None))
+                    # A model can finish after login without selecting a valid
+                    # proof resource. Complete a bounded comparison of actual
+                    # browser GETs before deciding the engine is public-only.
+                    verification = browser.verify_observed(account)
+                    event('phase', name='access_preparation', account=account, **verification)
             elif scope.get('authentication') and scope.get('auth_check_path'):
                 from live_http import request
                 protected = scope['origins'][0] + scope['auth_check_path']

@@ -9,6 +9,36 @@ from urllib.error import HTTPError
 EVIDENCE_DIRECTORY = Path('/work/http-evidence')
 
 
+def binary_response(reply):
+    """The broker's decoded text is not a faithful binary download."""
+    headers = reply.get('evidence', {}).get('headers', {})
+    content_type = next((v for k, v in headers.items() if k.lower() == 'content-type'), '')
+    media = content_type.split(';', 1)[0].strip().lower()
+    binary_type = (not media.endswith(('+json', '+xml')) and
+                   media.startswith(('image/', 'audio/', 'video/', 'font/', 'application/vnd.'))) or media in {
+        'application/pdf', 'application/zip', 'application/gzip',
+        'application/x-gzip', 'application/x-7z-compressed', 'application/x-rar-compressed',
+        'application/x-tar', 'application/x-bzip2', 'application/x-xz', 'application/msword',
+        'application/x-executable', 'application/x-sharedlib', 'application/x-sqlite3', 'application/wasm',
+    }
+    body = reply.get('body', '')
+    # Generic servers also serve useful plain-text config/JSON as octet-stream.
+    # Keep that text; an absent/ambiguous MIME needs byte-loss/control evidence.
+    nontext = '\ufffd' in body or any(ord(c) < 32 and c not in '\t\r\n' for c in body)
+    return (binary_type or (media in ('', 'application/octet-stream') and nontext)
+            or body.startswith(('PK\x03\x04', 'PK\x05\x06', '%PDF-', '\x1f\ufffd')))
+
+
+def text_response(reply, method):
+    # Preserve the exact broker record before changing only the tool-facing body.
+    # Re-encoding a lossy UTF-8 string does not recover an XLSX/ZIP/PDF download.
+    reply = retain_evidence(reply)
+    if method.upper() != 'HEAD' and binary_response(reply):
+        reply['body'] = ''
+        reply['body_unavailable'] = 'binary_response_not_supported'
+    return reply
+
+
 def retain_evidence(reply):
     """Keep the broker's redacted record available after a scanner finishes.
 
@@ -50,7 +80,7 @@ def request(method, url, headers=None, data=None, authenticated=True, *, discove
                   headers={"Content-Type": "application/json"})
     try:
         with urlopen(req, timeout=75) as response:
-            return retain_evidence(json.loads(response.read(2 * 1024 * 1024)))
+            return text_response(json.loads(response.read(2 * 1024 * 1024)), method)
     except HTTPError as error:
         with error:
             return json.loads(error.read(8192))
@@ -95,8 +125,11 @@ if __name__ == "__main__":
         path = Path(args.save_body).resolve()
         if not path.is_relative_to("/work"):
             raise SystemExit("Save analysis files under /work")
-        path.write_text(body)
-        result["saved_body"] = str(path)
+        if result.get('body_unavailable'):
+            result['save_body_error'] = result['body_unavailable']
+        else:
+            path.write_text(body)
+            result["saved_body"] = str(path)
     result["body"] = body[:args.body_chars]
     result["display_shortened"] = len(body) > args.body_chars
     print(json.dumps(result))

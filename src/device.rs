@@ -302,29 +302,56 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
     payload: T,
     maximum: u64,
 ) -> Result<R, Error> {
-    let signed_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs()
-        .try_into()?;
-    let request = sign(key, &config.audience, path, signed_at, payload)?;
-    let url = validate_url(&config.dispatcher)?.join(path)?;
-    let outgoing = client.post(url).json(&request);
-    // A completed live report may contain 4 MiB of evidence. Keep the short
-    // heartbeat timeout, but allow its upload more time while leases renew.
-    let outgoing = if path.ends_with("/work/complete") {
-        outgoing.timeout(Duration::from_secs(30))
-    } else {
-        outgoing
-    };
-    let response = outgoing.send().map_err(|error| {
-        DispatcherConnectionError(if error.is_timeout() {
-            "request timed out"
-        } else if error.is_connect() {
-            "connection failed"
+    let completion = path.ends_with("/work/complete");
+    let evidence = path.ends_with("/work/pentest-evidence");
+    // Negotiate via a distinct endpoint: old servers return 404 before seeing
+    // any result. Only that response enables the original signed JSON transport.
+    // A lost response is retried from the durable outbox with the same payload.
+    let compressed_path = format!("{path}-gzip");
+    let mut compressed = completion || evidence;
+    let response = loop {
+        let request_path = if compressed { &compressed_path } else { path };
+        let signed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            .try_into()?;
+        let request = sign(key, &config.audience, request_path, signed_at, &payload)?;
+        let url = validate_url(&config.dispatcher)?.join(request_path)?;
+        let outgoing = if compressed && completion {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            serde_json::to_writer(&mut encoder, &request)?;
+            encoder.flush()?;
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+                .body(encoder.finish()?)
         } else {
-            "request failed"
-        })
-    })?;
+            client.post(url).json(&request)
+        };
+        // Reports can reach 32 MiB. Allow slow links without extending heartbeat
+        // deadlines or the server's 120-second signature freshness window.
+        let outgoing = if completion || evidence {
+            outgoing.timeout(Duration::from_secs(90))
+        } else {
+            outgoing
+        };
+        let response = outgoing.send().map_err(|error| {
+            DispatcherConnectionError(if error.is_timeout() {
+                "request timed out"
+            } else if error.is_connect() {
+                "connection failed"
+            } else {
+                "request failed"
+            })
+        })?;
+        if compressed && response.status() == reqwest::StatusCode::NOT_FOUND {
+            compressed = false;
+            continue;
+        }
+        break response;
+    };
     if !response.status().is_success() {
         let status = response.status().as_u16();
         // Log only known protocol codes. Server bodies can contain private
@@ -344,12 +371,29 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         .find(|code| value.as_ref().and_then(|v| v["error"].as_str()) == Some(*code));
         return Err(Box::new(RemoteError { status, code }));
     }
-    // Treat even a configured server's output as bounded input; redirects are disabled.
+    let gzip = match response.headers().get(reqwest::header::CONTENT_ENCODING) {
+        None => false,
+        Some(value) if value == "gzip" && evidence => true,
+        _ => return Err("dispatcher returned unsupported response encoding".into()),
+    };
+    // Bound both wire bytes and expanded JSON. A highly compressible response
+    // cannot bypass the normal evidence limit. Redirects remain disabled.
     let mut bytes = Vec::new();
     response
-        .take(maximum + 1)
+        .take(maximum + if gzip { 8193 } else { 1 })
         .read_to_end(&mut bytes)
         .map_err(|_| DispatcherConnectionError("response read failed"))?;
+    if gzip {
+        if bytes.len() as u64 > maximum + 8192 {
+            return Err("dispatcher response exceeded limit".into());
+        }
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .take(maximum + 1)
+            .read_to_end(&mut decoded)
+            .map_err(|_| "dispatcher returned invalid compressed evidence")?;
+        bytes = decoded;
+    }
     if bytes.len() as u64 > maximum {
         return Err("dispatcher response exceeded limit".into());
     }
@@ -539,9 +583,24 @@ fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<S
 fn clear_assignment(directory: &Path) -> Result<(), Error> {
     let _lock = state_lock(directory)?;
     let mut config = read_config(directory)?;
+    let funding_blocked = config.pending_result.as_ref().is_some_and(|saved| {
+        matches!(&saved.result, WorkResult::Pentest(result)
+            if result.execution.state == patchriot_protocol::website_reviews::WebsiteRunState::Failed
+                && result.execution.failure_reason.as_deref() == Some("provider_payment_required"))
+    });
+    // Only after delivery acknowledgement (or preserving a fenced outbox) can
+    // we pause: doing it earlier would stop the result's own lease renewals.
+    // Keep the pause durable so restart cannot consume the rest of the queue.
+    if funding_blocked {
+        config.paused = true;
+    }
     config.active_assignment = None;
     config.pending_result = None;
-    write_config(directory, &config)
+    write_config(directory, &config)?;
+    if funding_blocked {
+        eprintln!("worker paused: provider_payment_required; restore funding before resume");
+    }
+    Ok(())
 }
 
 fn send_result(directory: &Path, client: &reqwest::blocking::Client) -> Result<(), Error> {
@@ -620,24 +679,46 @@ fn work_tick(
     source_reviews: bool,
     live_tests: bool,
 ) -> Result<(), Error> {
-    // A restarted relay can have a completed outbox but no running monitor.
-    // Refresh its existing lease before a potentially large upload. A completed
-    // server lease may reject renewal yet still accept an idempotent replay.
+    // Outbox delivery after restart needs the same renewable lease as live
+    // execution: the upload deadline can exceed a single 60-second lease.
     let saved = read_config(directory)?;
-    if let Some(result) = &saved.pending_result
+    let renewal = if let Some(result) = &saved.pending_result
         && !saved.paused
         && saved.active_assignment.as_ref().map(|a| a.lease_id) == Some(result.lease_id)
     {
         match renew(directory, client, result.lease_id, None) {
-            Ok(_) => {}
+            Ok((started, renewed)) => Some((result.lease_id, started, renewed)),
+            // An already accepted result still needs its idempotent ack.
             Err(error)
                 if error
                     .downcast_ref::<RemoteError>()
-                    .is_some_and(|e| [404, 409].contains(&e.status)) => {}
+                    .is_some_and(|e| [404, 409].contains(&e.status)) =>
+            {
+                None
+            }
             Err(error) => return Err(error),
         }
+    } else {
+        None
+    };
+    if let Some((lease_id, started, renewed)) = renewal {
+        let window = LeaseWindow::new(started, renewed.valid_for_seconds);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let monitor = scope.spawn(|| {
+                monitor_lease(directory, client, stop, &window, &done, lease_id, || None)
+            });
+            let guard = StopMonitor(&done);
+            let result = send_result(directory, client);
+            drop(guard);
+            if monitor.join().is_err() {
+                return Err("saved delivery lease monitor stopped unexpectedly".into());
+            }
+            result
+        })?;
+    } else {
+        send_result(directory, client)?;
     }
-    send_result(directory, client)?;
     let (config, key) = {
         let _lock = state_lock(directory)?;
         let mut config = read_config(directory)?;
@@ -871,6 +952,96 @@ fn agent_execution_deadline(
         + Duration::from_secs(remaining.saturating_sub(patchriot_protocol::AGENT_CLEANUP_SECONDS)))
 }
 
+fn monitor_lease(
+    directory: &Path,
+    client: &reqwest::blocking::Client,
+    stop: &AtomicBool,
+    window: &LeaseWindow,
+    done: &AtomicBool,
+    lease_id: Uuid,
+    snapshot: impl Fn() -> Option<patchriot_protocol::pentests::LiveProgress>,
+) {
+    struct StopWindow<'a>(&'a LeaseWindow);
+    impl Drop for StopWindow<'_> {
+        fn drop(&mut self) {
+            self.0.stop();
+        }
+    }
+    let _stop_window = StopWindow(window);
+    let mut heartbeat_at = Instant::now() + Duration::from_secs(10);
+    let mut renew_at = Instant::now() + Duration::from_secs(20);
+    while !done.load(Ordering::Relaxed) {
+        let reason = if stop.load(Ordering::Relaxed) {
+            Some("operator_stop")
+        } else if window.stopped_at(Instant::now()) {
+            Some("lease_window_expired")
+        } else if !locally_ready(directory, lease_id) {
+            Some("local_assignment_unavailable")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            eprintln!("lease monitor stopped: {reason}");
+            window.stop();
+            break;
+        }
+        if Instant::now() >= heartbeat_at {
+            match tick(directory, client) {
+                Ok(Some(state)) if ["online", "busy"].contains(&state.as_str()) => {}
+                Err(error) if !terminal_remote_error(&error) => {
+                    eprintln!("heartbeat retry pending")
+                }
+                Ok(_) => {
+                    eprintln!("lease monitor stopped: heartbeat_device_unavailable");
+                    window.stop();
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("lease monitor stopped: heartbeat_rejected: {error}");
+                    window.stop();
+                    break;
+                }
+            }
+            heartbeat_at = Instant::now() + Duration::from_secs(10);
+        }
+        if Instant::now() >= renew_at {
+            let renewal_started = Instant::now();
+            match renew(directory, client, lease_id, snapshot()) {
+                Ok((started, reply)) => {
+                    window.extend_at(started, reply.valid_for_seconds, Instant::now());
+                    if window.stopped_at(Instant::now()) {
+                        eprintln!("lease monitor stopped: renewal_arrived_after_local_expiry");
+                        break;
+                    }
+                }
+                Err(error) if !terminal_remote_error(&error) => {
+                    eprintln!("lease renewal retry pending")
+                }
+                Err(error) => {
+                    eprintln!("lease monitor stopped: renewal_rejected: {error}");
+                    window.stop();
+                    break;
+                }
+            }
+            if renewal_started.elapsed() >= Duration::from_secs(2) {
+                eprintln!(
+                    "lease renewal delayed: duration_ms={}",
+                    renewal_started.elapsed().as_millis()
+                );
+            }
+            renew_at = Instant::now() + Duration::from_secs(10);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+struct StopMonitor<'a>(&'a AtomicBool);
+impl Drop for StopMonitor<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn agent_work(
     directory: &Path,
     client: &reqwest::blocking::Client,
@@ -911,92 +1082,21 @@ fn agent_work(
         .as_deref()
         .ok_or("missing model declaration")?;
     let done = AtomicBool::new(false);
-    struct StopMonitor<'a>(&'a AtomicBool);
-    impl Drop for StopMonitor<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
     println!(
         "{}",
         serde_json::json!({"event":"agent_started","review_id":assignment.review_id,"role":assignment.role,"lease_id":assignment.lease_id})
     );
     std::thread::scope(|scope| {
         let monitor = scope.spawn(|| {
-            struct StopWindow<'a>(&'a LeaseWindow);
-            impl Drop for StopWindow<'_> {
-                fn drop(&mut self) {
-                    self.0.stop();
-                }
-            }
-            let _stop_window = StopWindow(&window);
-            let mut heartbeat_at = Instant::now() + Duration::from_secs(10);
-            let mut renew_at = Instant::now() + Duration::from_secs(20);
-            while !done.load(Ordering::Relaxed) {
-                let reason = if stop.load(Ordering::Relaxed) {
-                    Some("operator_stop")
-                } else if window.stopped_at(Instant::now()) {
-                    Some("lease_window_expired")
-                } else if !locally_ready(directory, assignment.lease_id) {
-                    Some("local_assignment_unavailable")
-                } else {
-                    None
-                };
-                if let Some(reason) = reason {
-                    eprintln!("lease monitor stopped: {reason}");
-                    window.stop();
-                    break;
-                }
-                if Instant::now() >= heartbeat_at {
-                    match tick(directory, client) {
-                        Ok(Some(state)) if ["online", "busy"].contains(&state.as_str()) => {}
-                        Err(error) if !terminal_remote_error(&error) => {
-                            eprintln!("heartbeat retry pending")
-                        }
-                        Ok(_) => {
-                            eprintln!("lease monitor stopped: heartbeat_device_unavailable");
-                            window.stop();
-                            break;
-                        }
-                        Err(error) => {
-                            eprintln!("lease monitor stopped: heartbeat_rejected: {error}");
-                            window.stop();
-                            break;
-                        }
-                    }
-                    heartbeat_at = Instant::now() + Duration::from_secs(10);
-                }
-                if Instant::now() >= renew_at {
-                    let renewal_started = Instant::now();
-                    match renew(directory, client, assignment.lease_id, snapshot()) {
-                        Ok((started, reply)) => {
-                            window.extend_at(started, reply.valid_for_seconds, Instant::now());
-                            if window.stopped_at(Instant::now()) {
-                                eprintln!(
-                                    "lease monitor stopped: renewal_arrived_after_local_expiry"
-                                );
-                                break;
-                            }
-                        }
-                        Err(error) if !terminal_remote_error(&error) => {
-                            eprintln!("lease renewal retry pending")
-                        }
-                        Err(error) => {
-                            eprintln!("lease monitor stopped: renewal_rejected: {error}");
-                            window.stop();
-                            break;
-                        }
-                    }
-                    if renewal_started.elapsed() >= Duration::from_secs(2) {
-                        eprintln!(
-                            "lease renewal delayed: duration_ms={}",
-                            renewal_started.elapsed().as_millis()
-                        );
-                    }
-                    renew_at = Instant::now() + Duration::from_secs(10);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            monitor_lease(
+                directory,
+                client,
+                stop,
+                &window,
+                &done,
+                assignment.lease_id,
+                snapshot,
+            );
         });
         let stop_monitor = StopMonitor(&done);
         let result = (|| {
@@ -1493,6 +1593,338 @@ mod tests {
     }
 
     #[test]
+    fn restarted_outbox_keeps_renewing_during_delivery_without_starting_work() {
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("relay");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        initialize(
+            &state,
+            &HashMap::from([
+                ("--dispatcher", url.as_str()),
+                ("--audience", "test"),
+                ("--label", "Owned fixture"),
+                ("--compute-group", "owned"),
+            ]),
+        )
+        .unwrap();
+        let lease_id = Uuid::new_v4();
+        let mut config = read_config(&state).unwrap();
+        config.device_id = Some(Uuid::new_v4());
+        config.active_assignment = Some(WorkAssignment {
+            lease_id,
+            review_id: Uuid::new_v4(),
+            role: ReviewRole::Investigator,
+            scenario: FixtureScenario::AccessControlV1,
+            expires_at: i64::MAX,
+            mode: ReviewMode::OwnedFixture,
+            website: None,
+            source: None,
+            pentest: None,
+        });
+        config.pending_result = Some(CompleteWork {
+            lease_id,
+            result: WorkResult::Fixture(FixtureResult { runs: vec![] }),
+        });
+        write_config(&state, &config).unwrap();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let observed = renewals.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(35);
+            let mut handlers = Vec::new();
+            let polled = Arc::new(AtomicBool::new(false));
+            while !polled.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                let renewals = renewals.clone();
+                let polled = polled.clone();
+                handlers.push(std::thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new();
+                    let (end, length) = loop {
+                        let mut buffer = [0; 8192];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert!(n > 0 && bytes.len() < 16384);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let length: usize = std::str::from_utf8(&bytes[..end]).unwrap().lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                            }).unwrap();
+                            if bytes.len() >= end + 4 + length { break (end + 4, length); }
+                        }
+                    };
+                    let path = std::str::from_utf8(&bytes[..end]).unwrap().lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                    let body = if path.ends_with("/complete-gzip") {
+                        // Hold the completion open until a concurrent renewal arrives.
+                        while renewals.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        assert!(renewals.load(Ordering::Relaxed) >= 2);
+                        serde_json::json!({"accepted":true,"fixture_matches":true,"evidence_complete":null,"replayed":false})
+                    } else {
+                        let request: serde_json::Value = serde_json::from_slice(&bytes[end..end+length]).unwrap();
+                        if path.ends_with("/renew") {
+                            renewals.fetch_add(1, Ordering::Relaxed);
+                            serde_json::json!({"lease_id":lease_id,"sequence":request["payload"]["sequence"],"expires_at":100,"deadline_at":1000,"valid_for_seconds":60,"replayed":false})
+                        } else if path.ends_with("/heartbeat") {
+                            serde_json::json!({"state":"busy","sequence":request["payload"]["sequence"],"replayed":false})
+                        } else {
+                            assert!(path.ends_with("/poll"));
+                            polled.store(true, Ordering::Relaxed);
+                            serde_json::json!({"assignment":null})
+                        }
+                    }.to_string();
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}",body.len()).unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+            assert!(polled.load(Ordering::Relaxed));
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        work_tick(
+            &state,
+            &client,
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(observed.load(Ordering::Relaxed) >= 2);
+        assert!(read_config(&state).unwrap().pending_result.is_none());
+        assert!(read_config(&state).unwrap().active_assignment.is_none());
+    }
+
+    #[test]
+    fn evidence_download_negotiates_signed_routes_and_bounds_gzip() {
+        use std::net::TcpListener;
+        fn gzip(bytes: &[u8]) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        }
+        for (fallback, encoding, body, expected_error) in [
+            (false, "gzip", gzip(br#"{"evidence":"saved"}"#), None),
+            (true, "", br#"{"evidence":"saved"}"#.to_vec(), None),
+            (
+                false,
+                "gzip",
+                gzip(&vec![b' '; 1025]),
+                Some("dispatcher response exceeded limit"),
+            ),
+            (
+                false,
+                "gzip",
+                vec![0; 1024 + 8193],
+                Some("dispatcher response exceeded limit"),
+            ),
+            (
+                false,
+                "gzip",
+                b"invalid compressed body".to_vec(),
+                Some("dispatcher returned invalid compressed evidence"),
+            ),
+            (
+                false,
+                "br",
+                vec![],
+                Some("dispatcher returned unsupported response encoding"),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = directory.path().join("relay");
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            initialize(
+                &state,
+                &HashMap::from([
+                    ("--dispatcher", url.as_str()),
+                    ("--audience", "test"),
+                    ("--label", "Owned fixture"),
+                    ("--compute-group", "owned"),
+                ]),
+            )
+            .unwrap();
+            let config = read_config(&state).unwrap();
+            let key = read_key(&state).unwrap();
+            let server = std::thread::spawn(move || {
+                for attempt in 0..if fallback { 2 } else { 1 } {
+                    let path = if attempt == 0 {
+                        "/work/pentest-evidence-gzip"
+                    } else {
+                        "/work/pentest-evidence"
+                    };
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let (end, length) = loop {
+                        let mut buffer = [0; 8192];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert!(n > 0 && bytes.len() < 16384);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                            assert!(headers.starts_with(&format!("POST {path} ")));
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap();
+                            if bytes.len() >= end + 4 + length {
+                                break (end + 4, length);
+                            }
+                        }
+                    };
+                    let signed: SignedRequest<serde_json::Value> =
+                        serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                    patchriot_protocol::verify(&signed, "test", path, signed.signed_at).unwrap();
+                    assert_eq!(signed.payload, serde_json::json!({"lease":"same"}));
+                    let old_endpoint = fallback && attempt == 0;
+                    let status = if old_endpoint { 404 } else { 200 };
+                    let data = if old_endpoint {
+                        b"{}".as_slice()
+                    } else {
+                        body.as_slice()
+                    };
+                    let header = if encoding.is_empty() || old_endpoint {
+                        String::new()
+                    } else {
+                        format!("Content-Encoding: {encoding}\r\n")
+                    };
+                    // A caller may reject unsupported headers before reading the body.
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{header}\r\n",
+                        data.len()
+                    );
+                    let _ = stream.write_all(data);
+                }
+            });
+            let client = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap();
+            let result = post_with_limit::<_, serde_json::Value>(
+                &client,
+                &config,
+                &key,
+                "/work/pentest-evidence",
+                serde_json::json!({"lease":"same"}),
+                1024,
+            );
+            if let Some(expected) = expected_error {
+                assert_eq!(result.unwrap_err().to_string(), expected);
+            } else {
+                assert_eq!(result.unwrap(), serde_json::json!({"evidence":"saved"}));
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn completion_falls_back_only_for_an_old_endpoint_and_resigns_the_path() {
+        use std::net::TcpListener;
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("relay");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        initialize(
+            &state,
+            &HashMap::from([
+                ("--dispatcher", url.as_str()),
+                ("--audience", "test"),
+                ("--label", "Owned fixture"),
+                ("--compute-group", "owned"),
+            ]),
+        )
+        .unwrap();
+        let config = read_config(&state).unwrap();
+        let key = read_key(&state).unwrap();
+        let server = std::thread::spawn(move || {
+            for (path, status) in [("/work/complete-gzip", 404), ("/work/complete", 200)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let (end, length) = loop {
+                    let mut buffer = [0; 8192];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0 && bytes.len() < 16384);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        assert!(headers.starts_with(&format!("POST {path} ")));
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break (end + 4, length);
+                        }
+                    }
+                };
+                let decoded = if status == 404 {
+                    let mut decoded = Vec::new();
+                    flate2::read::GzDecoder::new(&bytes[end..end + length])
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                    decoded
+                } else {
+                    bytes[end..end + length].to_vec()
+                };
+                let signed: SignedRequest<serde_json::Value> =
+                    serde_json::from_slice(&decoded).unwrap();
+                patchriot_protocol::verify(&signed, "test", path, signed.signed_at).unwrap();
+                assert_eq!(signed.payload, serde_json::json!({"saved":"unchanged"}));
+                let body = "{}";
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        post::<_, serde_json::Value>(
+            &client,
+            &config,
+            &key,
+            "/work/complete",
+            serde_json::json!({"saved":"unchanged"}),
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn structured_website_outbox_survives_restart_and_oversized_writes_are_atomic() {
         let directory = tempfile::tempdir().unwrap();
         let finding = serde_json::json!({"title":"Observed fixture", "support":"needs_live_test", "explanation":"x".repeat(1200), "suggested_action":"x".repeat(800), "citations":[{"resource_sha256":"a".repeat(64),"quote":"x".repeat(300)}]});
@@ -1519,6 +1951,109 @@ mod tests {
         config.introduction.label = "x".repeat(MAX_STATE as usize);
         assert!(write_config(directory.path(), &config).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn payment_refusal_pauses_only_after_saved_delivery_and_does_not_poll() {
+        use std::net::TcpListener;
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("relay");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        initialize(
+            &state,
+            &HashMap::from([
+                ("--dispatcher", url.as_str()),
+                ("--audience", "test"),
+                ("--label", "Owned fixture"),
+                ("--compute-group", "owned"),
+            ]),
+        )
+        .unwrap();
+        let mut config = read_config(&state).unwrap();
+        config.device_id = Some(Uuid::new_v4());
+        let result = serde_json::from_value(serde_json::json!({
+            "kind":"pentest_agent_v1","scope_sha256":"a".repeat(64),
+            "execution":{"state":"failed","provider":"venice.ai","model":"fixture",
+                "image_digest":"fixture","duration_ms":10,"inference_calls":1,"http_requests":1,
+                "cost_upper_microusd":1,"cleanup_confirmed":true,"failure_reason":"provider_payment_required"},
+            "assessment":null,"evidence":[],"raw_summary":"saved partial work"
+        })).unwrap();
+        config.pending_result = Some(CompleteWork {
+            lease_id: Uuid::new_v4(),
+            result: WorkResult::Pentest(result),
+        });
+        write_config(&state, &config).unwrap();
+        let before = serde_json::to_value(&config.pending_result).unwrap();
+        let server = std::thread::spawn(move || {
+            for status in [503, 200] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 8192];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0 && bytes.len() < 16384);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                        assert!(
+                            headers
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .contains("/work/complete-gzip ")
+                        );
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = if status == 503 {
+                    "{}"
+                } else {
+                    r#"{"accepted":true,"fixture_matches":false,"evidence_complete":false,"replayed":true}"#
+                };
+                write!(stream,"HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert!(send_result(&state, &client).is_err());
+        let saved = read_config(&state).unwrap();
+        assert!(!saved.paused, "Delivery still needs normal lease renewal");
+        assert_eq!(serde_json::to_value(saved.pending_result).unwrap(), before);
+        // A later work tick delivers the exact outbox, then stops before polling
+        // another assignment. A third request would fail against this server.
+        work_tick(
+            &state,
+            &client,
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        server.join().unwrap();
+        let resumed = read_config(&state).unwrap();
+        assert!(resumed.paused);
+        assert!(resumed.pending_result.is_none());
+        assert!(resumed.active_assignment.is_none());
+        assert_eq!(resumed.device_id, config.device_id);
     }
 
     #[test]
@@ -1663,9 +2198,30 @@ mod tests {
                         }
                     }
                 };
-                let signed: serde_json::Value =
-                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
-                requests.push(signed["payload"].clone());
+                assert!(
+                    std::str::from_utf8(&bytes[..end])
+                        .unwrap()
+                        .contains("/work/complete-gzip ")
+                );
+                assert!(
+                    length < MAX_RESULT_BYTES / 20,
+                    "repeated evidence should compress"
+                );
+                let mut decoded = Vec::new();
+                flate2::read::GzDecoder::new(&bytes[end..end + length])
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+                let signed: SignedRequest<CompleteWork> = serde_json::from_slice(&decoded).unwrap();
+                let path = std::str::from_utf8(&bytes[..end])
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                patchriot_protocol::verify(&signed, "test", path, signed.signed_at).unwrap();
+                requests.push(serde_json::to_value(signed.payload).unwrap());
                 let body = if status == 503 {
                     "{}"
                 } else {

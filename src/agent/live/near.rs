@@ -126,13 +126,7 @@ async fn completion_body(mut response: InferenceResponse) -> Result<Value, &'sta
     if !response.status.is_success() {
         let status = response.status.as_u16();
         eprintln!("NEAR completion rejected: http_status={status}");
-        return Err(match status {
-            401 | 403 => "provider_authentication_failed",
-            413 => "provider_context_limit",
-            429 => "provider_rate_limited",
-            500..=599 => "provider_unavailable",
-            _ => "provider_rejected_request",
-        });
+        return Err(super::provider_http_error(status));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.body.next().await {
@@ -285,6 +279,7 @@ mod tests {
         for (status, reason) in [
             (400, "provider_rejected_request"),
             (401, "provider_authentication_failed"),
+            (402, "provider_payment_required"),
             (403, "provider_authentication_failed"),
             (413, "provider_context_limit"),
             (429, "provider_rate_limited"),

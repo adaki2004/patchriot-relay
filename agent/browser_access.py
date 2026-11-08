@@ -119,6 +119,7 @@ class BrowserAccess:
         self.resources = set(scope.get('browser_login', {}).get('resource_origins', []))
         self.pending = {}
         self.requests = {}
+        self.proof_candidates = {}
         self.verified = False
         self.legacy_wallet = False
         self.unsupported_wallet_methods = set()
@@ -227,6 +228,13 @@ class BrowserAccess:
                 # Keep only session headers for an explicit access comparison;
                 # never dump this cache into an agent transcript or artifact.
                 self.requests[request.url] = {k:v for k,v in headers.items() if k.lower() in ('authorization','cookie','accept')}
+                # Verification fallback considers only resources the actual
+                # signed-in browser already fetched successfully, never guessed
+                # routes or public dependencies. Credentials stay in requests.
+                if (evidence.get('authenticated') and 200 <= evidence.get('status', 0) < 300
+                        and request.resource_type in ('fetch', 'xhr', 'document')
+                        and len(self.proof_candidates) < 32):
+                    self.proof_candidates[request.url] = True
             response_headers = {}
             for key, value in reply['headers']:
                 # Only Set-Cookie uses Playwright's newline representation.
@@ -416,6 +424,28 @@ class BrowserAccess:
             return result
         raise ValueError('Unknown browser access operation')
 
+    async def verify_observed(self):
+        """Finish a missed protected-resource comparison without another login.
+
+        The broker remains the authority: a changed page or HTTP 200 is never
+        enough. Public 200/200 resources fail; only its paired proof enables
+        engine access. This does not invent an identity or mutation permission.
+        """
+        if self.verified:
+            return {'verified': True, 'checks': 0}
+        checks = 0
+        for url in list(self.proof_candidates)[:4]:
+            if self.http_exhausted:
+                break
+            checks += 1
+            try:
+                result = await self.operation({'command': 'check', 'url': url})
+            except (OSError, ValueError):
+                continue
+            if result.get('verified') is True:
+                return {'verified': True, 'checks': checks}
+        return {'verified': False, 'checks': checks}
+
     async def handle_control(self, reader, writer):
         try:
             head = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 5)
@@ -442,6 +472,7 @@ class BrowserAccess:
             if not pending['future'].done(): pending['future'].cancel()
         self.credentials = None
         self.requests.clear()
+        self.proof_candidates.clear()
         if self.control: self.control.close(); await self.control.wait_closed()
         if self.context: await self.context.close()
         if hasattr(self,'playwright'): await self.playwright.stop()
@@ -520,6 +551,16 @@ class BrowserAccounts:
         os.environ['BH_TMP_DIR'] = str(runtime / 'tmp')
         os.environ['BH_TMP_DIR_SHARED'] = '1'
         Path('/work/default-account.json').write_text(json.dumps(account))
+
+    def verify_observed(self, account):
+        runner = self.runners[account]
+        future = asyncio.run_coroutine_threadsafe(
+            asyncio.wait_for(runner.browser.verify_observed(), timeout=120), runner.loop)
+        try:
+            return future.result(timeout=125)
+        except (TimeoutError, OSError, ValueError):
+            future.cancel()
+            return {'verified': False, 'unavailable': True}
 
     def close(self):
         runners, self.runners = self.runners, {}

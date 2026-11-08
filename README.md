@@ -176,7 +176,7 @@ For a Linux host that should stay online, install the [systemd template](deploy/
 
 ### Inspect and maintain a relay
 
-Run these as the Unix user that owns the device state. `doctor` is read-only apart from lock files; it checks identity-file permissions, the gateway's HTTPS health, connection state and the configured image/provider files. It sends no customer data or model request. A passing health check does not prove remote approval.
+Run these as the Unix user that owns the device state. `doctor` is read-only apart from lock files; it checks identity-file permissions, the gateway's HTTPS health, connection state and the configured image/provider files. It sends no customer data or model request. A passing health check does not prove remote approval. It also does not prove inference credit is available. A live provider HTTP 402 is reported as `provider_payment_required`. After its saved result is acknowledged (or a fenced result is preserved), that worker pauses durably before taking more queued work. Restore the provider balance or key allowance, then explicitly `resume`; restarting the service does not clear this pause.
 
 | Command | Effect |
 | --- | --- |
@@ -568,3 +568,20 @@ Scanner scratch files use the existing bounded work mount and are removed on exi
 The final coverage ledger is constructed by the relay from recorded requests. Each observation identifies its URL, method, account context and evidence. Unverified vulnerability classes remain explicit obligations. The displayed ledger is size-bounded and reports omitted units. Complete request evidence remains in the normal private report. Model-authored completion cannot close a coverage obligation.
 
 The web scanner sees selected headers and decoded text through a scoped mirror. Browser execution, cookie attributes, TLS and raw protocol behavior require faithful original-context evidence. API-schema generation exercises positive and negative OpenAPI inputs for GET, HEAD and OPTIONS operations. Observed GraphQL endpoints can receive introspection and generated query operations when POST is approved. Reference-account POST and mutations remain explicit gaps. External schema references are rejected. All scanners share the existing request and time budgets. Deploy compatible core and dispatcher readers before the adapter 21 relay.
+
+
+### ZAP inputs and current coverage
+
+The bundled ZAP adapter runs passive checks on selected recorded URLs. Grey-box scans use the broker's verified account context; the scanner receives scoped responses through the local mirror, not a credential file. A supplied username/password alone does not establish access. The relay must first verify the login against a protected resource.
+
+Mirrors expose broker-owned `X-Patchriot-Authenticated`, `X-Patchriot-Account` and `X-Patchriot-Evidence-Id` response headers. Target-supplied headers with this prefix are discarded. A command without a visible token can still use injected access; access-control findings must compare the exact recorded account context with a fresh anonymous control. These headers contain no credentials and are not target security properties.
+
+The broker returns decoded text, not raw binary downloads. Unsupported binary bodies are withheld from tool downloads, with `binary_response_not_supported` identifying a broker coverage gap; original response evidence, hashes and IDs remain unchanged. Mirrors return a clearly marked local 502 for that gap, not a claimed target error. HEAD checks and usable plain-text responses remain available, including text served as `application/octet-stream`. Agents must not attempt to reconstruct or decompress binary files from lossy text.
+
+For explicitly approved active scopes, the current adapter enables only the reflected-input rule on observed GET query parameters. Successful GET inputs discovered by the agent can seed the follow-up scan without a user-uploaded schema. Generated values must still pass the same method, origin, account and request limits. Missing inputs produce an explicit inapplicable outcome.
+
+This is narrower than ZAP's full active or API scan. ZAP's API scan accepts OpenAPI, SOAP or GraphQL definitions; its automation framework also supports authentication/session configuration and users. Those upstream capabilities are not an API-schema upload feature in Patchriot. The current separate schema generator uses observed definitions for bounded read cases. Stateful POST workflows, browser-only behavior and reliable session renewal require additional adapters and owned fixtures before broader scanning is enabled. Scanner execution has no model-token charge, but compute, storage and model interpretation still cost money. See [ZAP automation](https://www.zaproxy.org/docs/automate/), [API scan inputs](https://www.zaproxy.org/docs/docker/api-scan/) and [authentication configuration](https://www.zaproxy.org/docs/desktop/addons/automation-framework/authentication/).
+
+### Saved report delivery
+
+Completed results stay in the private outbox until the dispatcher acknowledges them. Completion uploads use gzip with a 90-second request deadline; heartbeats retain their shorter deadline. The server bounds both compressed bytes and expanded JSON, verifies the signed endpoint and applies the normal lease and exact-replay checks. An older server's missing compressed endpoint falls back to the original signed JSON request. Timeouts retain the same saved result and do not rerun inference. Deploy the compatible dispatcher/gateway first, and upgrade runners after their active execution ends.

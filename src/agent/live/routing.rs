@@ -149,12 +149,9 @@ impl LiveBroker {
             .await
             .map_err(|_| "provider_unavailable")?;
         if !response.status().is_success() {
-            return Err(match response.status().as_u16() {
-                401 | 403 => "provider_authentication_failed",
-                429 => "provider_rate_limited",
-                500..=599 => "provider_unavailable",
-                _ => "provider_rejected_request",
-            });
+            let status = response.status().as_u16();
+            eprintln!("Provider completion rejected: http_status={status}");
+            return Err(provider_http_error(status));
         }
         if response
             .headers()
@@ -850,6 +847,7 @@ mod tests {
             "near_model_signature_required",
             "wrong_provider_model",
             "provider_authentication_failed",
+            "provider_payment_required",
             "provider_rejected_request",
             "provider_context_limit",
             "provider_budget_reached",

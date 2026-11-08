@@ -46,6 +46,20 @@ async fn await_model_reply<T>(
 pub fn is_chat_path(path: &str) -> bool {
     path == "/v1/chat/completions" || path == ENGINE_CHAT || path == SUMMARY_CHAT
 }
+
+/// HTTP status is safe to retain; provider error bodies can quote private input.
+/// Payment refusal is distinct from the review's own inference budget and must
+/// not trigger automatic retries or a change to another paid provider.
+fn provider_http_error(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "provider_authentication_failed",
+        402 => "provider_payment_required",
+        413 => "provider_context_limit",
+        429 => "provider_rate_limited",
+        500..=599 => "provider_unavailable",
+        _ => "provider_rejected_request",
+    }
+}
 /// A rejected discovery request must stop that engine, not discard the later
 /// reviewer's chance to report the saved evidence. Local input errors send no
 /// model request; transient provider failures keep their attempt and cost
@@ -335,7 +349,12 @@ impl LiveBroker {
                         workflow.checks[6].state = CheckState::Running;
                     }
                 }
-                if phase == LivePhase::Finishing {
+                // The outer investigator checks leads after discovery, before
+                // producing its report. That work belongs to evidence review;
+                // waiting until the result event hid this entire phase.
+                if matches!(phase, LivePhase::Investigating | LivePhase::Finishing)
+                    && workflow.checks[7].state == CheckState::Pending
+                {
                     workflow.checks[7].state = CheckState::Running;
                 }
             }
@@ -681,7 +700,9 @@ impl LiveBroker {
             .await
             .map_err(|_| "provider_unavailable")?;
         if !response.status().is_success() {
-            return Err("provider_rejected_request");
+            let status = response.status().as_u16();
+            eprintln!("Provider completion rejected: http_status={status}");
+            return Err(provider_http_error(status));
         }
         let content_type = if body["stream"] == true {
             "text/event-stream"
@@ -2610,6 +2631,47 @@ for _ in range(270): print(frame,flush=True)
             CheckState::Pending
         );
         assert!(!broker.accept_workflow(&json!({"version":1,"checks":[]})));
+    }
+    #[test]
+    fn evidence_review_starts_with_follow_up_investigation() {
+        let broker = broker();
+        let workflow = AssessmentWorkflow {
+            version: 1,
+            checks: CheckId::ALL
+                .into_iter()
+                .map(|id| CheckProgress {
+                    id,
+                    state: CheckState::Pending,
+                    evidence_count: 0,
+                    source_role: None,
+                })
+                .collect(),
+        };
+        assert!(broker.accept_workflow(&serde_json::to_value(&workflow).unwrap()));
+        let progress = Progress::default();
+        for (phase, expected) in [
+            (LivePhase::Starting, CheckState::Pending),
+            (LivePhase::ScopedTools, CheckState::Pending),
+            (LivePhase::Investigating, CheckState::Running),
+            (LivePhase::Finishing, CheckState::Running),
+        ] {
+            broker.update_progress(&progress, phase, 0, None);
+            let observed = progress.lock().unwrap();
+            let checks = &observed.workflow.as_ref().unwrap().checks;
+            assert_eq!(checks[7].state, expected);
+            assert_eq!(checks[4].state, CheckState::Pending);
+            assert_eq!(checks[7].evidence_count, 0);
+        }
+        for state in [CheckState::Incomplete, CheckState::Recorded] {
+            let mut saved = workflow.clone();
+            saved.checks[7].state = state;
+            assert!(broker.accept_workflow(&serde_json::to_value(saved).unwrap()));
+            broker.update_progress(&progress, LivePhase::Investigating, 0, None);
+            assert_eq!(
+                progress.lock().unwrap().workflow.as_ref().unwrap().checks[7].state,
+                state
+            );
+        }
     }
     #[tokio::test]
     async fn engine_generated_identity_is_rejected_before_target_io() {

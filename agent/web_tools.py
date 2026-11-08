@@ -19,7 +19,7 @@ import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.error import URLError
 
-from live_http import request
+from live_http import binary_response, request
 
 PROFILE = "owasp-web-v1"
 VERSION = "1"
@@ -232,9 +232,14 @@ class ScopeMirror:
                     if status and evidence.get("id"):
                         observation = [self.command, origin + self.path, data, status, reply.get("body", "")]
                         mirror.progress_keys.add(hashlib.sha256(json.dumps(observation).encode()).digest())
-                    payload = reply.get("body", "").encode() if status else b"relay request unavailable"
-                    self.send_response(status or 502)
+                    unsupported = self.command != 'HEAD' and (reply.get('body_unavailable') == 'binary_response_not_supported'
+                                                              or binary_response(reply))
+                    payload = (b"Binary response unavailable through the text-only broker. Do not reconstruct or decompress decoded bytes."
+                               if unsupported else reply.get("body", "").encode() if status else b"relay request unavailable")
+                    self.send_response(502 if unsupported else status or 502)
                     for name, value in evidence.get("headers", {}).items():
+                        if unsupported and name.lower() in ('content-type', 'content-disposition', 'location'):
+                            continue
                         if not name.lower().startswith("x-patchriot-") and name.lower() not in ("connection", "content-length", "transfer-encoding", "content-encoding") and "\r" not in value and "\n" not in value:
                             if name.lower() == "location":
                                 destination = urljoin(origin + self.path, value)
@@ -246,11 +251,22 @@ class ScopeMirror:
                     # A body cap must not look like the target served a short
                     # but complete file, or a denied probe like a target 502.
                     self.send_header("X-Patchriot-Body-Truncated", "true" if reply.get("body_truncated") else "false")
-                    error = reply.get("error") or evidence.get("error")
+                    if unsupported:
+                        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    error = 'binary_response_not_supported' if unsupported else reply.get("error") or evidence.get("error")
                     if isinstance(error, str) and re.fullmatch(r"[a-z0-9_]{1,80}", error):
                         self.send_header("X-Patchriot-Relay-Error", error)
                     if type(evidence.get("id")) is int and evidence['id'] > 0:
                         self.send_header("X-Patchriot-Evidence-Id", str(evidence['id']))
+                        # HttpEvidence omits authenticated=false on the wire.
+                        # The broker may inject access even when curl supplies
+                        # no Authorization header to this local mirror.
+                        authenticated = evidence.get('authenticated', False) is True
+                        self.send_header("X-Patchriot-Authenticated", "true" if authenticated else "false")
+                        if authenticated and evidence.get('account') in ('testing', 'reference'):
+                            self.send_header("X-Patchriot-Account", evidence['account'])
+                    else:
+                        self.send_header("X-Patchriot-Authenticated", "unknown")
                     self.send_header("Content-Length", str(len(payload)))
                     self.send_header("Connection", "close")
                     self.end_headers()

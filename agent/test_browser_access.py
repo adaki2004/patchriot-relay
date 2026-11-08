@@ -11,12 +11,56 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 from urllib.parse import urlsplit
 from browser_access import BrowserAccess, BrowserAccounts, StaticAssetCache, configure_hermes_browser
 
 ORIGIN = 'https://owned.example'
 ADDRESS = '0x1111111111111111111111111111111111111111'
+
+
+class ObservedAccessTests(unittest.IsolatedAsyncioTestCase):
+    def browser(self):
+        browser = BrowserAccess({'origins':[ORIGIN], 'authentication':'session', 'browser_login':{}}, 'http://127.0.0.1:1')
+        browser.context = SimpleNamespace(cookies=AsyncMock(return_value=[{'name':'session','value':'private-fixture'}]))
+        browser.retain = lambda reply: 'saved-fixture-evidence'
+        return browser
+
+    async def test_missed_proof_tries_observed_gets_and_stops_at_broker_verified(self):
+        browser = self.browser()
+        browser.proof_candidates = {ORIGIN+'/public-session':True, ORIGIN+'/private-records':True, ORIGIN+'/unused':True}
+        browser.requests[ORIGIN+'/private-records'] = {'authorization':'Bearer private-fixture'}
+        browser.call = AsyncMock(side_effect=[{'verified':False,'evidence':[]}, {'verified':True,'evidence':[{'id':1},{'id':2}]}])
+        result = await browser.verify_observed()
+        self.assertEqual(result, {'verified':True,'checks':2})
+        self.assertTrue(browser.verified)
+        calls=browser.call.call_args_list
+        self.assertEqual([call.args[1]['url'] for call in calls], list(browser.proof_candidates)[:2])
+        self.assertTrue(all(call.args[0]=='check' and call.args[1]['json_pointer'] is None for call in calls))
+        self.assertEqual(calls[1].args[1]['headers']['authorization'], 'Bearer private-fixture')
+        self.assertNotIn('private-fixture', json.dumps(result))
+        browser.call.reset_mock()
+        self.assertEqual(await browser.verify_observed(), {'verified':True,'checks':0})
+        browser.call.assert_not_called()
+
+    async def test_no_guessed_routes_or_false_proof_and_four_comparison_limit(self):
+        browser=self.browser()
+        browser.call=AsyncMock(return_value={'verified':False,'evidence':[]})
+        self.assertEqual(await browser.verify_observed(), {'verified':False,'checks':0})
+        browser.call.assert_not_called()
+        browser.proof_candidates={ORIGIN+f'/observed-{n}':True for n in range(8)}
+        self.assertEqual(await browser.verify_observed(), {'verified':False,'checks':4})
+        self.assertEqual(browser.call.call_count,4)
+        self.assertFalse(browser.verified)
+        browser.http_exhausted=True
+        self.assertEqual(await browser.verify_observed(), {'verified':False,'checks':0})
+
+    async def test_failed_comparison_does_not_invent_proof(self):
+        browser=self.browser()
+        browser.proof_candidates={ORIGIN+'/observed':True}
+        browser.call=AsyncMock(side_effect=ValueError('browser_unavailable'))
+        self.assertEqual(await browser.verify_observed(), {'verified':False,'checks':1})
+        self.assertFalse(browser.verified)
 
 
 class StaticAssetTests(unittest.TestCase):
@@ -154,7 +198,7 @@ class FixtureBrowser(BrowserAccess):
                 ['set-cookie','first=one; Secure; HttpOnly; Path=/'],
                 ['set-cookie','second=two; Secure; HttpOnly; Path=/']]
         else: status, body = 404, '{}'
-        return {'evidence':{'id':self.seq,'status':status,'error':None},'headers':headers,'body_base64':base64.b64encode(body.encode()).decode()}
+        return {'evidence':{'id':self.seq,'status':status,'error':None,'authenticated':bool(data.get('authenticated') and 'session=owned-fixture' in data['headers'].get('cookie',''))},'headers':headers,'body_base64':base64.b64encode(body.encode()).decode()}
 
 
 def origin_of(url):
@@ -182,6 +226,20 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         page=self.browser.context.pages[0]
         await page.goto(ORIGIN)
         return page
+
+    async def test_observed_resource_fallback_finishes_login_without_model_chosen_endpoint(self):
+        page=await self.start('session')
+        self.assertEqual(self.browser.proof_candidates,{})
+        await self.browser.operation({'command':'begin'})
+        await self.browser.operation({'command':'fill','username':'#user','password':'#pass'})
+        await page.get_by_role('button',name='Enter').click()
+        await page.wait_for_function("document.querySelector('#account').textContent.includes('@')")
+        self.assertEqual(list(self.browser.proof_candidates),[ORIGIN+'/account-data'])
+        self.assertFalse(self.browser.verified)
+        result=await self.browser.verify_observed()
+        self.assertEqual(result, {'verified':True,'checks':1})
+        self.assertTrue(self.browser.verified)
+        self.assertEqual(sum(call['method']=='POST' for call in self.browser.calls),1)
 
     async def test_password_login_runs_the_sites_javascript_and_keeps_its_cookie(self):
         page=await self.start('session')
