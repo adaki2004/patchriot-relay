@@ -51,7 +51,7 @@ def configure_exploration(client):
     for role in ('worker', 'planner'):
         path = '/api/agents/' + role
         current = client.call(path)
-        template = (current.get('prompt') or {}).get('template_text')
+        template = current.get('prompt')
         if not isinstance(template, str) or not template.strip():
             raise ValueError('engine prompt unavailable')
         policy = SAMPLING_POLICY

@@ -37,7 +37,7 @@ class EngineTests(unittest.TestCase):
                     if path.endswith('/prompt'): self.prompts[role] = body['template']
                     if path.endswith('/config'): self.config = body
                     return {}
-                return {'prompt': {'template_text': self.prompts[role]}, 'agent': self.config}
+                return {'prompt': self.prompts[role], 'agent': self.config}
         client = FakeClient()
         artex.configure_exploration(client)
         self.assertEqual(client.config, {'max_turns': 64, 'run_seconds': 600})
@@ -51,7 +51,7 @@ class EngineTests(unittest.TestCase):
     def test_unapplied_native_worker_limits_cannot_silently_start_unbounded(self):
         class FakeClient:
             def call(self, path, body=None, method=None):
-                return {'prompt': {'template_text': 'original'}, 'agent': {'max_turns': 0, 'run_seconds': 0}}
+                return {'prompt': 'original', 'agent': {'max_turns': 0, 'run_seconds': 0}}
         with self.assertRaisesRegex(ValueError, 'worker limits not applied'):
             artex.configure_exploration(FakeClient())
 
@@ -564,7 +564,7 @@ class ImageSmoke(unittest.TestCase):
                     worker = engine.client.call('/api/agents/worker')
                     self.assertEqual(worker['agent']['max_turns'], artex.WORKER_MAX_TURNS)
                     self.assertEqual(worker['agent']['run_seconds'], artex.WORKER_RUN_SECONDS)
-                    self.assertIn(artex.SAMPLING_POLICY, worker['prompt']['template_text'])
+                    self.assertIn(artex.SAMPLING_POLICY, worker['prompt'])
                     # Check the shipped process boundary, not the engine's own
                     # tool approvals or target blacklist. No external target is
                     # contacted: the isolated namespace has only loopback.
