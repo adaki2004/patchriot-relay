@@ -238,6 +238,7 @@ struct Counters {
     evidence_bytes: usize,
     primary_attempts: u16,
     fallback: Option<ProviderFallbackReceipt>,
+    returned_to_primary: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

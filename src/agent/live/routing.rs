@@ -225,6 +225,10 @@ impl LiveBroker {
         count.reserved += reservation;
         if route.provider() == self.provider {
             count.primary_attempts += 1;
+            let attempts = count.primary_attempts;
+            if let Some(receipt) = count.fallback.as_mut() {
+                receipt.primary_attempts = attempts;
+            }
         } else {
             let primary_attempts = count.primary_attempts;
             let receipt = count
@@ -315,23 +319,65 @@ impl LiveBroker {
         F: FnMut(Route, Value) -> R,
         R: Future<Output = Result<Value, &'static str>>,
     {
-        let already_fell_back = self
-            .counters
-            .lock()
-            .map_err(|_| "counter_unavailable")?
-            .fallback
-            .is_some();
+        let (already_fell_back, returned_to_primary) = {
+            let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+            (count.fallback.is_some(), count.returned_to_primary)
+        };
         let primary = Route::from_provider(self.provider)?;
         let secondary = self
             .fallback_provider
             .map(Route::from_provider)
             .transpose()?;
+        if returned_to_primary {
+            return self
+                .complete_route(primary, route_body(primary, body), engine, None, &mut send)
+                .await;
+        }
         if already_fell_back {
             let secondary = secondary.ok_or("fallback_not_configured")?;
-            let body = route_body(secondary, body);
-            return self
-                .complete_route(secondary, body, engine, None, &mut send)
+            let result = self
+                .complete_route(
+                    secondary,
+                    route_body(secondary, body.clone()),
+                    engine,
+                    None,
+                    &mut send,
+                )
                 .await;
+            if let Err(reason) = result {
+                // A backup that worked for earlier calls may later degrade.
+                // Return to the already-consented primary at most once per
+                // role, only before any output/tool call reached the agent.
+                // Do not ping-pong when both providers fail at first failover.
+                let recover = {
+                    let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
+                    if fallback_available_for(reason)
+                        && !count.returned_to_primary
+                        && count
+                            .fallback
+                            .as_ref()
+                            .is_some_and(|r| r.fallback_completed > 0)
+                    {
+                        count.returned_to_primary = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if recover {
+                    eprintln!(
+                        "model recovery return: {} -> {} reason={reason}",
+                        secondary.provider().name(),
+                        primary.provider().name()
+                    );
+                    // Count this generation as another call and reserve its
+                    // full allowance. Keep the ambiguous failed charge.
+                    return self
+                        .complete_route(primary, route_body(primary, body), engine, None, &mut send)
+                        .await;
+                }
+            }
+            return result;
         }
         let primary_body = route_body(primary, body.clone());
         match self
@@ -345,7 +391,7 @@ impl LiveBroker {
                     && secondary.is_some() =>
             {
                 // Nothing has reached the agent. Keep the primary's uncertain
-                // charge, reserve the backup separately and stay there for this role.
+                // charge and reserve the backup separately. Later calls prefer it.
                 let secondary = secondary.ok_or("fallback_not_configured")?;
                 let body = route_body(secondary, body);
                 eprintln!(
@@ -595,6 +641,127 @@ mod tests {
             count.fallback.as_ref().unwrap().reason,
             "near_verification_timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn a_later_backup_failure_returns_to_consented_primary_once() {
+        for primary in [Route::Near, Route::Venice] {
+            let secondary = if primary == Route::Near {
+                Route::Venice
+            } else {
+                Route::Near
+            };
+            let mut broker = broker();
+            let config = Arc::get_mut(&mut broker).unwrap();
+            config.provider = primary.provider();
+            config.fallback_provider = Some(secondary.provider());
+            broker
+                .route_completion(request(), true, |route, _| {
+                    std::future::ready(if route == primary {
+                        Err("provider_unavailable")
+                    } else {
+                        Ok(reply())
+                    })
+                })
+                .await
+                .unwrap();
+            let before = broker.counters.lock().unwrap().reserved;
+            let mut routes = Vec::new();
+            broker
+                .route_completion(request(), true, |route, body| {
+                    routes.push(route);
+                    assert_eq!(body["model"], route.provider().model());
+                    std::future::ready(if route == secondary {
+                        Err("near_verification_timeout")
+                    } else {
+                        Ok(reply())
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(routes, vec![secondary, primary]);
+            {
+                let count = broker.counters.lock().unwrap();
+                let receipt = count.fallback.as_ref().unwrap();
+                assert!(count.returned_to_primary);
+                assert_eq!(count.calls, 3); // The return generation consumes its own call slot.
+                assert_eq!(receipt.primary_attempts, 2);
+                assert_eq!(receipt.fallback_attempts, 2);
+                assert_eq!(receipt.fallback_completed, 1);
+                assert!(receipt.valid(count.calls));
+                assert!(count.reserved > before); // No guessed refund of the failed backup.
+            }
+            routes.clear();
+            let error = broker
+                .route_completion(request(), true, |route, _| {
+                    routes.push(route);
+                    std::future::ready(Err("provider_unavailable"))
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error, "provider_unavailable");
+            assert_eq!(routes, vec![primary], "No further provider ping-pong");
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_payment_or_verification_denial_never_returns_to_primary() {
+        for reason in [
+            "provider_payment_required",
+            "provider_authentication_failed",
+            "near_signature_invalid",
+            "engine_budget_reached",
+        ] {
+            let broker = broker();
+            broker
+                .route_completion(request(), true, |route, _| {
+                    std::future::ready(if route == Route::Near {
+                        Err("provider_unavailable")
+                    } else {
+                        Ok(reply())
+                    })
+                })
+                .await
+                .unwrap();
+            let mut routes = Vec::new();
+            let error = broker
+                .route_completion(request(), true, |route, _| {
+                    routes.push(route);
+                    std::future::ready(Err(reason))
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error, reason);
+            assert_eq!(routes, vec![Route::Venice]);
+            assert!(!broker.counters.lock().unwrap().returned_to_primary);
+        }
+    }
+
+    #[tokio::test]
+    async fn return_to_primary_cannot_exceed_the_engine_call_allowance() {
+        let broker = broker();
+        broker
+            .route_completion(request(), true, |route, _| {
+                std::future::ready(if route == Route::Near {
+                    Err("provider_unavailable")
+                } else {
+                    Ok(reply())
+                })
+            })
+            .await
+            .unwrap();
+        broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT - 1;
+        let mut routes = Vec::new();
+        let error = broker
+            .route_completion(request(), true, |route, _| {
+                routes.push(route);
+                std::future::ready(Err("provider_unavailable"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, "engine_budget_reached");
+        assert_eq!(routes, vec![Route::Venice]);
+        assert_eq!(broker.counters.lock().unwrap().calls, ENGINE_CALL_LIMIT);
     }
 
     #[tokio::test]
