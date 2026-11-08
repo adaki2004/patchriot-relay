@@ -26,6 +26,8 @@ flowchart LR
 
 On the NEAR route, only the model step runs inside its TEE. The agent host and approved operator still handle assigned content. Venice is also supported as primary or backup; that API route has no relay-verified TEE. Reports preserve actual routing. Containers receive neither host secrets nor unrestricted network access.
 
+For a consented worker pool, the dispatcher selects the worker when a role becomes ready. The signed evidence response identifies that worker; the relay binds inference to its saved model declaration rather than its position in the pool. Older pinned assignments keep their original role ordering.
+
 For new two-agent requests, Scout runs the full scoped investigation and Recon receives its findings and evidence for targeted validation. No automatic third role runs; older requests retain their saved policy. Reports list the tools actually run. An optional check can fail while the agent still returns useful evidence; that gap stays visible. Successful defenses and ordinary behavior belong in the summary, not the vulnerability list. A matching answer is not proof of a vulnerability or of independent reviewers.
 
 Later roles reuse completed discovery records. When ARTEX reaches a time, request, model or progress limit after saving target responses, the next agent uses those records for targeted checks instead of repeating the broad scan. Coverage stays incomplete. Missing discovery or a failed startup can be retried once; older, truncated receipts retain that recovery path. If a role stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.

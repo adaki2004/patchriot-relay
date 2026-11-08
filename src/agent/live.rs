@@ -171,6 +171,14 @@ pub struct Task {
 }
 impl Task {
     pub fn model(&self) -> Option<&str> {
+        if self.evidence.context.use_worker_pool {
+            return self
+                .evidence
+                .assigned_reviewer
+                .as_ref()
+                .filter(|r| self.evidence.context.reviewers.contains(r))
+                .map(|r| r.declared_model.as_str());
+        }
         let position = match self.role {
             ReviewRole::Investigator => 0,
             ReviewRole::Reproducer => 1,
@@ -195,8 +203,17 @@ impl Task {
             )
             .as_deref()
                 != Some(self.evidence.context.provider.as_str())
-            || self.evidence.context.reviewers.len()
-                != self.evidence.context.review_policy.team_size()
+            || !self.evidence.context.review_policy.valid_devices(
+                &self
+                    .evidence
+                    .context
+                    .reviewers
+                    .iter()
+                    .map(|r| r.device_id)
+                    .collect::<Vec<_>>(),
+                self.evidence.context.use_worker_pool,
+            )
+            || self.model().is_none()
             || self.evidence.previous_reports.len() > 2
         {
             return Err("invalid live assignment".into());
@@ -2181,10 +2198,12 @@ for _ in range(270): print(frame,flush=True)
             role: ReviewRole::Investigator,
             scope_sha256: hash.clone(),
             evidence: PentestEvidence {
+                assigned_reviewer: None,
                 context: PentestContext {
                     allows_venice_fallback: false,
                     fallback_model: None,
                     review_policy: Default::default(),
+                    use_worker_pool: false,
                     third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope,
@@ -2225,10 +2244,12 @@ for _ in range(270): print(frame,flush=True)
             role: ReviewRole::Challenger,
             scope_sha256: scope.hash().unwrap(),
             evidence: PentestEvidence {
+                assigned_reviewer: None,
                 context: PentestContext {
                     allows_venice_fallback: false,
                     fallback_model: None,
                     review_policy: Default::default(),
+                    use_worker_pool: false,
                     third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope_sha256: scope.hash().unwrap(),
@@ -2448,10 +2469,12 @@ for _ in range(270): print(frame,flush=True)
             role: ReviewRole::Investigator,
             scope_sha256: scope.hash().unwrap(),
             evidence: PentestEvidence {
+                assigned_reviewer: None,
                 context: PentestContext {
                     allows_venice_fallback: false,
                     fallback_model: None,
                     review_policy: Default::default(),
+                    use_worker_pool: false,
                     third_review: None,
                     pentest_id: uuid::Uuid::new_v4(),
                     scope_sha256: scope.hash().unwrap(),
@@ -2469,6 +2492,26 @@ for _ in range(270): print(frame,flush=True)
         assert_eq!(task.model(), Some(LiveProvider::Abliteration.model()));
         task.evidence.context.provider = "abliteration.ai".into();
         assert!(task.input().is_err());
+        task.evidence.context.provider = "abliteration.ai, venice.ai".into();
+        task.evidence.context.use_worker_pool = true;
+        task.evidence.context.review_policy =
+            patchriot_protocol::pentests::LiveReviewPolicy::InvestigateValidateV1;
+        task.role = ReviewRole::Investigator;
+        assert!(
+            task.input().is_err(),
+            "Pool assignments must identify the actual worker"
+        );
+        task.evidence.assigned_reviewer = Some(task.evidence.context.reviewers[2].clone());
+        assert_eq!(task.model(), Some(LiveProvider::Abliteration.model()));
+        assert!(
+            task.input().is_ok(),
+            "The assigned model comes from the lease, not the pool order"
+        );
+        task.evidence.assigned_reviewer.as_mut().unwrap().device_id = uuid::Uuid::new_v4();
+        assert!(
+            task.input().is_err(),
+            "An unconsented worker cannot inherit a pool assignment"
+        );
     }
     #[tokio::test]
     async fn generated_login_tokens_are_redacted_before_http_evidence_and_tool_output() {
