@@ -102,6 +102,25 @@ class EngineTests(unittest.TestCase):
         self.assertIn('missing authenticated coverage', body['goal'])
         self.assertNotIn('no supplied account', body['goal'])
 
+    def test_requested_native_authentication_cannot_finish_as_public_only(self):
+        class FakeEngine:
+            def __init__(self, *_): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def assess(self, *_args, **_kwargs):
+                return {'coverage_complete':True,'stop_reason':'done','findings':[]}
+        for requested in (True, False):
+            with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine):
+                receipt = artex.run(SCOPE, 'investigator', time.monotonic()+2, Path(folder),
+                    access={'requested':requested,'verified':False})
+                detail = json.loads(receipt['output_excerpt'])
+            self.assertEqual(detail['authentication_requested'], requested)
+            self.assertEqual(detail['access_mode'], 'anonymous')
+            self.assertEqual(detail['coverage_complete'], not requested)
+            self.assertEqual(receipt['failure'], 'incomplete' if requested else None)
+            if requested:
+                self.assertIn('authenticated_context_unverified', detail['collection_errors'])
+
     def test_password_change_guidance_distinguishes_consent_from_verified_permission(self):
         scope = dict(SCOPE, account_policy={'allow_password_changes': True})
         blocked = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')['goal']

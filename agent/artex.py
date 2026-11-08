@@ -496,6 +496,11 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
                     authenticated_target_mapping=engine_scope.get('_authenticated_targets', {}),
                     anonymous_evidence_count=sum(len(m.refs) for m in mirrors),
                     authenticated_evidence_count=sum(len(m.refs) for m in signed))
+                if engine_scope['_authentication_requested'] and not signed:
+                    # A later outer-agent login cannot retroactively make this
+                    # public-only native pass an authenticated investigation.
+                    result['coverage_complete'] = False
+                    result.setdefault('collection_errors', []).append('authenticated_context_unverified')
                 if signed and (any(not m.refs for m in signed) or not any(m.refs for m in mirrors)):
                     result['coverage_complete'] = False
                     result.setdefault('collection_errors', []).append('access_context_untested')
