@@ -124,6 +124,24 @@ fn route_body(route: Route, mut body: Value) -> Value {
     body
 }
 
+// A truncated visible answer or tool call must reach the runtime unchanged.
+// Only an entirely empty, length-limited generation can be safely replaced.
+fn empty_output_limit(completion: &Value) -> bool {
+    let choices = &completion["choices"];
+    let message = &choices[0]["message"];
+    let empty_text = |value: &Value| {
+        value.is_null() || value.as_str().is_some_and(|text| text.trim().is_empty())
+    };
+    choices.as_array().is_some_and(|items| items.len() == 1)
+        && choices[0]["finish_reason"] == "length"
+        && message.is_object()
+        && empty_text(&message["content"])
+        && empty_text(&message["refusal"])
+        && message["function_call"].is_null()
+        && (message["tool_calls"].is_null()
+            || message["tool_calls"].as_array().is_some_and(Vec::is_empty))
+}
+
 /// Published uncached Venice rates for the fixed DeepSeek fallback, 2026-11-04.
 /// Failed/ambiguous attempts keep their full reservation; no guessed refunds.
 #[cfg(test)]
@@ -289,6 +307,30 @@ impl LiveBroker {
     {
         let mut reserved = self.reserve_route(route, &body, engine, reason.is_none(), reason)?;
         let mut completion = send(route, body.clone()).await;
+        if completion.as_ref().is_ok_and(empty_output_limit)
+            && !matches!(body["reasoning_effort"].as_str(), Some("low" | "none"))
+        {
+            // Hermes continues an empty length-limited answer with the same
+            // reasoning settings. Lower the effort once, before it sees any
+            // output, so reasoning cannot consume every continuation's budget.
+            // Account for the paid empty generation too; never replay tools or
+            // rerun the investigation, and retain every ordinary spend limit.
+            self.finish_route(route, reserved, completion.as_ref().unwrap())?;
+            body["reasoning_effort"] = json!("low");
+            body["messages"].as_array_mut().ok_or("invalid_model_request")?.insert(0, json!({
+                "role":"system", "content":"The previous generation reached its output limit before producing visible text or a tool call. Produce one concise next action or the requested final answer from the existing observations. Keep reasoning brief enough to leave room for the answer. All original scope, evidence and permission restrictions still apply. Do not invent findings or repeat completed tests."
+            }));
+            reserved = self.reserve_route(route, &body, engine, true, None)?;
+            eprintln!(
+                "model empty-output recovery: provider={} fresh_attempt=1",
+                route.provider().name()
+            );
+            // Deliberately no loop: another empty response remains visible as
+            // incomplete to the runtime; it is never labelled a valid report.
+            let recovered = send(route, body).await?;
+            self.finish_route(route, reserved, &recovered)?;
+            return Ok(recovered);
+        }
         if completion.as_ref().err() == Some(&"provider_repetition") {
             // No output or tool call from the rejected generation reached the
             // agent. One fresh generation consumes another call slot and keeps
@@ -475,6 +517,110 @@ mod tests {
     }
     fn reply() -> Value {
         json!({"model":VENICE_FALLBACK_MODEL,"choices":[{"message":{"role":"assistant","content":"fixture"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100}})
+    }
+    fn exhausted() -> Value {
+        let mut result = reply();
+        result["choices"][0]["message"]["content"] = Value::Null;
+        result["choices"][0]["message"]["reasoning_content"] = json!("Owned fixture reasoning");
+        result["choices"][0]["finish_reason"] = json!("length");
+        result
+    }
+    #[test]
+    fn output_limit_recovery_excludes_visible_content_tool_calls_and_refusals() {
+        assert!(empty_output_limit(&exhausted()));
+        for (field, value) in [
+            ("content", json!("partial answer")),
+            ("content", json!([{"type":"text","text":"partial"}])),
+            ("tool_calls", json!([{"id":"owned-tool"}])),
+            ("function_call", json!({"name":"owned-tool"})),
+            ("refusal", json!("cannot perform this action")),
+        ] {
+            let mut response = exhausted();
+            response["choices"][0]["message"][field] = value;
+            assert!(!empty_output_limit(&response), "{field}");
+        }
+        let mut response = exhausted();
+        response["choices"][0]["finish_reason"] = json!("stop");
+        assert!(!empty_output_limit(&response));
+        assert!(!empty_output_limit(&json!({})));
+    }
+    #[tokio::test]
+    async fn empty_length_reply_gets_one_lower_effort_attempt_with_both_charges_retained() {
+        for primary in [Route::Near, Route::Venice] {
+            for still_empty in [false, true] {
+                let mut broker = broker();
+                let config = Arc::get_mut(&mut broker).unwrap();
+                config.provider = primary.provider();
+                config.fallback_provider = None;
+                config.fallback_key = None;
+                let mut attempts = 0;
+                let result = broker
+                    .route_completion(request(), false, |route, body| {
+                        assert_eq!(route, primary);
+                        attempts += 1;
+                        if attempts == 2 {
+                            assert_eq!(body["reasoning_effort"], "low");
+                            assert_eq!(body["max_tokens"], 8192);
+                        }
+                        let mut response = if attempts == 1 || still_empty {
+                            exhausted()
+                        } else {
+                            reply()
+                        };
+                        response["model"] = json!(route.provider().model());
+                        response["cost"] = json!({"usd":0.001});
+                        std::future::ready(Ok(response))
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(attempts, 2);
+                assert_eq!(empty_output_limit(&result), still_empty);
+                let count = broker.counters.lock().unwrap();
+                assert_eq!(count.calls, 2);
+                assert_eq!(count.primary_attempts, 2);
+                assert!(count.fallback.is_none());
+                assert_eq!(
+                    count.reserved,
+                    2 * token_cost(primary.provider(), 1000, 100).unwrap()
+                );
+                assert_eq!(count.inference_usage[0].responses, 2);
+                assert_eq!(count.inference_usage[0].completion_tokens, 200);
+                if primary == Route::Venice {
+                    assert_eq!(count.inference_usage[0].provider_reported_usd, 0.002);
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn empty_output_retry_respects_existing_low_effort_and_engine_call_reserve() {
+        let broker = broker();
+        let mut body = request();
+        body["reasoning_effort"] = json!("low");
+        let mut attempts = 0;
+        let result = broker
+            .route_completion(body, false, |_, _| {
+                attempts += 1;
+                std::future::ready(Ok(exhausted()))
+            })
+            .await
+            .unwrap();
+        assert!(empty_output_limit(&result));
+        assert_eq!(attempts, 1);
+        broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT - 1;
+        let error = broker
+            .route_completion(request(), true, |_, _| {
+                attempts += 1;
+                std::future::ready(Ok(exhausted()))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, "engine_budget_reached");
+        assert_eq!(attempts, 2);
+        assert_eq!(broker.counters.lock().unwrap().calls, ENGINE_CALL_LIMIT);
+        assert_eq!(
+            broker.counters.lock().unwrap().inference_usage[0].responses,
+            2
+        );
     }
     #[tokio::test]
     async fn either_order_preserves_one_call_one_failover_and_costs_of_both_attempts() {
