@@ -24,6 +24,52 @@ POSTGRES = '/usr/lib/postgresql/17/bin/'
 TERMINAL = {'completed', 'done', 'failed', 'paused', 'stopped', 'timed_out', 'timeout', 'unavailable'}
 NO_ENGINE_PROGRESS_SECONDS = 900
 SETTLEMENT_RESERVE_SECONDS = 300
+WORKER_MAX_TURNS = 64
+WORKER_RUN_SECONDS = 600
+SAMPLING_POLICY = '''
+Patchriot bounded investigation policy:
+An intent tests a security hypothesis, not the contents of an entire dataset. State the
+boundary, control, expected evidence and stop condition before probing. Sample at most
+12 distinct records/pages/cursors per operation across commands in an intent. Do not
+walk historical records, identifier ranges, transaction histories or pagination merely
+to find a convenient example. Reuse observed examples and scanner evidence. Further
+probes must test a concrete new security mechanism or reproduce an observed anomaly,
+not just select another record with the same response shape.
+Read the mirror's response headers. A broker-withheld or truncated body is a transport
+gap, not an empty target response or a reason to enumerate neighboring records. Keep
+the evidence ID and limitation, then continue other reachable checks. Do not bypass
+the broker's inspection limits or reconstruct withheld data.
+Persist tested controls, sample counts, conclusions and remaining gaps before finishing
+each intent. A bounded negative result is useful; do not require a vulnerability or
+exhaustive enumeration to finish a planned security check. Never claim an untested
+boundary is covered. Preserve authentication, scope and finding-proof requirements.
+'''
+
+
+def configure_exploration(client):
+    """Use upstream settlement to keep one intent from monopolizing the task."""
+    for role in ('worker', 'planner'):
+        path = '/api/agents/' + role
+        current = client.call(path)
+        template = (current.get('prompt') or {}).get('template_text')
+        if not isinstance(template, str) or not template.strip():
+            raise ValueError('engine prompt unavailable')
+        policy = SAMPLING_POLICY
+        if role == 'planner':
+            policy += ('\nPrioritize uncovered planned boundaries before continuing an exhausted intent. '
+                       'Do not redispatch a sampled direction merely because more IDs exist or a worker '
+                       'used its turn/time slice. Continuation requires a cited new observation and a '
+                       'specific different control; otherwise retain the gap and advance the finite plan. '
+                       'When the applicable plan has evidence and explicit limitations, finalize its '
+                       'coverage fact and prove_goal; do not invent new goals to avoid a negative result.\n')
+        if SAMPLING_POLICY not in template:
+            client.call(path + '/prompt', {'template': template + '\n' + policy,
+                                          'note': 'Bounded security hypotheses and explicit coverage gaps'}, method='PUT')
+    client.call('/api/agents/worker/config', {'max_turns': WORKER_MAX_TURNS,
+                                            'run_seconds': WORKER_RUN_SECONDS}, method='PUT')
+    worker = client.call('/api/agents/worker').get('agent', {})
+    if worker.get('max_turns') != WORKER_MAX_TURNS or worker.get('run_seconds') != WORKER_RUN_SECONDS:
+        raise ValueError('engine worker limits not applied')
 
 
 def receipt_summary(result, full_output):
@@ -48,7 +94,8 @@ def receipt_summary(result, full_output):
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
-        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested'
+        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested',
+        'exploration_limits', 'transport_gaps'
     ) if key in result}
     commands = result.get('commands', {})
     entries = commands.get('commands', []) if isinstance(commands, dict) else commands
@@ -205,6 +252,7 @@ def task_body(scope, targets, seconds, role, allowance=None):
             'For each applicable area record tested cases and controls as facts, plus findings where supported; explicitly record unavailable or inapplicable areas. '
             'Rate-limit and lockout observations must include attempt counts, time window, identity scope and actual responses. A small burst cannot prove that a limit is absent. A bypass requires an observed enforced boundary and an approved bounded comparison of that same boundary; otherwise preserve the narrower observation. Do not increase traffic or guess passwords to establish an absent limit. '
             'Use the full permitted suite for that plan. Do not invent extra goals merely because no vulnerability was found. '
+            + SAMPLING_POLICY +
             'Once the applicable planned tests are finished, record a final coverage fact with evidence, then use prove_goal for the assessment goal referencing that fact. '
             'A negative assessment can meet the goal. Resource exhaustion is not completion: preserve any untested planned cases as gaps. '
             'Finish within the supplied time and request allowance. Reporting coverage limits is a valid outcome; do not keep creating new work. '
@@ -330,6 +378,7 @@ class Engine:
             self.client.call('/api/settings', {'workers': 1, 'web_search_enabled': False, 'traffic_capture': False,
                 'notify_enabled': False, 'llm_pool_enabled': False, 'task_concurrency_enabled': True,
                 'task_concurrency_limit': 1}, method='PUT')
+            configure_exploration(self.client)
             profile = self.client.call('/api/llm/profiles', {'name': 'scope-bound-model-bridge', 'format': 'openai',
                 'model': self.model, 'base_url': self.bridge + '/patchriot/artex/v1', 'api_key': 'local-bridge-placeholder',
                 'streaming': False, 'max_tokens': 8192, 'context_window_k': 64, 'reasoning_effort': 'high'})
@@ -496,14 +545,24 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
                     authenticated_target_mapping=engine_scope.get('_authenticated_targets', {}),
                     anonymous_evidence_count=sum(len(m.refs) for m in mirrors),
                     authenticated_evidence_count=sum(len(m.refs) for m in signed))
+                result['exploration_limits'] = {'worker_max_turns': WORKER_MAX_TURNS,
+                                                'worker_run_seconds': WORKER_RUN_SECONDS}
+                errors = {}
+                for mirror in mirrors + signed:
+                    for error, count in mirror.transport_errors.items():
+                        errors[error] = errors.get(error, 0) + count
+                result['transport_gaps'] = [{'error': error, 'count': count} for error, count in sorted(errors.items())]
                 if engine_scope['_authentication_requested'] and not signed:
                     # A later outer-agent login cannot retroactively make this
                     # public-only native pass an authenticated investigation.
                     result['coverage_complete'] = False
                     result.setdefault('collection_errors', []).append('authenticated_context_unverified')
-                if signed and (any(not m.refs for m in signed) or not any(m.refs for m in mirrors)):
+                if signed and (any(not m.progress_keys for m in signed) or not any(m.progress_keys for m in mirrors)):
                     result['coverage_complete'] = False
                     result.setdefault('collection_errors', []).append('access_context_untested')
+                if not signed and not any(m.progress_keys for m in mirrors):
+                    result['coverage_complete'] = False
+                    result.setdefault('collection_errors', []).append('public_context_untested')
                 if scope.get('account_policy') is not None and len(signed) != 2:
                     result['coverage_complete'] = False
                     result.setdefault('collection_errors', []).append('account_context_unverified')
@@ -566,6 +625,9 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         result['limitations'].append(
             'Engine result collection was incomplete for: ' + ', '.join(result['collection_errors']) +
             '. Available outcome, findings and broker evidence were retained.')
+    if result.get('transport_gaps'):
+        result['limitations'].append('Some mirror responses could not be exposed safely or completely. '
+            'The recorded transport_gaps are coverage limitations, not target vulnerabilities.')
     # The full file is for this role. Its handoff must remain valid JSON even
     # when upstream commands include long scripts or page responses.
     output = json.dumps({key: result[key] for key in (
@@ -574,7 +636,8 @@ def run(scope, role, deadline, directory=Path('/work'), fetch=None, model=MODEL,
         'usage', 'inference_usage',
         'distinct_target_observations', 'seconds_without_target_progress',
         'limitations', 'target_mapping', 'authenticated_target_mapping', 'access_mode',
-        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested', 'inference_usage', 'outcome', 'findings', 'facts', 'commands'
+        'anonymous_evidence_count', 'authenticated_evidence_count', 'authentication_requested', 'inference_usage', 'outcome', 'findings', 'facts', 'commands',
+        'exploration_limits', 'transport_gaps'
     ) if key in result}, ensure_ascii=True)
     (directory / 'artex-results.json').write_text(output)
     return record('artex-engine', VERSION, ['/opt/artex/artex', *scope['origins']], started,

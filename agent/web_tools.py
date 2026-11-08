@@ -179,6 +179,7 @@ class ScopeMirror:
         # Count new recorded observations, not polling or repeated identical
         # replies. Only hashes are retained here; the broker owns the evidence.
         self.progress_keys = set()
+        self.transport_errors = {}
         mirror = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -229,16 +230,26 @@ class ScopeMirror:
                     if evidence.get("id"):
                         mirror.refs.append(evidence["id"])
                     status = evidence.get("status")
-                    if status and evidence.get("id"):
-                        observation = [self.command, origin + self.path, data, status, reply.get("body", "")]
-                        mirror.progress_keys.add(hashlib.sha256(json.dumps(observation).encode()).digest())
                     unsupported = self.command != 'HEAD' and (reply.get('body_unavailable') == 'binary_response_not_supported'
                                                               or binary_response(reply))
+                    error = 'binary_response_not_supported' if unsupported else reply.get("error") or evidence.get("error")
+                    error = error if isinstance(error, str) and re.fullmatch(r"[a-z0-9_]{1,80}", error) else None
+                    if error:
+                        mirror.transport_errors[error] = mirror.transport_errors.get(error, 0) + 1
+                    if status and evidence.get("id") and not error:
+                        observation = [self.command, origin + self.path, data, status, reply.get("body", "")]
+                        mirror.progress_keys.add(hashlib.sha256(json.dumps(observation).encode()).digest())
+                    withheld = bool(error and not reply.get('body'))
+                    unavailable = unsupported or withheld
                     payload = (b"Binary response unavailable through the text-only broker. Do not reconstruct or decompress decoded bytes."
                                if unsupported else reply.get("body", "").encode() if status else b"relay request unavailable")
-                    self.send_response(502 if unsupported else status or 502)
+                    if withheld and not unsupported:
+                        payload = ('Relay response unavailable: ' + error + '. This is a broker limitation, '
+                                   'not an empty target response. Retain the evidence and coverage gap; '
+                                   'do not enumerate alternative records to bypass inspection limits.').encode()
+                    self.send_response(502 if unavailable else status or 502)
                     for name, value in evidence.get("headers", {}).items():
-                        if unsupported and name.lower() in ('content-type', 'content-disposition', 'location'):
+                        if unavailable and name.lower() in ('content-type', 'content-disposition', 'location'):
                             continue
                         if not name.lower().startswith("x-patchriot-") and name.lower() not in ("connection", "content-length", "transfer-encoding", "content-encoding") and "\r" not in value and "\n" not in value:
                             if name.lower() == "location":
@@ -251,10 +262,11 @@ class ScopeMirror:
                     # A body cap must not look like the target served a short
                     # but complete file, or a denied probe like a target 502.
                     self.send_header("X-Patchriot-Body-Truncated", "true" if reply.get("body_truncated") else "false")
-                    if unsupported:
+                    if unavailable:
                         self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                    error = 'binary_response_not_supported' if unsupported else reply.get("error") or evidence.get("error")
-                    if isinstance(error, str) and re.fullmatch(r"[a-z0-9_]{1,80}", error):
+                        if type(status) is int:
+                            self.send_header('X-Patchriot-Target-Status', str(status))
+                    if error:
                         self.send_header("X-Patchriot-Relay-Error", error)
                     if type(evidence.get("id")) is int and evidence['id'] > 0:
                         self.send_header("X-Patchriot-Evidence-Id", str(evidence['id']))
