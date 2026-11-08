@@ -330,9 +330,22 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         } else {
             client.post(url).json(&request)
         };
-        // Reports can reach 32 MiB. Allow slow links without extending heartbeat
-        // deadlines or the server's 120-second signature freshness window.
-        let outgoing = if completion || evidence {
+        // The signed gzip route alone does not negotiate HTTP response coding.
+        // Intermediaries may expand it unless the client explicitly accepts gzip,
+        // turning a small evidence transfer into a multi-megabyte timeout. Decode
+        // manually below so both wire and expanded limits still apply.
+        let outgoing = if compressed && evidence {
+            outgoing.header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        } else {
+            outgoing
+        };
+        // Evidence downloads include earlier reports and can be slow even when
+        // compressed. Signatures are checked when the request arrives; download
+        // time does not extend signature freshness, lease renewal or execution.
+        // The independent monitor keeps renewing (or stopping) the same lease.
+        let outgoing = if evidence {
+            outgoing.timeout(Duration::from_secs(300))
+        } else if completion {
             outgoing.timeout(Duration::from_secs(90))
         } else {
             outgoing
@@ -1786,6 +1799,13 @@ mod tests {
                         if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
                             let headers = std::str::from_utf8(&bytes[..end]).unwrap();
                             assert!(headers.starts_with(&format!("POST {path} ")));
+                            let accepts_gzip = headers.lines().any(|line| {
+                                line.split_once(':').is_some_and(|(name, value)| {
+                                    name.eq_ignore_ascii_case("accept-encoding")
+                                        && value.trim() == "gzip"
+                                })
+                            });
+                            assert_eq!(accepts_gzip, attempt == 0);
                             let length: usize = headers
                                 .lines()
                                 .find_map(|line| {
