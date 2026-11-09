@@ -105,18 +105,20 @@ def configure_hermes_browser(scope):
     setting, proxy or alternative browser backend is enabled.
     """
     from tools import browser_tool
-    approved = scope['origins'][0]
-    browser_tool._is_safe_url = lambda url: origin(url) == approved
+    approved = set(scope['origins'])
+    browser_tool._is_safe_url = lambda url: origin(url) in approved
 
 
 class BrowserAccess:
     def __init__(self, scope, bridge, *, directory='/work', executable='/usr/bin/chromium', account='testing'):
         self.scope, self.bridge = scope, bridge
+        self.public = not scope.get('authentication')
         self.account_slot = account
         if account not in ("testing", "reference") or account == "reference" and not scope.get("account_policy"):
             raise ValueError("Account context is not configured")
-        self.origin = scope['origins'][0]
-        self.resources = set(scope.get('browser_login', {}).get('resource_origins', []))
+        self.origins = set(scope['origins'])
+        self.origin = scope.get('browser_entry_origin') or scope['origins'][0]
+        self.resources = set(scope.get('browser_resource_origins', [])) | set((scope.get('browser_login') or {}).get('resource_origins', []))
         self.pending = {}
         self.requests = {}
         self.proof_candidates = {}
@@ -194,7 +196,7 @@ class BrowserAccess:
         try:
             # Only approved public dependencies may load outside the app. They
             # cannot become pages/login targets or receive its session headers.
-            external = origin(request.url) != self.origin
+            external = origin(request.url) not in self.origins
             resource = external and origin(request.url) in self.resources and request.method in ('GET','HEAD') and request.resource_type not in ('document','websocket')
             if external and not resource:
                 if len(self.blocked_origins) < 12:
@@ -206,7 +208,8 @@ class BrowserAccess:
             if cached:
                 await route.fulfill(status=200, headers=cached['headers'], body=cached['body'])
                 return
-            login = not resource and request.method == 'POST' and not self.verified
+            login = (not self.public and not resource and request.method == 'POST'
+                     and not self.verified and self.login_deadline is not None)
             # A split JS bundle can queue hundreds of files. Bound bridge
             # callers so queued assets do not start their RPC timeout at once.
             async with self.http_slots:
@@ -217,22 +220,24 @@ class BrowserAccess:
                     await route.abort('blockedbyclient')
                     return
                 reply = await self.call('http', {'method':request.method, 'url':request.url,
-                    'headers':headers, 'data':request.post_data, 'authenticated':not resource, 'login':login})
+                    'headers':headers, 'data':request.post_data, 'authenticated':not self.public and not resource, 'login':login})
             self.retain(reply)
             evidence = reply['evidence']
             if evidence.get('error'):
                 self.errors = (self.errors + [evidence['error']])[-12:]
                 await route.abort('failed')
                 return
-            if not resource and request.method == 'GET':
+            if not resource and request.method in ('GET', 'POST'):
                 # Keep only session headers for an explicit access comparison;
                 # never dump this cache into an agent transcript or artifact.
-                self.requests[request.url] = {k:v for k,v in headers.items() if k.lower() in ('authorization','cookie','accept')}
+                # The broker selects/redacts session headers. Keeping these
+                # privately supports token-based APIs without site adapters.
+                self.requests[request.url] = headers.copy()
                 # Verification fallback considers only resources the actual
                 # signed-in browser already fetched successfully, never guessed
                 # routes or public dependencies. Credentials stay in requests.
                 if (evidence.get('authenticated') and 200 <= evidence.get('status', 0) < 300
-                        and request.resource_type in ('fetch', 'xhr', 'document')
+                        and request.method == 'GET' and request.resource_type in ('fetch', 'xhr', 'document')
                         and len(self.proof_candidates) < 32):
                     self.proof_candidates[request.url] = True
             response_headers = {}
@@ -312,7 +317,7 @@ class BrowserAccess:
             return self.wallet_account.copy()
 
     def page(self):
-        pages = [p for p in self.context.pages if origin(p.url) == self.origin]
+        pages = [p for p in self.context.pages if origin(p.url) in self.origins]
         if not pages: raise ValueError('Open the approved website with the browser first')
         return pages[-1]
 
@@ -336,6 +341,8 @@ class BrowserAccess:
 
     async def operation(self, value):
         command = value.get('command')
+        if self.public and command not in ('status', 'wait'):
+            raise ValueError('Public browsing does not authorize account login')
         if command == 'wait':
             # Waiting uses no inference and lets the bounded asset queue drain.
             # Repeated model calls while a JS bundle loads share the bridge and
@@ -356,9 +363,9 @@ class BrowserAccess:
             # Estimate from the successful begin receipt, without queuing status
             # behind page requests. The Rust broker still enforces the real limit.
             remaining = None if self.login_deadline is None else max(0, self.login_deadline - asyncio.get_running_loop().time())
-            login_state = ('verified' if self.verified else 'not_started' if remaining is None else
+            login_state = ('not_applicable' if self.public else 'verified' if self.verified else 'not_started' if remaining is None else
                            'expired' if remaining == 0 else 'exhausted' if self.login_exhausted else 'active')
-            return {'verified':self.verified, 'pages':[p.url.split('?')[0].split('#')[0] for p in self.context.pages if origin(p.url) == self.origin],
+            return {'verified':self.verified, 'pages':[p.url.split('?')[0].split('#')[0] for p in self.context.pages if origin(p.url) in self.origins],
                 'login':{'state':login_state,'seconds_remaining_estimate':None if remaining is None else int(remaining)},
                 'wallet_transport':'legacy' if self.legacy_wallet else 'eip6963',
                 'network_transport':'scoped_relay',
@@ -411,11 +418,12 @@ class BrowserAccess:
             return {'signed':True}
         if command == 'check':
             url = value.get('url','')
-            if origin(url) != self.origin: raise ValueError('Check must use the approved origin')
+            if origin(url) not in self.origins: raise ValueError('Check must use an approved origin')
             headers = self.requests.get(url, {}).copy()
             cookies = await self.context.cookies([url])
             if cookies: headers['cookie'] = '; '.join(c['name'] + '=' + c['value'] for c in cookies)
-            result = await self.call('check', {'url':url,'headers':headers,'json_pointer':value.get('json_pointer')})
+            result = await self.call('check', {'url':url,'headers':headers,
+                'json_pointer':value.get('json_pointer'), **({'data':value['data']} if value.get('data') else {})})
             # Only the broker's redacted records enter the working cache, never
             # browser headers, cookies or the raw authenticated response body.
             result['evidence_files'] = [self.retain({'evidence':record})
@@ -487,6 +495,7 @@ def cli():
     parser.add_argument('--id', help='Pending signature ID, after reviewing its exact message')
     parser.add_argument('--url', help='Actual protected GET resource or account API observed in the browser')
     parser.add_argument('--json-pointer', help='JSON pointer to supplied username or test wallet address in an account response')
+    parser.add_argument('--data', help='Small observed GraphQL query JSON for a POST identity check; mutations are rejected')
     args = vars(parser.parse_args())
     from live_http import default_account
     selected = args.pop('account') or default_account()

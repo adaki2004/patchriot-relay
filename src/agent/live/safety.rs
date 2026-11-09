@@ -35,6 +35,14 @@ pub(super) fn secret_field(key: &str) -> bool {
         )
 }
 
+/// Common browser session headers. These are retained only in the broker,
+/// stripped from anonymous controls and never sent to another origin.
+pub(super) fn session_header(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let key = key.strip_prefix("x-").unwrap_or(&key);
+    secret_field(key) || matches!(normalized(key).as_str(), "authtoken" | "auth")
+}
+
 fn mutation_field(key: &str) -> bool {
     let key = normalized(key);
     matches!(

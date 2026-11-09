@@ -538,6 +538,7 @@ impl LiveBroker {
             fallback_key: None,
             fallback_provider: None,
             scope: self.scope.clone(),
+            environment_gate: self.environment_gate.clone(),
             deadline: self.deadline,
             final_report_reserve: self.final_report_reserve,
             counters: self.counters.clone(),
