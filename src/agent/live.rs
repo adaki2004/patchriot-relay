@@ -1013,7 +1013,7 @@ impl LiveBroker {
         let parsed = public_url(&url).ok()?;
         let browser = self.browser.lock().ok()?;
         (self.access.authenticated(&parsed, true)
-            || (browser.verified_authorization.is_some()
+            || ((browser.verified_authorization.is_some() || !browser.verified_headers.is_empty())
                 && browser.verified_origin.as_deref()
                     == Some(parsed.origin().ascii_serialization().as_str())))
         .then_some(url)
@@ -1031,6 +1031,11 @@ impl LiveBroker {
             && probe.authenticated
             && !login
             && !matches!(probe.method.as_str(), "GET" | "HEAD" | "OPTIONS")
+            && !(probe.method == "POST"
+                && probe
+                    .data
+                    .as_deref()
+                    .is_some_and(patchriot_protocol::pentests::auth::read_only_graphql_body))
         {
             return Err("protected_reference_read_only");
         }
@@ -1067,6 +1072,7 @@ impl LiveBroker {
                     || v.len() > 1024
                     || k.chars().any(char::is_control)
                     || v.chars().any(char::is_control)
+                    || safety::session_header(k)
                     || [
                         "host",
                         "authorization",
@@ -1133,10 +1139,24 @@ impl LiveBroker {
         } else {
             None
         };
+        let browser_headers = if !login && probe.authenticated {
+            let state = self.browser.lock().map_err(|_| "browser_unavailable")?;
+            if state.proof.is_some()
+                && state.verified_origin.as_deref()
+                    == Some(url.origin().ascii_serialization().as_str())
+            {
+                state.verified_headers.clone()
+            } else {
+                BTreeMap::new()
+            }
+        } else {
+            BTreeMap::new()
+        };
         let authenticated = !login
             && self.scope.authentication.is_some()
             && (self.access.authenticated(&url, probe.authenticated)
-                || browser_authorization.is_some());
+                || browser_authorization.is_some()
+                || !browser_headers.is_empty());
         request = self.apply_environment_gate(
             request,
             &url,
@@ -1146,6 +1166,9 @@ impl LiveBroker {
         request = self.access.apply(request, &url, probe.authenticated);
         if let Some(value) = browser_authorization {
             request = request.header("authorization", value.as_str());
+        }
+        for (key, value) in browser_headers {
+            request = request.header(key, value.as_str());
         }
         if let Some(data) = &probe.data {
             request = request.body(data.clone());

@@ -208,7 +208,8 @@ class BrowserAccess:
             if cached:
                 await route.fulfill(status=200, headers=cached['headers'], body=cached['body'])
                 return
-            login = not self.public and not resource and request.method == 'POST' and not self.verified
+            login = (not self.public and not resource and request.method == 'POST'
+                     and not self.verified and self.login_deadline is not None)
             # A split JS bundle can queue hundreds of files. Bound bridge
             # callers so queued assets do not start their RPC timeout at once.
             async with self.http_slots:
@@ -226,15 +227,17 @@ class BrowserAccess:
                 self.errors = (self.errors + [evidence['error']])[-12:]
                 await route.abort('failed')
                 return
-            if not resource and request.method == 'GET':
+            if not resource and request.method in ('GET', 'POST'):
                 # Keep only session headers for an explicit access comparison;
                 # never dump this cache into an agent transcript or artifact.
-                self.requests[request.url] = {k:v for k,v in headers.items() if k.lower() in ('authorization','cookie','accept')}
+                # The broker selects/redacts session headers. Keeping these
+                # privately supports token-based APIs without site adapters.
+                self.requests[request.url] = headers.copy()
                 # Verification fallback considers only resources the actual
                 # signed-in browser already fetched successfully, never guessed
                 # routes or public dependencies. Credentials stay in requests.
                 if (evidence.get('authenticated') and 200 <= evidence.get('status', 0) < 300
-                        and request.resource_type in ('fetch', 'xhr', 'document')
+                        and request.method == 'GET' and request.resource_type in ('fetch', 'xhr', 'document')
                         and len(self.proof_candidates) < 32):
                     self.proof_candidates[request.url] = True
             response_headers = {}
@@ -419,7 +422,8 @@ class BrowserAccess:
             headers = self.requests.get(url, {}).copy()
             cookies = await self.context.cookies([url])
             if cookies: headers['cookie'] = '; '.join(c['name'] + '=' + c['value'] for c in cookies)
-            result = await self.call('check', {'url':url,'headers':headers,'json_pointer':value.get('json_pointer')})
+            result = await self.call('check', {'url':url,'headers':headers,
+                'json_pointer':value.get('json_pointer'), **({'data':value['data']} if value.get('data') else {})})
             # Only the broker's redacted records enter the working cache, never
             # browser headers, cookies or the raw authenticated response body.
             result['evidence_files'] = [self.retain({'evidence':record})
@@ -491,6 +495,7 @@ def cli():
     parser.add_argument('--id', help='Pending signature ID, after reviewing its exact message')
     parser.add_argument('--url', help='Actual protected GET resource or account API observed in the browser')
     parser.add_argument('--json-pointer', help='JSON pointer to supplied username or test wallet address in an account response')
+    parser.add_argument('--data', help='Small observed GraphQL query JSON for a POST identity check; mutations are rejected')
     args = vars(parser.parse_args())
     from live_http import default_account
     selected = args.pop('account') or default_account()

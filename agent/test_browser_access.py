@@ -20,6 +20,22 @@ ADDRESS = '0x1111111111111111111111111111111111111111'
 
 
 class ObservedAccessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_page_bootstrap_posts_do_not_start_the_login_window(self):
+        browser = self.browser()
+        browser.call = AsyncMock(return_value={'evidence':{'id':1,'status':200,'error':None},'headers':[],'body_base64':'e30='})
+        headers = {'content-type':'application/json','x-access-token':'synthetic-private-token'}
+        request = SimpleNamespace(url=ORIGIN+'/graphql',method='POST',resource_type='fetch',post_data='{"query":"{ viewer { email } }"}',all_headers=AsyncMock(return_value=headers))
+        route = SimpleNamespace(request=request,fulfill=AsyncMock(),abort=AsyncMock())
+        await browser.route(route)
+        self.assertFalse(browser.call.call_args.args[1]['login'])
+        self.assertIsNone(browser.login_deadline)
+        browser.call = AsyncMock(return_value={'verified':True,'evidence':[]})
+        await browser.operation({'command':'check','url':request.url,'data':request.post_data,'json_pointer':'/data/viewer/email'})
+        sent = browser.call.call_args.args[1]
+        self.assertEqual(sent['data'], request.post_data)
+        self.assertEqual(sent['headers']['x-access-token'], 'synthetic-private-token')
+        self.assertTrue(browser.verified)
+
     async def test_public_browser_cannot_start_login_fill_credentials_or_sign(self):
         browser = BrowserAccess({'origins':[ORIGIN]}, 'http://127.0.0.1:1')
         browser.call = AsyncMock()
@@ -283,17 +299,21 @@ document.querySelector('#answer').textContent=(await r.json()).reply;};</script>
             if path == 'begin': return {'login_submissions':8,'expires_in_seconds':300}
             if path == 'check':
                 self.assertEqual(data['url'], api + '/member')
-                self.assertEqual(data['headers']['authorization'], 'Bearer synthetic-fixture-token')
+                self.assertEqual(data['headers']['x-access-token'], 'synthetic-fixture-token')
+                self.assertEqual(json.loads(data['data']), {'query':'{ viewer { email } }'})
                 return {'verified':True, 'evidence':[]}
             self.assertEqual(path, 'http')
             calls.append(data)
-            headers = [['access-control-allow-origin',ORIGIN],['access-control-allow-headers','content-type,authorization']]
+            headers = [['access-control-allow-origin',ORIGIN],['access-control-allow-headers','content-type,x-access-token']]
             if data['url'].startswith(cdn):
                 self.assertFalse(data['authenticated'])
                 self.assertFalse(data['login'])
                 body, kind = 'window.fixtureAssetLoaded=true;', 'application/javascript'
             elif data['method'] == 'OPTIONS':
                 body, kind = '', 'text/plain'
+            elif data['url'] == api + '/bootstrap':
+                self.assertFalse(data['login'])
+                body, kind = '{}', 'application/json'
             elif data['url'] == api + '/start':
                 self.assertEqual(json.loads(data['data']), {'email':'fixture@example.com'})
                 self.assertTrue(data['login'])
@@ -303,7 +323,8 @@ document.querySelector('#answer').textContent=(await r.json()).reply;};</script>
                 self.assertEqual(data['headers']['origin'], ORIGIN)
                 body, kind = '{"token":"synthetic-fixture-token"}', 'application/json'
             elif data['url'] == api + '/member':
-                self.assertEqual(data['headers']['authorization'], 'Bearer synthetic-fixture-token')
+                self.assertEqual(data['headers']['x-access-token'], 'synthetic-fixture-token')
+                self.assertEqual(data['method'], 'POST')
                 body, kind = '{"email":"fixture@example.com"}', 'application/json'
             else:
                 self.assertTrue(data['url'].startswith(ORIGIN))
@@ -311,13 +332,14 @@ document.querySelector('#answer').textContent=(await r.json()).reply;};</script>
 <input type="email" id="email"><button id="start">Send code</button>
 <input id="code" hidden><button id="finish" hidden>Verify</button><p id="account"></p>
 <script>
+fetch('{api}/bootstrap',{{method:'POST',headers:{{'content-type':'application/json'}},body:'{{"query":"{{ siteTitle }}"}}'}}).then(()=>window.bootstrapReady=true);
 document.querySelector('#start').onclick=async()=>{{
 await fetch('{api}/start',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{email:document.querySelector('#email').value}})}});
 document.querySelector('#code').hidden=false;document.querySelector('#finish').hidden=false;}};
 document.querySelector('#finish').onclick=async()=>{{
 const r=await fetch('{api}/finish',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{code:document.querySelector('#code').value}})}});
 const t=(await r.json()).token;
-document.querySelector('#account').textContent=(await (await fetch('{api}/member',{{headers:{{authorization:'Bearer '+t}}}})).json()).email;}};
+document.querySelector('#account').textContent=(await (await fetch('{api}/member',{{method:'POST',headers:{{'content-type':'application/json','x-access-token':t}},body:'{{"query":"{{ viewer {{ email }} }}"}}'}})).json()).email;}};
 </script>'''
                 kind = 'text/html'
             return {'evidence':{'id':len(calls),'status':200,'error':None,'authenticated':data['url']==api+'/member'},
@@ -327,13 +349,14 @@ document.querySelector('#account').textContent=(await (await fetch('{api}/member
         page = browser.context.pages[0]
         await page.goto(ORIGIN)
         await page.wait_for_function('window.fixtureAssetLoaded === true')
+        await page.wait_for_function('window.bootstrapReady === true')
         await browser.operation({'command':'begin'})
         await browser.operation({'command':'fill','username':'#email'})
         await page.get_by_role('button',name='Send code').click()
         await browser.operation({'command':'fill','password':'#code'})
         await page.get_by_role('button',name='Verify',exact=True).click()
         await page.wait_for_function("document.querySelector('#account').textContent.includes('@')")
-        self.assertTrue((await browser.operation({'command':'check','url':api+'/member'}))['verified'])
+        self.assertTrue((await browser.operation({'command':'check','url':api+'/member','data':'{"query":"{ viewer { email } }"}'}))['verified'])
         before = len(calls)
         await page.evaluate("fetch('https://unapproved.example/').catch(()=>null)")
         await page.evaluate(f"fetch('{cdn}/submit',{{method:'POST'}}).catch(()=>null)")

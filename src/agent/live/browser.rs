@@ -21,6 +21,7 @@ pub(super) struct BrowserState {
     // Learned only from a successful paired access check. Never sent to the
     // engine or model; the relay injects it for this exact origin only.
     pub(super) verified_authorization: Option<Zeroizing<String>>,
+    pub(super) verified_headers: BTreeMap<String, Zeroizing<String>>,
     pub(super) verified_origin: Option<String>,
     pub(super) password_login: Option<accounts::PasswordLogin>,
     pub(super) password_login_attempted: bool,
@@ -137,6 +138,16 @@ impl LiveBroker {
         mut input: BrowserRequest,
     ) -> Result<BrowserReply, &'static str> {
         self.require_browser()?;
+        // Page bootstrap and account queries are POST on many GraphQL apps.
+        // They do not consume password-submission attempts. Mutations still do.
+        if input.method == "POST"
+            && input
+                .data
+                .as_deref()
+                .is_some_and(patchriot_protocol::pentests::auth::read_only_graphql_body)
+        {
+            input.login = false;
+        }
         let public_browser = self.scope.authentication.is_none();
         if public_browser && (input.authenticated || input.login) {
             return Err("browser_login_not_selected");
@@ -213,11 +224,11 @@ impl LiveBroker {
             // own visitor cookies so anonymous forms/chat can retain state.
             // Anonymous controls of a supplied account still strip sessions.
             if !input.authenticated
-                && (name == "authorization" || name == "cookie" && !public_browser)
+                && (safety::session_header(&name) || name == "cookie" && !public_browser)
             {
                 continue;
             }
-            if name == "authorization" {
+            if safety::session_header(&name) {
                 self.access.remember_secret(value.clone())?;
                 if let Some((_, secret)) = value.split_once(' ') {
                     self.access.remember_secret(secret.into())?;
@@ -310,7 +321,10 @@ impl LiveBroker {
             request = request.header("authorization", value);
         }
         let authenticated = input.authenticated
-            && (input.headers.contains_key("authorization")
+            && (input
+                .headers
+                .keys()
+                .any(|name| safety::session_header(name))
                 || input.headers.contains_key("cookie")
                 || self.access.authorization(true).is_some());
         if let Some(data) = &input.data {
@@ -519,6 +533,8 @@ impl LiveBroker {
         struct Check {
             url: String,
             #[serde(default)]
+            data: Option<String>,
+            #[serde(default)]
             headers: BTreeMap<String, String>,
             #[serde(default)]
             json_pointer: Option<String>,
@@ -529,7 +545,13 @@ impl LiveBroker {
             // Keep earlier paired evidence for the final report, but revoke the
             // live capability until this new check succeeds.
             state.verified_authorization = None;
+            state.verified_headers.clear();
             state.verified_origin = None;
+        }
+        if input.data.as_deref().is_some_and(|body| {
+            body.len() > 2048 || !patchriot_protocol::pentests::auth::read_only_graphql_body(body)
+        }) {
+            return Err("access_check_requires_read_only_query");
         }
         if input.json_pointer.as_ref().is_some_and(|p| {
             p.len() > 256 || !p.starts_with('/') || p.chars().any(char::is_control)
@@ -541,26 +563,44 @@ impl LiveBroker {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
             .map(|(_, value)| Zeroizing::new(value.clone()));
+        let session_headers: BTreeMap<_, _> = input
+            .headers
+            .iter()
+            .filter(|(key, _)| {
+                safety::session_header(key) && !key.eq_ignore_ascii_case("authorization")
+            })
+            .map(|(key, value)| (key.to_ascii_lowercase(), Zeroizing::new(value.clone())))
+            .collect();
+        let method = if input.data.is_some() { "POST" } else { "GET" };
+        let mut headers = input.headers;
+        if input.data.is_some() {
+            headers.insert("content-type".into(), "application/json".into());
+        }
+        let anonymous_headers = if input.data.is_some() {
+            BTreeMap::from([("content-type".into(), "application/json".into())])
+        } else {
+            BTreeMap::new()
+        };
         let verified_origin = url::Url::parse(&input.url)
             .map_err(|_| "invalid_access_check")?
             .origin()
             .ascii_serialization();
         let signed = self
             .browser_exchange(BrowserRequest {
-                method: "GET".into(),
+                method: method.into(),
                 url: input.url.clone(),
-                headers: input.headers,
-                data: None,
+                headers,
+                data: input.data.clone(),
                 authenticated: true,
                 login: false,
             })
             .await?;
         let anonymous = self
             .browser_exchange(BrowserRequest {
-                method: "GET".into(),
+                method: method.into(),
                 url: input.url,
-                headers: BTreeMap::new(),
-                data: None,
+                headers: anonymous_headers,
+                data: input.data,
                 authenticated: false,
                 login: false,
             })
@@ -616,6 +656,7 @@ impl LiveBroker {
             let mut state = self.browser.lock().map_err(|_| "browser_unavailable")?;
             state.proof = Some(proof.clone());
             state.verified_authorization = authorization;
+            state.verified_headers = session_headers;
             state.verified_origin = Some(verified_origin);
         }
         Ok(
@@ -1772,6 +1813,113 @@ mod tests {
             "authenticated_access_not_verified"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn graphql_bootstrap_and_token_identity_keep_login_limits_and_origin_boundaries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.methods.push("POST".into());
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        inner
+            .scope
+            .tools
+            .extend([LiveToolProfile::ActiveWebV2, LiveToolProfile::ArtexEngineV1]);
+        inner.test_target = Some(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 16384];
+                let n = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]).to_lowercase();
+                let body = if request.contains("x-access-token: synthetic-browser-credential") {
+                    r#"{"data":{"viewer":{"email":"fixture@example.com"}}}"#
+                } else {
+                    r#"{"data":null,"errors":[{"message":"Forbidden"}]}"#
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let data = r#"{"query":"query Me { viewer { email } }"}"#;
+        let headers = json!({"content-type":"application/json","x-access-token":"synthetic-browser-credential"});
+        // Bootstrap reads precede begin and must not spend credential attempts.
+        let read = broker.browser_call("/patchriot/browser/http",json!({"method":"POST","url":"https://owned.example/graphql","headers":headers,"data":data,"login":true})).await.unwrap();
+        assert_ne!(read["evidence"]["login"], true);
+        assert_eq!(broker.browser.lock().unwrap().posts, 0);
+        assert_eq!(
+            broker.access.redact("synthetic-browser-credential"),
+            "REDACTED"
+        );
+        for data in [
+            r#"{"query":"mutation { changeEmail }"}"#,
+            r#"{"email":"fixture@example.com"}"#,
+        ] {
+            assert_eq!(
+                broker
+                    .browser_call(
+                        "/patchriot/browser/check",
+                        json!({"url":"https://owned.example/graphql","headers":headers,"data":data})
+                    )
+                    .await
+                    .unwrap_err(),
+                "access_check_requires_read_only_query"
+            );
+        }
+        let proof = broker.browser_call("/patchriot/browser/check", json!({"url":"https://owned.example/graphql","headers":headers,"data":data,"json_pointer":"/data/viewer/email"})).await.unwrap();
+        assert_eq!(proof["verified"], true);
+        assert!(!proof.to_string().contains("synthetic-browser-credential"));
+        assert!(broker.verified_access().is_some());
+        let request = json!({"method":"POST","url":"https://owned.example/graphql","headers":{"content-type":"application/json"},"data":data,"authenticated":true});
+        let signed = broker.engine_http(request.clone()).await.unwrap();
+        assert_eq!(signed["evidence"]["authenticated"], true);
+        assert!(
+            signed["body"]
+                .as_str()
+                .unwrap()
+                .contains("fixture@example.com")
+        );
+        let mut anonymous = request.clone();
+        anonymous["authenticated"] = json!(false);
+        let control = broker.engine_http(anonymous).await.unwrap();
+        assert!(control["body"].as_str().unwrap().contains("Forbidden"));
+        let mut foreign = request;
+        foreign["url"] = json!("https://outside.example/graphql");
+        assert!(broker.engine_http(foreign).await.is_err());
+        // An unsuccessful new check revokes token replay; saved proof remains evidence.
+        let control = broker
+            .browser_call(
+                "/patchriot/browser/check",
+                json!({"url":"https://owned.example/graphql","data":data}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control["verified"], false);
+        assert!(broker.verified_access().is_none());
+        server.abort();
+    }
+
+    #[test]
+    fn reference_graphql_reads_do_not_authorize_mutations() {
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.account = Some(AccountSlot::Reference);
+        inner.scope.methods.push("POST".into());
+        for (query, allowed) in [
+            ("{ viewer { email } }", true),
+            ("mutation { deleteMe }", false),
+            ("query A { me } mutation B { deleteMe }", false),
+        ] {
+            let probe = Probe {
+                method: "POST".into(),
+                url: "https://owned.example/graphql".into(),
+                headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+                data: Some(json!({"query":query}).to_string()),
+                authenticated: true,
+                account_change: false,
+            };
+            assert_eq!(broker.probe_url(&probe, false).is_ok(), allowed);
+        }
     }
 
     #[tokio::test]
