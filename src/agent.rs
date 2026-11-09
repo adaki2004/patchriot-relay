@@ -107,15 +107,7 @@ impl Settings {
     /// prove model weights, operator trust or successful penetration testing.
     pub(crate) fn installed_capabilities(&self) -> Result<Value, Box<dyn std::error::Error>> {
         let image = Docker::new(&self.docker_socket)?.inspect("image", &self.image)?;
-        if image["Id"] != self.image
-            || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
-            || image["Config"]["User"] != "65534:65534"
-        {
-            return Err(
-                "installed image must use the pinned Patchriot entrypoint and unprivileged user"
-                    .into(),
-            );
-        }
+        validate_agent_image(self, &image, false, false, None)?;
         self.require_website_adapter()?;
         let tools = if self.live_provider_key_file.is_some() {
             self.live_tools()?
@@ -1013,27 +1005,14 @@ pub fn execute(args: &[String]) -> Result<u8, Box<dyn std::error::Error>> {
     Ok(u8::from(!check.result.matches_fixture()))
 }
 
-pub fn run(
+/// Validate the same installed-image boundary for inspection and execution.
+fn validate_agent_image(
     settings: &Settings,
-    assignment: Option<Assignment<'_>>,
-    website: Option<&website::Task>,
-    source: Option<&source::Task>,
+    image: &Value,
+    website: bool,
+    source: bool,
     live: Option<&live::Task>,
-    cancelled: &impl Fn() -> bool,
-) -> Result<Check, Box<dyn std::error::Error>> {
-    if [website.is_some(), source.is_some(), live.is_some()]
-        .into_iter()
-        .filter(|v| *v)
-        .count()
-        > 1
-    {
-        return Err("assignment has conflicting material".into());
-    }
-    if cancelled() {
-        return Err("agent check cancelled before startup".into());
-    }
-    let docker = Docker::new(Path::new(&settings.docker_socket))?;
-    let image = docker.inspect("image", &settings.image)?;
+) -> Result<(), Box<dyn std::error::Error>> {
     if image["Id"] != settings.image
         || image["Os"] != "linux"
         || image["Config"]["Entrypoint"] != json!(IMAGE_ENTRY)
@@ -1047,7 +1026,7 @@ pub fn run(
                 .as_str()
                 .unwrap_or(""),
         )
-        || website.is_some()
+        || website
             && ![
                 "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
                 "17", "18", "19", "20", "21", "22",
@@ -1057,7 +1036,7 @@ pub fn run(
                     .as_str()
                     .unwrap_or(""),
             )
-        || source.is_some()
+        || source
             && !matches!(
                 image["Config"]["Labels"]["io.patchriot.agent-adapter"].as_str(),
                 Some(
@@ -1170,7 +1149,7 @@ pub fn run(
         || settings.max_attempt_seconds > DEFAULT_AGENT_ATTEMPT_SECONDS
             && ![
                 "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
-                "18", "19", "20", "21",
+                "18", "19", "20", "21", "22",
             ]
             .contains(
                 &image["Config"]["Labels"]["io.patchriot.agent-adapter"]
@@ -1200,6 +1179,33 @@ pub fn run(
     {
         return Err("multiple test accounts require the inspected adapter 20–22 image".into());
     }
+    Ok(())
+}
+
+pub fn run(
+    settings: &Settings,
+    assignment: Option<Assignment<'_>>,
+    website: Option<&website::Task>,
+    source: Option<&source::Task>,
+    live: Option<&live::Task>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Check, Box<dyn std::error::Error>> {
+    if [website.is_some(), source.is_some(), live.is_some()]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
+        > 1
+    {
+        return Err("assignment has conflicting material".into());
+    }
+    if cancelled() {
+        return Err("agent check cancelled before startup".into());
+    }
+    let docker = Docker::new(Path::new(&settings.docker_socket))?;
+    let image = docker.inspect("image", &settings.image)?;
+    validate_agent_image(settings, &image, website.is_some(), source.is_some(), live)?;
+    let browser = live.is_some_and(|task| task.evidence.context.scope.browser_login.is_some());
+    let paired = live.is_some_and(|task| task.evidence.context.scope.account_policy.is_some());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -2065,6 +2071,44 @@ mod tests {
             assert!(
                 !policy(&value, "owned-image", &["owned-model"], 600, false),
                 "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_adapter_starts_with_the_full_pilot_allowance_and_keeps_image_checks() {
+        let mut settings = settings();
+        settings.max_attempt_seconds = 10_800;
+        let image = json!({"Id":settings.image,"Os":"linux","Config":{
+            "Entrypoint":IMAGE_ENTRY,"User":"65534:65534",
+            "Labels":{"io.patchriot.agent-adapter":"22"}
+        }});
+        // The exact image guard used by run() must accept the advertised adapter
+        // with the real pilot allowance, not only the default ten-minute fixture.
+        assert!(validate_agent_image(&settings, &image, false, false, None).is_ok());
+        assert!(validate_agent_image(&settings, &image, true, false, None).is_ok());
+        assert!(validate_agent_image(&settings, &image, false, true, None).is_ok());
+        for (pointer, value) in [
+            ("/Id", json!("another-image")),
+            ("/Os", json!("windows")),
+            ("/Config/User", json!("0:0")),
+            ("/Config/Entrypoint", json!(["/bin/sh"])),
+            ("/Config/Healthcheck", json!({"Test":["CMD","false"]})),
+            ("/Config/OnBuild", json!(["RUN false"])),
+            ("/Config/Labels/io.patchriot.agent-adapter", json!("23")),
+            ("/Config/Labels/io.patchriot.agent-adapter", json!("2")),
+        ] {
+            let mut altered = image.clone();
+            if pointer == "/Config/Healthcheck" {
+                altered["Config"]["Healthcheck"] = value;
+            } else if pointer == "/Config/OnBuild" {
+                altered["Config"]["OnBuild"] = value;
+            } else {
+                *altered.pointer_mut(pointer).unwrap() = value;
+            }
+            assert!(
+                validate_agent_image(&settings, &altered, false, false, None).is_err(),
+                "{pointer}"
             );
         }
     }
