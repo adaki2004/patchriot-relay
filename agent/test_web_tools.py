@@ -141,6 +141,26 @@ class WebToolsTests(unittest.TestCase):
             self.assertIsNone(response.getheader('X-Patchriot-Evidence-Id'))
             self.assertEqual(mirror.refs, [7])
 
+    def test_withheld_success_body_is_a_visible_transport_gap_not_target_success_or_progress(self):
+        evidence = {'id': 42, 'status': 200, 'error': 'browser_json_too_wide',
+                    'headers': {'content-type': 'application/json', 'x-patchriot-target-status': '201'}}
+        def fixture(*args, **kwargs):
+            return {'body': '', 'evidence': dict(evidence)}
+        with tools.ScopeMirror('https://owned.example', time.monotonic()+5, fixture) as mirror:
+            for path in ['/items?page=1', '/items?page=2']:
+                client = http.client.HTTPConnection('127.0.0.1', mirror.server.server_port, timeout=2)
+                client.request('GET', path)
+                response = client.getresponse()
+                self.assertEqual(response.status, 502)
+                self.assertEqual(response.getheader('X-Patchriot-Target-Status'), '200')
+                self.assertEqual(response.getheader('X-Patchriot-Relay-Error'), 'browser_json_too_wide')
+                self.assertIn(b'not an empty target response', response.read())
+                client.close()
+            self.assertEqual(mirror.refs, [42, 42])
+            self.assertFalse(mirror.progress_keys)
+            self.assertEqual(mirror.transport_errors, {'browser_json_too_wide': 2})
+            self.assertEqual(evidence['status'], 200)
+
     def test_new_evidence_ids_and_repeated_replies_do_not_fake_target_progress(self):
         calls = []
         def fixture(method, url, headers, **kwargs):

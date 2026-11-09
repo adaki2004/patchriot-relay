@@ -284,6 +284,34 @@ fn retryable_dispatcher_error(error: &Error) -> bool {
             .is_some_and(|e| e.status == 429 || e.status >= 500)
 }
 
+/// Keep startup transport retries inside the active lease monitor. Returning a
+/// transient error to the device polling loop would stop renewal during its
+/// backoff, potentially expiring the lease before any paid execution begins.
+fn retry_evidence_download<T>(
+    mut download: impl FnMut() -> Result<T, Error>,
+    active: impl Fn() -> bool,
+) -> Result<T, Error> {
+    loop {
+        if !active() {
+            return Err("evidence download stopped before execution".into());
+        }
+        match download() {
+            Ok(value) if active() => return Ok(value),
+            Ok(_) => return Err("evidence download stopped before execution".into()),
+            Err(error) if retryable_dispatcher_error(&error) => {
+                eprintln!("evidence download unavailable; retrying while lease is active");
+                for _ in 0..50 {
+                    if !active() {
+                        return Err("evidence download stopped before execution".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn post<T: Serialize, R: DeserializeOwned>(
     client: &reqwest::blocking::Client,
     config: &Config,
@@ -330,9 +358,22 @@ fn post_with_limit<T: Serialize, R: DeserializeOwned>(
         } else {
             client.post(url).json(&request)
         };
-        // Reports can reach 32 MiB. Allow slow links without extending heartbeat
-        // deadlines or the server's 120-second signature freshness window.
-        let outgoing = if completion || evidence {
+        // The signed gzip route alone does not negotiate HTTP response coding.
+        // Intermediaries may expand it unless the client explicitly accepts gzip,
+        // turning a small evidence transfer into a multi-megabyte timeout. Decode
+        // manually below so both wire and expanded limits still apply.
+        let outgoing = if compressed && evidence {
+            outgoing.header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        } else {
+            outgoing
+        };
+        // Evidence downloads include earlier reports and can be slow even when
+        // compressed. Signatures are checked when the request arrives; download
+        // time does not extend signature freshness, lease renewal or execution.
+        // The independent monitor keeps renewing (or stopping) the same lease.
+        let outgoing = if evidence {
+            outgoing.timeout(Duration::from_secs(300))
+        } else if completion {
             outgoing.timeout(Duration::from_secs(90))
         } else {
             outgoing
@@ -1139,15 +1180,24 @@ fn agent_work(
                 None
             };
             let live = if let Some(live) = &assignment.pentest {
-                let saved: patchriot_protocol::pentests::PentestEvidence = post_with_limit(
-                    client,
-                    &config,
-                    &read_key(directory)?,
-                    &format!("/v1/devices/{device_id}/work/pentest-evidence"),
-                    patchriot_protocol::website_reviews::ReadWorkEvidence {
-                        lease_id: assignment.lease_id,
+                let saved: patchriot_protocol::pentests::PentestEvidence = retry_evidence_download(
+                    || {
+                        post_with_limit(
+                            client,
+                            &config,
+                            &read_key(directory)?,
+                            &format!("/v1/devices/{device_id}/work/pentest-evidence"),
+                            patchriot_protocol::website_reviews::ReadWorkEvidence {
+                                lease_id: assignment.lease_id,
+                            },
+                            patchriot_protocol::pentests::MAX_EVIDENCE_BYTES as u64,
+                        )
                     },
-                    patchriot_protocol::pentests::MAX_EVIDENCE_BYTES as u64,
+                    || {
+                        !stop.load(Ordering::Relaxed)
+                            && !window.stopped_at(Instant::now())
+                            && Instant::now() < execution_deadline
+                    },
                 )?;
                 if saved.context.pentest_id != live.pentest_id {
                     return Err("wrong live scope".into());
@@ -1511,6 +1561,68 @@ mod tests {
     }
 
     #[test]
+    fn evidence_retry_retains_startup_until_download_succeeds() {
+        let attempts = std::cell::Cell::new(0);
+        let value = retry_evidence_download(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(Box::new(DispatcherConnectionError("response read failed")) as Error)
+                } else {
+                    Ok("saved report")
+                }
+            },
+            || true,
+        )
+        .unwrap();
+        assert_eq!(value, "saved report");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn evidence_retry_stops_on_revocation_or_non_retryable_reply() {
+        for status in [401, 403, 409] {
+            let attempts = std::cell::Cell::new(0);
+            let error = retry_evidence_download::<()>(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Err(Box::new(RemoteError { status, code: None }))
+                },
+                || true,
+            )
+            .unwrap_err();
+            assert!(error.is::<RemoteError>());
+            assert_eq!(attempts.get(), 1);
+        }
+        for response_succeeds in [false, true] {
+            let active = std::cell::Cell::new(true);
+            let error = retry_evidence_download(
+                || {
+                    active.set(false);
+                    if response_succeeds {
+                        Ok("arrived after cancellation")
+                    } else {
+                        Err(Box::new(DispatcherConnectionError("request timed out")) as Error)
+                    }
+                },
+                || active.get(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "evidence download stopped before execution"
+            );
+        }
+        assert!(
+            retry_evidence_download(
+                || -> Result<(), Error> { panic!("expired lease must not download") },
+                || false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn transport_errors_can_retry_but_invalid_replies_cannot_restart_agent_work() {
         use std::net::TcpListener;
         let directory = tempfile::tempdir().unwrap();
@@ -1786,6 +1898,13 @@ mod tests {
                         if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
                             let headers = std::str::from_utf8(&bytes[..end]).unwrap();
                             assert!(headers.starts_with(&format!("POST {path} ")));
+                            let accepts_gzip = headers.lines().any(|line| {
+                                line.split_once(':').is_some_and(|(name, value)| {
+                                    name.eq_ignore_ascii_case("accept-encoding")
+                                        && value.trim() == "gzip"
+                                })
+                            });
+                            assert_eq!(accepts_gzip, attempt == 0);
                             let length: usize = headers
                                 .lines()
                                 .find_map(|line| {

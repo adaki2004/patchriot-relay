@@ -908,12 +908,22 @@ fn policy(container: &Value, image: &str, args: &[&str], seconds: u64, engine: b
     browser_policy(container, image, args, seconds, engine, false, false)
 }
 
-fn container_resources(browser: bool, paired: bool) -> (u64, u64) {
-    match (browser, paired) {
-        (true, true) => (4_294_967_296, 512),
-        (true, false) => (2_147_483_648, 256),
-        (false, _) => (2_147_483_648, 128),
-    }
+fn container_resources(engine: bool, browser: bool, paired: bool) -> (u64, u64) {
+    // Native exploration, its PostgreSQL state and later browser/scanner work
+    // share one cgroup. Long single-account and public runs need the same
+    // bounded memory headroom as paired-account work; account count is not a
+    // reliable proxy for the assessment's retained evidence size.
+    let memory = if engine || browser {
+        4_294_967_296
+    } else {
+        2_147_483_648
+    };
+    let pids = if browser {
+        if paired { 512 } else { 256 }
+    } else {
+        128
+    };
+    (memory, pids)
 }
 
 fn browser_policy(
@@ -925,7 +935,7 @@ fn browser_policy(
     browser: bool,
     paired: bool,
 ) -> bool {
-    let (memory, pids) = container_resources(browser, paired);
+    let (memory, pids) = container_resources(engine, browser, paired);
     let h = &container["HostConfig"];
     let c = &container["Config"];
     (!paired || browser)
@@ -1315,7 +1325,14 @@ pub fn run(
         ]
         .map(str::to_owned),
     );
-    let (memory, pids) = container_resources(browser, paired);
+    let engine = live.is_some_and(|task| {
+        task.evidence
+            .context
+            .scope
+            .tools
+            .contains(&patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
+    });
+    let (memory, pids) = container_resources(engine, browser, paired);
     command.extend([
         "--memory".into(),
         memory.to_string(),
@@ -1324,13 +1341,6 @@ pub fn run(
         "--pids-limit".into(),
         pids.to_string(),
     ]);
-    let engine = live.is_some_and(|task| {
-        task.evidence
-            .context
-            .scope
-            .tools
-            .contains(&patchriot_protocol::pentests::LiveToolProfile::ArtexEngineV1)
-    });
     // This is a reviewed profile embedded in the binary, never a page or model
     // supplied path. Keep its file alive until Docker has read it at creation.
     let _browser_seccomp = if browser {
@@ -1827,6 +1837,8 @@ mod tests {
     #[test]
     fn browser_policy_adds_its_sandbox_without_allowing_host_access() {
         let mut value = container();
+        value["HostConfig"]["Memory"] = json!(4_294_967_296u64);
+        value["HostConfig"]["MemorySwap"] = json!(4_294_967_296u64);
         value["AppArmorProfile"] = json!("patchriot-browser-v1");
         value["HostConfig"]["PidsLimit"] = json!(256);
         value["HostConfig"]["ShmSize"] = json!(268435456);
@@ -1872,7 +1884,7 @@ mod tests {
             );
         }
         for paired in [false, true] {
-            let (memory, pids) = container_resources(true, paired);
+            let (memory, pids) = container_resources(false, true, paired);
             let mut configured = value.clone();
             configured["HostConfig"]["Memory"] = json!(memory);
             configured["HostConfig"]["MemorySwap"] = json!(memory);
@@ -1970,6 +1982,8 @@ mod tests {
             false
         ));
         let mut expanded = container();
+        expanded["HostConfig"]["Memory"] = json!(4_294_967_296u64);
+        expanded["HostConfig"]["MemorySwap"] = json!(4_294_967_296u64);
         expanded["HostConfig"]["Tmpfs"] = json!(
             temporary_storage(true)
                 .into_iter()
@@ -1989,6 +2003,19 @@ mod tests {
             600,
             true
         ));
+        for field in ["Memory", "MemorySwap"] {
+            for limit in [0, 2_147_483_648u64, 8_589_934_592u64] {
+                let mut changed = expanded.clone();
+                changed["HostConfig"][field] = json!(limit);
+                assert!(!policy(
+                    &changed,
+                    "owned-image",
+                    &["owned-model"],
+                    600,
+                    true
+                ));
+            }
+        }
         assert!(!policy(
             &container(),
             "owned-image",

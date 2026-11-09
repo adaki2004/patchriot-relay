@@ -253,6 +253,12 @@ def schema_checks(client, urls, execute=capture):
     return {'cases': results, 'interpretation': 'Server errors and schema anomalies require reproduction and demonstrated security impact.'}
 
 
+def scanner_failure_reason(error):
+    """Retain bounded scanner codes, never target text or credentials from exceptions."""
+    reason = str(error)
+    return reason if re.fullmatch(r'scanner_[a-z_]{1,60}', reason) else type(error).__name__
+
+
 def run(scope, records, access=None, fetch=request, emit=lambda value: None, directory=Path('/work')):
     urls = observed_urls(scope, records)
     for path in sorted((directory / 'http-evidence').glob('*.json')):
@@ -297,9 +303,7 @@ def run(scope, records, access=None, fetch=request, emit=lambda value: None, dir
                     selected = protected + [url for url in urls if re.search(r'(openapi|swagger|api-docs|graphql)', urlsplit(url).path, re.I)]
                 detail = function(client, selected)
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-                reason = str(error)
-                if not re.fullmatch(r'scanner_[a-z_]{1,60}', reason):
-                    reason = type(error).__name__
+                reason = scanner_failure_reason(error)
                 detail = {'state': 'blocked', 'reason': reason}
                 client.gaps.append('scanner_execution_incomplete')
             refs.extend(e['id'] for e in client.records)
@@ -378,8 +382,8 @@ def follow_up(scope, records, engine, access, deadline, fetch=request,
                           account, limit=48, discovery=False)
         try:
             detail = zap(client, urls)
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
-            detail = {'state': 'blocked', 'reason': 'scanner_follow_up_incomplete'}
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            detail = {'state': 'blocked', 'reason': scanner_failure_reason(error)}
             client.gaps.append('scanner_execution_incomplete')
         refs.extend(e['id'] for e in client.records)
         gaps.extend(client.gaps)

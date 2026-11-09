@@ -24,6 +24,60 @@ SCOPE = {'origins': ['https://owned.example'], 'objective': 'Owned fixture only'
 
 
 class EngineTests(unittest.TestCase):
+    def test_native_configuration_applies_fair_worker_slices_and_preserves_upstream_prompts(self):
+        class FakeClient:
+            def __init__(self):
+                self.prompts = {role: 'original ' + role + ' {{.Goal}}' for role in ('worker', 'planner')}
+                self.config = {}
+                self.writes = []
+            def call(self, path, body=None, method=None):
+                role = path.split('/')[3]
+                if body is not None:
+                    self.writes.append((path, body, method))
+                    if path.endswith('/prompt'): self.prompts[role] = body['template']
+                    if path.endswith('/config'): self.config = body
+                    return {}
+                return {'prompt': self.prompts[role], 'agent': self.config}
+        client = FakeClient()
+        artex.configure_exploration(client)
+        self.assertEqual(client.config, {'max_turns': 64, 'run_seconds': 600})
+        for role in ('worker', 'planner'):
+            self.assertTrue(client.prompts[role].startswith('original ' + role))
+            self.assertIn('12 distinct records/pages/cursors', client.prompts[role])
+        self.assertIn('cited new observation', client.prompts['planner'])
+        artex.configure_exploration(client)
+        self.assertEqual(sum(path.endswith('/prompt') for path, _, _ in client.writes), 2)
+
+    def test_unapplied_native_worker_limits_cannot_silently_start_unbounded(self):
+        class FakeClient:
+            def call(self, path, body=None, method=None):
+                return {'prompt': 'original', 'agent': {'max_turns': 0, 'run_seconds': 0}}
+        with self.assertRaisesRegex(ValueError, 'worker limits not applied'):
+            artex.configure_exploration(FakeClient())
+
+    def test_transport_gaps_are_retained_but_cannot_replace_all_target_observations(self):
+        from urllib.request import urlopen
+        for all_withheld in (False, True):
+            def fetch(method, url, *args, **kwargs):
+                if url.endswith('/wide') or all_withheld:
+                    return {'body': '', 'evidence': {'id': 1, 'status': 200, 'error': 'browser_json_too_wide'}}
+                return {'body': 'observed fixture', 'evidence': {'id': 2, 'status': 200}}
+            class FakeEngine:
+                def __init__(self, *_): pass
+                def __enter__(self): return self
+                def __exit__(self, *_): pass
+                def assess(self, scope, targets, role, **kwargs):
+                    for path in ['/wide', '/control']:
+                        try:
+                            with urlopen(targets[0] + path) as response: response.read()
+                        except urllib.error.HTTPError as error: error.close()
+                    return {'coverage_complete': True, 'stop_reason': 'done', 'findings': []}
+            with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine):
+                receipt = artex.run(SCOPE, 'investigator', time.monotonic()+10, Path(folder), fetch=fetch)
+                detail = json.loads(receipt['output_excerpt'])
+            self.assertEqual(detail['coverage_complete'], not all_withheld)
+            self.assertEqual(detail['transport_gaps'], [{'error': 'browser_json_too_wide', 'count': 2 if all_withheld else 1}])
+            self.assertEqual(detail['exploration_limits']['worker_max_turns'], 64)
     def test_two_accounts_share_one_engine_with_distinct_authenticated_mirrors(self):
         from urllib.request import urlopen
         for missing in (None, 'testing', 'reference'):
@@ -102,6 +156,28 @@ class EngineTests(unittest.TestCase):
         self.assertIn('missing authenticated coverage', body['goal'])
         self.assertNotIn('no supplied account', body['goal'])
 
+    def test_requested_native_authentication_cannot_finish_as_public_only(self):
+        from urllib.request import urlopen
+        class FakeEngine:
+            def __init__(self, *_): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def assess(self, scope, targets, role, **_kwargs):
+                with urlopen(targets[0]) as response: response.read()
+                return {'coverage_complete':True,'stop_reason':'done','findings':[]}
+        for requested in (True, False):
+            with tempfile.TemporaryDirectory() as folder, patch.object(artex, 'Engine', FakeEngine):
+                receipt = artex.run(SCOPE, 'investigator', time.monotonic()+2, Path(folder),
+                    fetch=lambda *args, **kwargs: {'body': 'public fixture', 'evidence': {'id': 1, 'status': 200}},
+                    access={'requested':requested,'verified':False})
+                detail = json.loads(receipt['output_excerpt'])
+            self.assertEqual(detail['authentication_requested'], requested)
+            self.assertEqual(detail['access_mode'], 'anonymous')
+            self.assertEqual(detail['coverage_complete'], not requested)
+            self.assertEqual(receipt['failure'], 'incomplete' if requested else None)
+            if requested:
+                self.assertIn('authenticated_context_unverified', detail['collection_errors'])
+
     def test_password_change_guidance_distinguishes_consent_from_verified_permission(self):
         scope = dict(SCOPE, account_policy={'allow_password_changes': True})
         blocked = artex.task_body(scope, ['http://127.0.0.1:1234'], 100, 'investigator')['goal']
@@ -158,6 +234,25 @@ class EngineTests(unittest.TestCase):
     def test_exhausted_upstream_planner_stops_even_if_task_is_queued(self):
         self.assertTrue(artex.should_stop({'status': 'queued', 'llm_failover_state': 'chain_exhausted'}))
         self.assertTrue(artex.should_stop({'status': 'completed'}))
+
+    def test_native_lead_handoff_uses_content_fields_and_preserves_total(self):
+        lead = {**{f'metadata_{i}': i for i in range(8)}, 'id':'17', 'severity':'low',
+                'summary':'Owned unverified lead', 'evidence':'Owned control observation',
+                'report':'Long private transcript ' * 10000}
+        result = {'findings':[lead] * 9, 'coverage_complete':False, 'stop_reason':'interrupted',
+                  'model_recovery':{'rate_limit_responses':1,'successful_replies_after_rate_limit':1,'unrecovered_rate_limit_responses':0}}
+        receipt = json.loads(artex.receipt_summary(result, json.dumps(result)))
+        self.assertEqual(receipt['findings_returned'], 9)
+        self.assertEqual(len(receipt['findings_preview']), 6)
+        self.assertEqual(receipt['findings_preview'][0]['summary'], 'Owned unverified lead')
+        self.assertEqual(receipt['findings_preview'][0]['evidence'], 'Owned control observation')
+        self.assertNotIn('metadata_0', receipt['findings_preview'][0])
+        self.assertNotIn('report', receipt['findings_preview'][0])
+        self.assertFalse(receipt['coverage_complete'])
+        self.assertEqual(receipt['model_recovery'], result['model_recovery'])
+        missing = json.loads(artex.receipt_summary({'findings':{'unavailable':True}}, '{}'))
+        self.assertIsNone(missing['findings_returned'])
+        self.assertTrue(missing['findings_preview']['unavailable'])
         self.assertFalse(artex.should_stop({'status': 'running'}))
 
     def test_missing_engine_and_deadline_are_visible_without_fake_findings(self):
@@ -402,7 +497,7 @@ class ImageSmoke(unittest.TestCase):
         Run in a network=none, non-root container with disposable /work. The
         scripted model is only an integration fixture, not a quality evaluation.
         """
-        requested, seen_tools, calls = [], [], []
+        requested, seen_tools, calls, refusals = [], [], [], []
         def fixture(method, url, headers):
             requested.append((method, url))
             return {'body': 'OWNED FIXTURE RESPONSE', 'evidence': {'id': len(requested), 'status': 200,
@@ -417,6 +512,13 @@ class ImageSmoke(unittest.TestCase):
                 if length > 512 * 1024:
                     return self.send_error(413)
                 body = json.loads(self.rfile.read(length))
+                if not refusals:
+                    refusals.append(True)
+                    self.send_response(429)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"provider_rate_limited"}')
+                    return
                 calls.append(self.path)
                 names = [t['function']['name'] for t in body.get('tools', [])]
                 seen_tools.extend(names)
@@ -459,6 +561,10 @@ class ImageSmoke(unittest.TestCase):
             deadline = time.monotonic() + 30
             with ScopeMirror(SCOPE['origins'][0], deadline, fixture) as mirror:
                 with artex.Engine(Path('/work/artex-state'), f'http://127.0.0.1:{server.server_port}', deadline) as engine:
+                    worker = engine.client.call('/api/agents/worker')
+                    self.assertEqual(worker['agent']['max_turns'], artex.WORKER_MAX_TURNS)
+                    self.assertEqual(worker['agent']['run_seconds'], artex.WORKER_RUN_SECONDS)
+                    self.assertIn(artex.SAMPLING_POLICY, worker['prompt'])
                     # Check the shipped process boundary, not the engine's own
                     # tool approvals or target blacklist. No external target is
                     # contacted: the isolated namespace has only loopback.
@@ -527,6 +633,7 @@ class ImageSmoke(unittest.TestCase):
                 self.assertIsNotNone(engine.process.poll(), 'engine process must be stopped')
                 self.assertIsNotNone(engine.pg.poll(), 'database process must be stopped')
             self.assertIn(('GET', 'https://owned.example/'), requested)
+            self.assertEqual(refusals, [True], 'The shipped SDK recovers an explicit rate refusal')
             self.assertIn('set_goals', seen_tools)
             self.assertIn('Bash', seen_tools)
             self.assertTrue(all(p == '/patchriot/artex/v1/chat/completions' for p in calls))

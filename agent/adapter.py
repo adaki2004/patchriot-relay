@@ -21,7 +21,46 @@ transaction_lock = threading.Lock()
 bridge_stopping = threading.Event()
 engine_stopping = threading.Event()
 engine_stop_reason = None
+# Only fixed broker codes may enter a retained receipt. Never copy a provider
+# error body: it can contain prompts, target responses or account material.
+ENGINE_REJECTION_REASONS = frozenset({
+    'provider_rate_limited', 'provider_unavailable', 'provider_stream_interrupted',
+    'provider_repetition', 'near_verification_timeout', 'model_history_limit',
+    'model_messages_empty', 'model_message_role', 'model_message_content',
+    'model_request_too_large', 'invalid_tools',
+})
 request_id = 0
+
+
+class EngineRecovery:
+    """Allow the upstream SDK a bounded retry after an explicit rate refusal.
+
+    No request is replayed here. Each upstream retry passes through the broker
+    and reserves its own allowance. Ambiguous responses, budget exhaustion,
+    authentication and malformed input still stop discovery immediately.
+    """
+    def __init__(self):
+        self.refusals = self.consecutive = self.recoveries = 0
+
+    def rejected(self, reason):
+        if reason != 'provider_rate_limited':
+            return False
+        self.refusals += 1
+        self.consecutive += 1
+        return self.consecutive < 3 and self.refusals <= 6
+
+    def succeeded(self):
+        if self.consecutive:
+            self.recoveries += 1
+            self.consecutive = 0
+
+    def snapshot(self):
+        return {'rate_limit_responses': self.refusals,
+                'successful_replies_after_rate_limit': self.recoveries,
+                'unrecovered_rate_limit_responses': self.consecutive}
+
+
+engine_recovery = EngineRecovery()
 
 
 def report_validation(**details):
@@ -208,7 +247,7 @@ class Bridge(BaseHTTPRequestHandler):
         """
         global engine_stop_reason
         if self.path == '/patchriot/artex/v1/chat/completions':
-            engine_stop_reason = 'model_request_rejected'
+            engine_stop_reason = 'model_request_too_large'
             engine_stopping.set()
         body = json.dumps({'error':{'type':'invalid_request_error', 'code':'request_too_large',
             'message':'Request exceeds the bridge size limit. Compact the conversation before retrying.'}}).encode()
@@ -285,11 +324,14 @@ class Bridge(BaseHTTPRequestHandler):
                                     reason = json.loads(error_body).get('error')
                                     if reason == 'engine_budget_reached':
                                         engine_stop_reason = 'model_budget'
-                                    elif reason == 'provider_repetition':
-                                        engine_stop_reason = 'provider_repetition'
+                                    elif isinstance(reason, str) and reason in ENGINE_REJECTION_REASONS:
+                                        engine_stop_reason = reason
                                 except (ValueError, AttributeError):
                                     pass
-                                engine_stopping.set()
+                                if not engine_recovery.rejected(engine_stop_reason):
+                                    engine_stopping.set()
+                            elif self.path == '/patchriot/artex/v1/chat/completions':
+                                engine_recovery.succeeded()
                             return
                         else:
                             raise RuntimeError("model request failed")
@@ -440,6 +482,7 @@ def main():
                 result = artex.run(scope if access.get('verified') or any(a.get('verified') for a in access.get('accounts', [])) else public_scope(scope),
                     role, engine_deadline, model=model, access=access,
                     stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
+                    recovery=engine_recovery.snapshot,
                     emit=lambda result: event("live_tool", run=result))
             finally:
                 engine_stopping.set()
