@@ -540,8 +540,11 @@ impl LiveBroker {
             let encoded = zeroize::Zeroizing::new(STANDARD.encode(joined.as_bytes()));
             let header = zeroize::Zeroizing::new(format!("Basic {}", encoded.as_str()));
             let inner = Arc::get_mut(&mut self).ok_or("gate_setup_after_start")?;
+            // As with ordinary Basic authentication, the login name alone is
+            // an identifier, not the secret. Globally masking it can corrupt
+            // approved hostnames and UI text that contain the same word.
+            // The password and complete credentials remain substring-redacted.
             for secret in [
-                username.as_str(),
                 password.as_str(),
                 joined.as_str(),
                 encoded.as_str(),
@@ -2280,6 +2283,39 @@ for _ in range(270): print(frame,flush=True)
         assert_eq!(counters.reserved, 0);
         assert!(counters.evidence.is_empty());
     }
+    #[test]
+    fn perimeter_login_name_does_not_corrupt_the_approved_hostname() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let gate = TestCredentials::Basic {
+            username: "example".into(),
+            password: "fixture-gate-password".into(),
+        };
+        let broker = broker().with_environment_gate(Some(&gate)).unwrap();
+        let scope = serde_json::to_value(&broker.scope).unwrap();
+        let mut messages = json!([{ "role": "tool", "content": scope.to_string() }]);
+        broker.access.redact_json(&mut messages);
+        assert_eq!(messages[0]["content"], scope.to_string());
+        assert_eq!(
+            broker.access.redact("Navigate https://example.com/"),
+            "Navigate https://example.com/"
+        );
+        // The username alone is an identifier. Passwords and either form of
+        // the actual Basic credential must still be hidden from model input.
+        let encoded = STANDARD.encode("example:fixture-gate-password");
+        for value in [
+            "fixture-gate-password".to_owned(),
+            "example:fixture-gate-password".to_owned(),
+            encoded.clone(),
+            format!("Basic {encoded}"),
+        ] {
+            assert_eq!(broker.access.redact(&value), "REDACTED");
+        }
+        assert_eq!(
+            broker.access.redact("prefixfixture-gate-passwordsuffix"),
+            "prefixREDACTEDsuffix"
+        );
+    }
+
     #[tokio::test]
     async fn perimeter_gate_is_origin_bound_redacted_and_does_not_sign_in_the_user() {
         use tokio::{
