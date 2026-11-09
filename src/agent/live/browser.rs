@@ -269,6 +269,12 @@ impl LiveBroker {
         for (key, value) in &input.headers {
             request = request.header(key, value);
         }
+        request = self.apply_environment_gate(
+            request,
+            &url,
+            input.headers.contains_key("authorization")
+                || self.access.authorization(input.authenticated).is_some(),
+        )?;
         // Basic/bearer access is injected by the relay. Cookie-based browser
         // contexts send their own cookies, including an empty anonymous context.
         if !resource

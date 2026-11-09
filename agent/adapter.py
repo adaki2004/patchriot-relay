@@ -481,6 +481,7 @@ def main():
             try:
                 result = artex.run(scope if access.get('verified') or any(a.get('verified') for a in access.get('accounts', [])) else public_scope(scope),
                     role, engine_deadline, model=model, access=access,
+                    requester_context=context.get("requester_context", ""),
                     stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
                     recovery=engine_recovery.snapshot,
                     emit=lambda result: event("live_tool", run=result))

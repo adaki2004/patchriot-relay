@@ -191,6 +191,15 @@ impl Access {
         ]
         .into())
     }
+    pub fn remember_supplied_secret(&mut self, value: String) -> Result<(), &'static str> {
+        self.remember_secret(value)?;
+        self.supplied_secret_count = self
+            .secrets
+            .lock()
+            .map_err(|_| "redaction_unavailable")?
+            .len();
+        Ok(())
+    }
     pub fn remember_secret(&self, value: String) -> Result<(), &'static str> {
         let value = Zeroizing::new(value);
         let mut secrets = self.secrets.lock().map_err(|_| "redaction_unavailable")?;
