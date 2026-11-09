@@ -448,6 +448,8 @@ mod tests {
             session_login: None,
             wallet_login: None,
             browser_login: None,
+            browser_entry_origin: None,
+            browser_resource_origins: vec![],
             account_policy: None,
         };
         let credentials = TestCredentials::Bearer {

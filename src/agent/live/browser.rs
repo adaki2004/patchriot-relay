@@ -48,7 +48,7 @@ pub(super) struct BrowserReply {
 
 impl LiveBroker {
     fn require_browser(&self) -> Result<(), &'static str> {
-        if self.scope.browser_login.is_none() {
+        if self.scope.browser_login.is_none() && self.scope.authentication.is_some() {
             return Err("browser_not_selected");
         }
         if Instant::now() >= self.deadline {
@@ -63,6 +63,14 @@ impl LiveBroker {
         input: Value,
     ) -> Result<Value, &'static str> {
         self.require_browser()?;
+        if self.scope.authentication.is_none()
+            && !matches!(
+                path,
+                "/patchriot/browser/http" | "/patchriot/browser/status"
+            )
+        {
+            return Err("browser_login_not_selected");
+        }
         match path {
             "/patchriot/browser/http" => {
                 let request =
@@ -97,7 +105,9 @@ impl LiveBroker {
                     .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs());
                 // The agent needs to distinguish a spent login window from a
                 // broken website. Status never renews it or resets attempts.
-                let phase = if state.verified_origin.is_some() {
+                let phase = if self.scope.authentication.is_none() {
+                    "not_applicable"
+                } else if state.verified_origin.is_some() {
                     "verified"
                 } else if remaining.is_none() {
                     "not_started"
@@ -127,11 +137,13 @@ impl LiveBroker {
         mut input: BrowserRequest,
     ) -> Result<BrowserReply, &'static str> {
         self.require_browser()?;
+        let public_browser = self.scope.authentication.is_none();
+        if public_browser && (input.authenticated || input.login) {
+            return Err("browser_login_not_selected");
+        }
         let resource = self
             .scope
-            .browser_login
-            .as_ref()
-            .is_some_and(|login| login.permits_resource(&input.method, &input.url));
+            .permits_browser_resource(&input.method, &input.url);
         let url = if resource {
             if input.authenticated || input.login || input.data.is_some() {
                 return Err("browser_resource_must_be_anonymous_read");
@@ -164,10 +176,15 @@ impl LiveBroker {
                 // Public page dependencies receive no session, referrer or
                 // caller-selected account headers. CORS still sees the app's
                 // actual origin; Chromium enforces the response policy.
-                if name == "accept" {
+                if name == "accept"
+                    || name == "origin"
+                        && url::Url::parse(&value).is_ok_and(|v| {
+                            self.scope
+                                .origins
+                                .contains(&v.origin().ascii_serialization())
+                        })
+                {
                     headers.insert(name, value);
-                } else if name == "origin" {
-                    headers.insert(name, self.scope.origins[0].clone());
                 }
                 continue;
             }
@@ -184,11 +201,20 @@ impl LiveBroker {
                 continue;
             }
             if matches!(name.as_str(), "origin" | "referer")
-                && url::Url::parse(&value).is_ok_and(|v| v.origin() != url.origin())
+                && !url::Url::parse(&value).is_ok_and(|v| {
+                    self.scope
+                        .origins
+                        .contains(&v.origin().ascii_serialization())
+                })
             {
                 return Err("browser_header_outside_scope");
             }
-            if !input.authenticated && matches!(name.as_str(), "cookie" | "authorization") {
+            // A public browser starts with no account credentials. Keep its
+            // own visitor cookies so anonymous forms/chat can retain state.
+            // Anonymous controls of a supplied account still strip sessions.
+            if !input.authenticated
+                && (name == "authorization" || name == "cookie" && !public_browser)
+            {
                 continue;
             }
             if name == "authorization" {
@@ -862,6 +888,123 @@ mod tests {
         evidence.login = false;
         broker.counters.lock().unwrap().evidence.push(evidence);
         assert!(!broker.login_rejected());
+    }
+
+    #[tokio::test]
+    async fn public_browser_keeps_visitor_state_but_cannot_use_account_access_or_leave_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.authentication = None;
+        inner.scope.browser_login = None;
+        inner.scope.tools = vec![LiveToolProfile::ActiveWebV2];
+        inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
+        inner.scope.methods.push("POST".into());
+        inner.test_target = Some(listener.local_addr().unwrap());
+        for path in ["begin", "credentials", "wallet", "check"] {
+            assert_eq!(
+                broker
+                    .browser_call(&format!("/patchriot/browser/{path}"), json!({}))
+                    .await,
+                Err("browser_login_not_selected")
+            );
+        }
+        for request in [
+            json!({"method":"POST","url":"https://other.example/chat","authenticated":false}),
+            json!({"method":"POST","url":"https://owned.example/chat","authenticated":true}),
+            json!({"method":"POST","url":"https://owned.example/chat","authenticated":false,"login":true}),
+            json!({"method":"DELETE","url":"https://owned.example/chat","authenticated":false}),
+        ] {
+            assert!(
+                broker
+                    .browser_call("/patchriot/browser/http", request)
+                    .await
+                    .is_err()
+            );
+        }
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let n = stream.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..n]).to_lowercase();
+            assert!(request.contains("cookie: visitor=synthetic-public-state"));
+            assert!(!request.contains("authorization:"));
+            let body = r#"{"reply":"received"}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        });
+        let response = broker.browser_call("/patchriot/browser/http", json!({
+            "method":"POST","url":"https://owned.example/chat","authenticated":false,
+            "headers":{"content-type":"application/json","cookie":"visitor=synthetic-public-state","authorization":"Bearer must-not-leave"},
+            "data":"{\"question\":\"A harmless fixture\"}"
+        })).await.unwrap();
+        assert_eq!(response["evidence"]["status"], 200);
+        assert_ne!(response["evidence"]["authenticated"], true);
+        assert_eq!(broker.access.redact("synthetic-public-state"), "REDACTED");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approved_api_login_keeps_the_environment_password_on_the_entry_host() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut broker = broker("session");
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.origins = vec!["https://api.example".into(), "https://owned.example".into()];
+        inner.scope.browser_entry_origin = Some("https://owned.example".into());
+        inner.scope = inner.scope.normalized().unwrap();
+        inner.test_target = Some(listener.local_addr().unwrap());
+        let broker = broker
+            .with_environment_gate(Some(&TestCredentials::Basic {
+                username: "fixture-gate".into(),
+                password: "fixture-gate-password".into(),
+            }))
+            .unwrap();
+        broker
+            .browser_call("/patchriot/browser/begin", json!({}))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0; 8192];
+                let n = stream.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]).to_lowercase();
+                if step == 0 {
+                    assert!(request.contains("authorization: basic "));
+                } else {
+                    assert!(request.starts_with("post /session "));
+                    assert!(request.contains("origin: https://owned.example"));
+                    assert!(!request.contains("authorization:"));
+                    assert!(!request.contains("fixture-gate"));
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            }
+        });
+        broker
+            .browser_call(
+                "/patchriot/browser/http",
+                json!({"method":"GET","url":"https://owned.example/","authenticated":false}),
+            )
+            .await
+            .unwrap();
+        let request = json!({"method":"POST","url":"https://api.example/session","login":true,
+            "headers":{"origin":"https://owned.example","referer":"https://owned.example/sign-in","content-type":"application/json"},
+            "data":"{\"email\":\"fixture@example.com\",\"code\":\"only-synthetic-password\"}"});
+        let mut unapproved = request.clone();
+        unapproved["headers"]["origin"] = json!("https://unapproved.example");
+        assert_eq!(
+            broker
+                .browser_call("/patchriot/browser/http", unapproved)
+                .await
+                .unwrap_err(),
+            "browser_header_outside_scope"
+        );
+        let reply = broker
+            .browser_call("/patchriot/browser/http", request)
+            .await
+            .unwrap();
+        assert_eq!(reply["evidence"]["status"], 200);
+        assert!(!reply.to_string().contains("only-synthetic-password"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

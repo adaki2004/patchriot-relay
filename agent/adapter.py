@@ -401,7 +401,7 @@ def main():
         tools = web_tools.run(scope, previous,
                               emit=lambda result: event("live_tool", run=result), role=role, workflow=workflow,
                               review_policy=review_policy)
-        if scope.get("browser_login") is not None:
+        if scope.get("browser_login") is not None or not scope.get('authentication'):
             from browser_access import BrowserAccounts
             browser = BrowserAccounts(scope, os.environ["PATCHRIOT_BRIDGE_URL"])
             if scope.get("account_policy") is not None and role != "investigator":
@@ -440,7 +440,13 @@ def main():
                         for p in tools['discovery_plan']):
             import artex
             from report_finish import bridge
-            if browser is not None:
+            if browser is not None and not scope.get('authentication'):
+                public_agent = AIAgent(**{**agent_options, 'max_iterations':40})
+                login_agents.append(public_agent)
+                public_agent.run_budget_seconds = max(1, min(600, started + budget - 30 - time.monotonic()))
+                event('phase', name='public_browser_preparation')
+                public_agent.run_conversation(live_review.public_browser_prompt())
+            if browser is not None and scope.get('authentication'):
                 # Login uses the existing private browser helper, not the engine.
                 # The broker's paired evidence, never this model answer, grants access.
                 access_prepared = True
@@ -510,7 +516,7 @@ def main():
         )
         if live:
             live_review.validation_brief(Path('/work'))
-            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran, paired=scope.get("account_policy") is not None) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran, paired=scope.get("account_policy") is not None, public_browser=not scope.get('authentication')) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         if live:
             import report_finish

@@ -20,6 +20,14 @@ ADDRESS = '0x1111111111111111111111111111111111111111'
 
 
 class ObservedAccessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_browser_cannot_start_login_fill_credentials_or_sign(self):
+        browser = BrowserAccess({'origins':[ORIGIN]}, 'http://127.0.0.1:1')
+        browser.call = AsyncMock()
+        for command in ('begin', 'fill', 'check', 'approve', 'legacy'):
+            with self.assertRaisesRegex(ValueError, 'does not authorize account login'):
+                await browser.operation({'command':command})
+        browser.call.assert_not_called()
+
     def browser(self):
         browser = BrowserAccess({'origins':[ORIGIN], 'authentication':'session', 'browser_login':{}}, 'http://127.0.0.1:1')
         browser.context = SimpleNamespace(cookies=AsyncMock(return_value=[{'name':'session','value':'private-fixture'}]))
@@ -226,6 +234,111 @@ class BrowserFixtures(unittest.IsolatedAsyncioTestCase):
         page=self.browser.context.pages[0]
         await page.goto(ORIGIN)
         return page
+
+    async def test_public_browser_submits_discovered_chat_without_login_permission(self):
+        browser = BrowserAccess({'origins':[ORIGIN], 'methods':['GET','POST']}, 'unused',
+            directory=self.directory.name, executable=os.environ.get('PATCHRIOT_BROWSER_EXECUTABLE','/usr/bin/chromium'))
+        self.browser = browser
+        calls = []
+        async def broker(path, data):
+            self.assertEqual(path, 'http')
+            self.assertFalse(data['authenticated'])
+            self.assertFalse(data['login'])
+            calls.append(data)
+            if data['method'] == 'POST':
+                self.assertEqual(data['url'], ORIGIN + '/observed-message')
+                self.assertEqual(json.loads(data['data']), {'question':'A benign fixture question'})
+                self.assertIn('visitor=synthetic-visitor', data['headers'].get('cookie',''))
+                body, kind = '{"reply":"Fixture reply received"}', 'application/json'
+                headers = []
+            else:
+                body = '''<button onclick="document.querySelector('form').hidden=false">Help desk</button>
+<form hidden><textarea aria-label="Question"></textarea><button>Send</button></form><p id="answer"></p>
+<script>document.querySelector('form').onsubmit=async e=>{e.preventDefault();
+const r=await fetch('/observed-message',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({question:document.querySelector('textarea').value})});
+document.querySelector('#answer').textContent=(await r.json()).reply;};</script>'''
+                kind, headers = 'text/html', [['set-cookie','visitor=synthetic-visitor; Secure; HttpOnly; Path=/']]
+            return {'evidence':{'id':len(calls),'status':200,'error':None},
+                'headers':[['content-type',kind],*headers], 'body_base64':base64.b64encode(body.encode()).decode()}
+        browser.call = broker
+        await browser.start()
+        page = browser.context.pages[0]
+        await page.goto(ORIGIN)
+        await page.get_by_role('button',name='Help desk').click()
+        await page.get_by_role('textbox',name='Question').fill('A benign fixture question')
+        await page.get_by_role('button',name='Send').click()
+        await page.wait_for_function("document.querySelector('#answer').textContent.includes('received')")
+        self.assertEqual(len([c for c in calls if c['method']=='POST']), 1)
+        self.assertFalse(browser.verified)
+
+    async def test_email_code_form_uses_approved_api_and_read_only_assets(self):
+        api, cdn = 'https://api.example', 'https://static.example'
+        browser = BrowserAccess({'origins':[api, ORIGIN], 'browser_entry_origin':ORIGIN,
+            'browser_resource_origins':[cdn], 'authentication':'session','browser_login':{}}, 'unused',
+            directory=self.directory.name, executable=os.environ.get('PATCHRIOT_BROWSER_EXECUTABLE','/usr/bin/chromium'))
+        self.browser = browser
+        calls = []
+        async def broker(path, data):
+            if path == 'credentials': return {'username':'fixture@example.com','password':'123456'}
+            if path == 'begin': return {'login_submissions':8,'expires_in_seconds':300}
+            if path == 'check':
+                self.assertEqual(data['url'], api + '/member')
+                self.assertEqual(data['headers']['authorization'], 'Bearer synthetic-fixture-token')
+                return {'verified':True, 'evidence':[]}
+            self.assertEqual(path, 'http')
+            calls.append(data)
+            headers = [['access-control-allow-origin',ORIGIN],['access-control-allow-headers','content-type,authorization']]
+            if data['url'].startswith(cdn):
+                self.assertFalse(data['authenticated'])
+                self.assertFalse(data['login'])
+                body, kind = 'window.fixtureAssetLoaded=true;', 'application/javascript'
+            elif data['method'] == 'OPTIONS':
+                body, kind = '', 'text/plain'
+            elif data['url'] == api + '/start':
+                self.assertEqual(json.loads(data['data']), {'email':'fixture@example.com'})
+                self.assertTrue(data['login'])
+                body, kind = '{}', 'application/json'
+            elif data['url'] == api + '/finish':
+                self.assertEqual(json.loads(data['data']), {'code':'123456'})
+                self.assertEqual(data['headers']['origin'], ORIGIN)
+                body, kind = '{"token":"synthetic-fixture-token"}', 'application/json'
+            elif data['url'] == api + '/member':
+                self.assertEqual(data['headers']['authorization'], 'Bearer synthetic-fixture-token')
+                body, kind = '{"email":"fixture@example.com"}', 'application/json'
+            else:
+                self.assertTrue(data['url'].startswith(ORIGIN))
+                body = f'''<script src="{cdn}/app.js"></script>
+<input type="email" id="email"><button id="start">Send code</button>
+<input id="code" hidden><button id="finish" hidden>Verify</button><p id="account"></p>
+<script>
+document.querySelector('#start').onclick=async()=>{{
+await fetch('{api}/start',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{email:document.querySelector('#email').value}})}});
+document.querySelector('#code').hidden=false;document.querySelector('#finish').hidden=false;}};
+document.querySelector('#finish').onclick=async()=>{{
+const r=await fetch('{api}/finish',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{code:document.querySelector('#code').value}})}});
+const t=(await r.json()).token;
+document.querySelector('#account').textContent=(await (await fetch('{api}/member',{{headers:{{authorization:'Bearer '+t}}}})).json()).email;}};
+</script>'''
+                kind = 'text/html'
+            return {'evidence':{'id':len(calls),'status':200,'error':None,'authenticated':data['url']==api+'/member'},
+                'headers':[['content-type',kind],*headers], 'body_base64':base64.b64encode(body.encode()).decode()}
+        browser.call = broker
+        await browser.start()
+        page = browser.context.pages[0]
+        await page.goto(ORIGIN)
+        await page.wait_for_function('window.fixtureAssetLoaded === true')
+        await browser.operation({'command':'begin'})
+        await browser.operation({'command':'fill','username':'#email'})
+        await page.get_by_role('button',name='Send code').click()
+        await browser.operation({'command':'fill','password':'#code'})
+        await page.get_by_role('button',name='Verify',exact=True).click()
+        await page.wait_for_function("document.querySelector('#account').textContent.includes('@')")
+        self.assertTrue((await browser.operation({'command':'check','url':api+'/member'}))['verified'])
+        before = len(calls)
+        await page.evaluate("fetch('https://unapproved.example/').catch(()=>null)")
+        await page.evaluate(f"fetch('{cdn}/submit',{{method:'POST'}}).catch(()=>null)")
+        self.assertEqual(len(calls), before)
+        self.assertIn('https://unapproved.example', browser.blocked_origins)
 
     async def test_observed_resource_fallback_finishes_login_without_model_chosen_endpoint(self):
         page=await self.start('session')

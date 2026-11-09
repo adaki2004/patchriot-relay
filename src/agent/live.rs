@@ -527,7 +527,7 @@ impl LiveBroker {
                 return Err("invalid_environment_gate".into());
             };
             if !gate.valid()
-                || self.scope.origins.len() != 1
+                || self.scope.origins.len() != 1 && self.scope.browser_entry_origin.is_none()
                 || matches!(
                     self.scope.authentication,
                     Some(TestAuthKind::Basic | TestAuthKind::Bearer)
@@ -549,7 +549,7 @@ impl LiveBroker {
             ] {
                 inner.access.remember_supplied_secret(secret.to_owned())?;
             }
-            inner.environment_gate = Some((inner.scope.origins[0].clone(), header));
+            inner.environment_gate = Some((inner.scope.browser_entry().to_owned(), header));
             if let Some(reference) = inner.reference.take() {
                 inner.reference = Some(reference.with_environment_gate(Some(gate))?);
             }
@@ -1899,6 +1899,78 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn late_workflows_cannot_replace_the_checklist_or_discard_one_report() {
+        for late_count in [1, 3, 4] {
+            let broker = broker();
+            let checks = [
+                "public_baseline",
+                "public_mapping",
+                "public_signatures",
+                "public_fingerprints",
+                "public_analysis",
+                "authentication",
+                "authenticated_checks",
+                "evidence_review",
+            ]
+            .map(|id| json!({"id":id,"state":"pending","evidence_count":0}));
+            let initial = json!({"version":1,"checks":checks});
+            assert!(broker.accept_workflow(&initial));
+            let mut command = std::process::Command::new("python3");
+            command.current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/agent"));
+            command.args(["-c", &format!(
+                "import adapter; adapter.event('phase', name='agent_ready'); [adapter.event('workflow', workflow={{'private_target_text':'must-not-be-retained'}}) for _ in range({late_count})]; adapter.event('result', completed=True, final_response='Saved assessment')"
+            )]);
+            let report = supervise(
+                command,
+                Bridge::Live(broker.clone()),
+                &|| false,
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(broker.workflow.lock().unwrap().as_ref().unwrap()).unwrap(),
+                initial
+            );
+            assert!(
+                !serde_json::to_string(&report.events)
+                    .unwrap()
+                    .contains("private_target_text")
+            );
+            if late_count <= 3 {
+                assert_eq!(report.outcome, "completed");
+                assert_eq!(
+                    report.events.last().unwrap()["data"]["final_response"],
+                    "Saved assessment"
+                );
+            } else {
+                assert_eq!(report.failure_reason, Some("invalid_workflow_event"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_startup_workflow_still_stops_the_runner() {
+        let mut command = std::process::Command::new("python3");
+        command.current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/agent"));
+        command.args(["-c", "import adapter; adapter.event('phase', name='scoped_tools'); adapter.event('workflow', workflow={'version':1,'checks':[]}); adapter.event('result', completed=True)"]);
+        let report = supervise(
+            command,
+            Bridge::Live(broker()),
+            &|| false,
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.failure_reason, Some("invalid_workflow_event"));
+        assert!(!report.events.iter().any(|e| e["event"] == "result"));
+    }
+
+    #[tokio::test]
     async fn a_rejected_engine_message_preserves_the_following_report() {
         let mut broker = broker();
         Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
@@ -1976,6 +2048,8 @@ mod tests {
                 session_login: None,
                 wallet_login: None,
                 browser_login: None,
+                browser_entry_origin: None,
+                browser_resource_origins: vec![],
                 account_policy: None,
                 origins: vec!["https://example.com".into()],
                 objective: "Owned fixture".into(),
