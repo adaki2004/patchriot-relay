@@ -635,6 +635,7 @@ async fn supervise(
     let mut exited = false;
     let mut final_seen = false;
     let mut live_phase = patchriot_protocol::pentests::LivePhase::Starting;
+    let mut browser_exploration = None;
     let mut completed_tools = 0u8;
     let mut late_workflows = 0u8;
     let mut last_tool = "none";
@@ -671,7 +672,7 @@ async fn supervise(
                     let model_request = active_model.map(|(since, purpose)| patchriot_protocol::pentests::LiveModelProgress {
                         purpose, elapsed_seconds: since.elapsed().as_secs().min(MAX_AGENT_ATTEMPT_SECONDS) as u32,
                     });
-                    broker.update_progress(progress, live_phase, completed_tools, model_request);
+                    broker.update_progress(progress, live_phase, browser_exploration, completed_tools, model_request);
                 }
             }
             n = stderr.read(&mut err), if err_open => {
@@ -815,6 +816,17 @@ async fn supervise(
                             }
                             if event == "phase" && data["name"] == "agent_ready" {
                                 live_phase = patchriot_protocol::pentests::LivePhase::Investigating;
+                            }
+                            // These adapter events describe activity, not proof of
+                            // coverage. Do not infer it from elapsed time or calls.
+                            if event == "phase" && live_phase == patchriot_protocol::pentests::LivePhase::ScopedTools {
+                                use patchriot_protocol::pentests::BrowserExploration;
+                                if data["name"] == "public_browser_preparation" {
+                                    browser_exploration = Some(BrowserExploration::Running);
+                                } else if data["name"] == "scoped_discovery"
+                                    && browser_exploration == Some(BrowserExploration::Running) {
+                                    browser_exploration = Some(BrowserExploration::Returned);
+                                }
                             }
                             if event == "phase"
                                 && let Some(name) = data["name"].as_str().filter(|name| [

@@ -324,6 +324,7 @@ impl LiveBroker {
         &self,
         progress: &Progress,
         phase: LivePhase,
+        browser_exploration: Option<BrowserExploration>,
         completed_tools: u8,
         model_request: Option<LiveModelProgress>,
     ) {
@@ -384,6 +385,7 @@ impl LiveBroker {
             *current = LiveProgress {
                 workflow,
                 phase,
+                browser_exploration,
                 http_requests: count.evidence.len() as u16,
                 inference_calls: count.calls,
                 completed_tools,
@@ -2203,6 +2205,65 @@ mod tests {
         assert_eq!(observed.inference_calls, 0);
     }
     #[tokio::test]
+    async fn browser_activity_uses_explicit_events_and_never_completes_a_check() {
+        for (names, expected) in [
+            (
+                vec!["scoped_tools", "public_browser_preparation"],
+                Some(BrowserExploration::Running),
+            ),
+            (
+                vec![
+                    "scoped_tools",
+                    "public_browser_preparation",
+                    "scoped_discovery",
+                    "agent_ready",
+                ],
+                Some(BrowserExploration::Returned),
+            ),
+            (
+                vec![
+                    "scoped_tools",
+                    "access_preparation",
+                    "scoped_discovery",
+                    "agent_ready",
+                ],
+                None,
+            ),
+            (vec!["agent_ready", "public_browser_preparation"], None),
+        ] {
+            let events: Vec<_> = names
+                .iter()
+                .map(|name| json!({"type":"event","event":"phase","data":{"name":name}}))
+                .collect();
+            let script = events
+                .iter()
+                .map(|event| format!("printf '%s\\n' '{event}'"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\nsleep 0.1";
+            let mut command = std::process::Command::new("/bin/sh");
+            command.env_clear().args(["-c", &script]);
+            let progress = Progress::default();
+            let broker = broker();
+            let _report = supervise(
+                command,
+                Bridge::Live(broker),
+                &|| false,
+                Duration::from_secs(2),
+                None,
+                Some(&progress),
+            )
+            .await
+            .unwrap();
+            let snapshot = progress.lock().unwrap();
+            assert_eq!(snapshot.browser_exploration, expected, "{names:?}");
+            assert_eq!(snapshot.workflow, None);
+            assert_eq!(snapshot.inference_calls, 0);
+            assert_eq!(snapshot.completed_tools, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn bounded_model_requests_do_not_spend_the_retained_output_allowance() {
         let mut broker = broker();
         Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
@@ -3045,7 +3106,7 @@ for _ in range(270): print(frame,flush=True)
         let workflow = AssessmentWorkflow { version: 2, checks };
         assert!(broker.accept_workflow(&serde_json::to_value(workflow).unwrap()));
         let progress = Progress::default();
-        broker.update_progress(&progress, LivePhase::Investigating, 0, None);
+        broker.update_progress(&progress, LivePhase::Investigating, None, 0, None);
         assert_eq!(
             progress
                 .lock()
@@ -3085,7 +3146,7 @@ for _ in range(270): print(frame,flush=True)
             (LivePhase::Investigating, CheckState::Running),
             (LivePhase::Finishing, CheckState::Running),
         ] {
-            broker.update_progress(&progress, phase, 0, None);
+            broker.update_progress(&progress, phase, None, 0, None);
             let observed = progress.lock().unwrap();
             let checks = &observed.workflow.as_ref().unwrap().checks;
             assert_eq!(
@@ -3113,7 +3174,7 @@ for _ in range(270): print(frame,flush=True)
                 .unwrap()
                 .state = state;
             assert!(broker.accept_workflow(&serde_json::to_value(saved).unwrap()));
-            broker.update_progress(&progress, LivePhase::Investigating, 0, None);
+            broker.update_progress(&progress, LivePhase::Investigating, None, 0, None);
             assert_eq!(
                 progress
                     .lock()
@@ -3155,7 +3216,7 @@ for _ in range(270): print(frame,flush=True)
                 check: BrowserAccessCheck::ProtectedResource,
             });
             let progress = Progress::default();
-            broker.update_progress(&progress, LivePhase::ScopedTools, 0, None);
+            broker.update_progress(&progress, LivePhase::ScopedTools, None, 0, None);
             let observed = progress.lock().unwrap();
             let checks = &observed.workflow.as_ref().unwrap().checks;
             let auth = checks
