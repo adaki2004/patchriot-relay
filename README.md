@@ -88,6 +88,8 @@ The browser reuses explicitly public, immutable scripts, styles, fonts and image
 
 Completed reports are saved before upload. Temporary delivery failures retry the same report while its lease stays active; they never rerun paid inference. Large report uploads have a separate 30-second timeout. Expired or cancelled work cannot be revived by a retry.
 
+If Hermes reports its typed conversation-context exhaustion, the adapter may make one fresh continuation in the same container from retained evidence. This is limited to 32 turns and ten minutes within the original role's remaining time, request and inference budgets. It does not restart discovery or reset permissions. Only a newly completed report that passes the broker's current-role citation checks can replace the interrupted response; it includes a context-recovery limitation. Other failures, invalid recovery reports and insufficient remaining time retain the original failure.
+
 Interrupted execution and rejected delivery preserve one bounded recovery file, `last-interrupted-work.json`, in the private device state directory with mode `0600`. It contains the lease ID, collected evidence and execution/cost receipt. It is an operator diagnostic artifact and requires operator-managed deletion after recovery. The relay keeps the paid-start marker and waits for the lease to close when a restarted process receives that assignment again.
 
 

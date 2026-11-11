@@ -506,6 +506,11 @@ def main():
             prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran, paired=scope.get("account_policy") is not None, public_browser=not scope.get('authentication')) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         if live:
+            import conversation_recovery
+            result = conversation_recovery.recover(result, prompt, started + budget - 30,
+                factory=lambda seconds, turns: AIAgent(**{**agent_options,
+                    'run_budget_seconds': seconds, 'max_iterations': turns}),
+                emit=lambda **data: event('phase', name='context_recovery', **data))
             import report_finish
             result = report_finish.finish(agent, result, started + budget - 30,
                 emit=report_validation)

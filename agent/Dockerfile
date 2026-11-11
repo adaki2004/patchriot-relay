@@ -41,7 +41,7 @@ COPY --from=engine /src/skills /opt/artex/skills
 COPY --from=engine /src/LICENSE /usr/share/licenses/artex/LICENSE
 COPY --from=engine /tmp/artex.tar.gz /usr/share/licenses/artex/corresponding-source.tar.gz
 COPY --from=engine /out/dependency-source.tar.gz /usr/share/licenses/artex/dependency-source.tar.gz
-COPY scoped_scanners.py schema_cases.py coverage_ledger.py adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py baseline.py artex.py ares_web.py workflow.py report_finish.py /patchriot/
+COPY scoped_scanners.py schema_cases.py coverage_ledger.py adapter.py access.py check.py inspect_site.py inspect_source.py live_http.py live_review.py live-review-skill.txt web_tools.py baseline.py artex.py ares_web.py workflow.py report_finish.py conversation_recovery.py /patchriot/
 COPY ares-LICENSE.txt /usr/share/licenses/ares/LICENSE
 COPY browser_access.py browser_wallet.js test_browser_access.py /patchriot/
 COPY templates /patchriot/templates

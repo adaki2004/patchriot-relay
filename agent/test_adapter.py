@@ -21,6 +21,24 @@ import live_review
 
 @unittest.skipUnless(os.environ.get('PATCHRIOT_HERMES_SMOKE') == '1', 'requires the pinned isolated Hermes image')
 class CompressionRuntimeTests(unittest.TestCase):
+    def test_pinned_context_overflow_has_typed_recovery_metadata(self):
+        script = '''from unittest.mock import Mock
+from agent.conversation_loop import _provider_overflow_exhausted_result
+agent=Mock();agent.model='owned-fixture';agent.log_prefix=''
+result=_provider_overflow_exhausted_result(agent, [], [], 5, 70000, 3)
+assert result['failed'] is True
+assert result['compression_exhausted'] is True
+assert result['turn_exit_reason']=='context_compression_exhausted'
+assert result['failure_reason']=='context_overflow'
+agent._persist_session.assert_called_once()
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            env={'PATH':os.environ['PATH'],'HOME':temp,'HERMES_HOME':temp,
+                 'PYTHONPATH':'/opt/hermes','PYTHONDONTWRITEBYTECODE':'1'}
+            result=subprocess.run([sys.executable,'-c',script],env=env,
+                capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stderr[-2000:])
+
     def test_real_login_preparation_stops_after_trusted_access_proof(self):
         calls = []
         class Model(BaseHTTPRequestHandler):
