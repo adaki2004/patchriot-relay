@@ -72,7 +72,7 @@ def default_account():
 
 def request(method, url, headers=None, data=None, authenticated=True, *, discovery=False, account=None):
     body = json.dumps({"method": method.upper(), "url": url, "headers": headers or {}, "data": data, "authenticated": authenticated}).encode()
-    path = "/patchriot/artex/http" if discovery else "/patchriot/http"
+    path = "/patchriot/discovery/http" if discovery else "/patchriot/http"
     account = account or default_account()
     if account not in ('testing', 'reference'): raise ValueError('Unknown account context')
     if account == 'reference': path = path.replace('/patchriot/', '/patchriot/accounts/reference/', 1)

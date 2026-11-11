@@ -234,7 +234,7 @@ class LiveOverviewTests(unittest.TestCase):
         coverage = {'stop_reason':'done', 'coverage_complete':True,
             'access_mode':'anonymous_and_authenticated', 'anonymous_evidence_count':12,
             'authenticated_evidence_count':9, 'authentication_requested':True}
-        record = {'tool':'artex-engine', 'exit_code':0, 'failure':None,
+        record = {'tool':'patchriot-discovery', 'exit_code':0, 'failure':None,
             'evidence_ids':list(range(1, 30)), 'output_truncated':False,
             'output_excerpt':json.dumps({**coverage, 'commands':'long untrusted output'})}
         previous = [{'role':'investigator', 'assessment':{'summary':'Unverified prior claim',
@@ -255,11 +255,11 @@ class LiveOverviewTests(unittest.TestCase):
             self.assertEqual(brief[0]['engine_coverage'], [coverage])
             self.assertEqual(brief[0]['limitations'], ['Claimed no login'])
         self.assertEqual(live_review.engine_coverage([
-            {'tool':'artex-engine', 'output_excerpt':'truncated {'},
-            {'tool':'artex-engine', 'output_excerpt':'[]'}, {'tool':'nuclei'}]), [])
+            {'tool':'patchriot-discovery', 'output_excerpt':'truncated {'},
+            {'tool':'patchriot-discovery', 'output_excerpt':'[]'}, {'tool':'nuclei'}]), [])
 
     def test_validation_only_never_restarts_missing_discovery_and_preserves_claim_evidence(self):
-        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        scope = {'origins':['https://owned.example'], 'tools':['scoped_discovery_v1']}
         previous = [{'role':'investigator', 'assessment':{'summary':'Owned fixture', 'findings':[
             {'title':'Fixture claim', 'evidence_ids':[7]}]}, 'evidence':[{'id':7,'url':'https://owned.example/api','status':403}]}]
         plan = live_review.discovery_plan('reproducer', scope, previous, 'investigate_validate_v1')
@@ -288,36 +288,35 @@ class LiveOverviewTests(unittest.TestCase):
         self.assertNotIn('Your first investigation task is to establish', prepared)
         self.assertIn('not another general scan', prepared)
         prompt = live_review.prompt('reproducer', review_policy='investigate_validate_v1')
-        self.assertIn('Do not run ARTEX', prompt)
+        self.assertIn('Do not repeat scoped scanners', prompt)
         self.assertIn('fresh', prompt)
 
 
     def test_limited_scan_hands_evidence_to_targeted_review_without_broad_rescan(self):
-        import artex
         import copy
-        scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
+        scope = {'origins': ['https://owned.example'], 'tools': ['scoped_discovery_v1']}
         for reason in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress', 'provider_repetition'):
             with self.subTest(reason=reason):
-                detail = {'engine': 'ARTEX', 'stop_reason': reason, 'coverage_complete': False,
+                detail = {'engine': 'Patchriot scoped discovery', 'receipt_schema': 1, 'stop_reason': reason, 'coverage_complete': False,
                           'failure': 'incomplete'}
-                record = {'tool': 'artex-engine', 'exit_code': 0, 'failure': 'incomplete',
+                record = {'tool': 'patchriot-discovery', 'exit_code': 0, 'failure': 'incomplete',
                           'output_truncated': False, 'evidence_ids': [7],
-                          'output_excerpt': artex.receipt_summary(detail, json.dumps(detail))}
+                          'output_excerpt': json.dumps(detail)}
                 first = {'role': 'investigator', 'assessment': None, 'tool_runs': [record],
                          'evidence': [{'id': 7, 'url': 'https://owned.example/api', 'status': 403}]}
                 saved = copy.deepcopy(first)
                 for role, previous in [('reproducer', [first]), ('challenger', [first, {'role': 'reproducer', 'tool_runs': []}])]:
                     plan = live_review.discovery_plan(role, scope, previous)[-1]
-                    self.assertEqual(plan, {'tool':'artex-engine','action':'reuse_partial',
+                    self.assertEqual(plan, {'tool':'patchriot-discovery','action':'reuse_partial',
                         'source_role':'investigator','coverage_complete':False,'stop_reason':reason})
                 self.assertEqual(first, saved, 'Original incomplete receipt and evidence must stay intact')
                 self.assertIn('coverage remains incomplete', live_review.prompt('reproducer'))
 
     def test_partial_scan_without_usable_evidence_or_known_stop_still_recovers(self):
         import copy
-        base = {'role': 'investigator', 'tool_runs': [{'tool': 'artex-engine', 'exit_code': 0,
+        base = {'role': 'investigator', 'tool_runs': [{'tool': 'patchriot-discovery', 'exit_code': 0,
             'failure': 'incomplete', 'output_truncated': False, 'evidence_ids': [7],
-            'output_excerpt': json.dumps({'receipt_schema':1,'engine':'ARTEX','stop_reason':'time_budget',
+            'output_excerpt': json.dumps({'receipt_schema':1,'engine':'Patchriot scoped discovery','stop_reason':'time_budget',
                                          'coverage_complete':False,'failure':'incomplete'})}],
             'evidence': [{'id':7,'url':'https://owned.example/','status':200}]}
         variants = []
@@ -332,18 +331,33 @@ class LiveOverviewTests(unittest.TestCase):
             detail['stop_reason']=reason;record['tool_runs'][0]['output_excerpt']=json.dumps(detail);variants.append(record)
         for record in variants:
             with self.subTest(record=record):
-                plan=live_review.discovery_plan('reproducer',{'origins':['https://owned.example'],'tools':['artex_engine_v1']},[record])
+                plan=live_review.discovery_plan('reproducer',{'origins':['https://owned.example'],'tools':['scoped_discovery_v1']},[record])
                 self.assertEqual(plan[-1]['action'],'recover')
 
+    def test_deep_aggregate_is_reused_but_unknown_engine_partials_are_not(self):
+        scope = {'origins':['https://owned.example'], 'tools':['scoped_discovery_v1','deep_checks_v1'],
+                 'check_groups':['public_deep']}
+        receipt = {'tool':'patchriot-deep', 'arguments':['/patchriot/deep_checks.py','--deep-suite'],
+            'exit_code':0, 'failure':None, 'evidence_ids':[7], 'output_truncated':False,
+            'output_excerpt':json.dumps({'receipt_schema':1,'engine':'Patchriot deep checks','coverage_complete':True})}
+        report = {'role':'investigator','tool_runs':[receipt],
+                  'evidence':[{'id':7,'url':'https://owned.example/','status':200}]}
+        self.assertEqual(live_review.discovery_plan('reproducer', scope, [report])[0]['action'], 'reuse')
+        receipt.update(failure='incomplete', output_excerpt=json.dumps({
+            'receipt_schema':1,'engine':'unknown retired engine','coverage_complete':False,
+            'failure':'incomplete','stop_reason':'time_budget'}))
+        self.assertIsNone(live_review.reusable_partial(receipt, report, scope))
+        self.assertEqual(live_review.discovery_plan('reproducer', scope, [report])[0]['action'], 'recover')
+
     def test_missing_discovery_is_recovered_once_without_repeating_finished_tools(self):
-        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        scope = {'origins':['https://owned.example'], 'tools':['scoped_discovery_v1']}
         first = {'role':'investigator', 'assessment':None, 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[
             {'tool':name, 'exit_code':0, 'failure':None, 'evidence_ids':[1]}
             for name in ['patchriot-baseline','patchriot-crawl','nuclei','ares-web-surface']]}
         plan = live_review.discovery_plan('reproducer', scope, [first])
-        self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['artex-engine'])
+        self.assertEqual([p['tool'] for p in plan if p['action']=='recover'], ['patchriot-discovery'])
         self.assertEqual([p['action'] for p in plan[:3]], ['reuse'] * 3)
-        second = {'role':'reproducer', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[{'tool':'artex-engine','exit_code':None,'failure':'incomplete','evidence_ids':[1]}]}
+        second = {'role':'reproducer', 'evidence':[{'id':1,'status':200,'url':'https://owned.example/'}], 'tool_runs':[{'tool':'patchriot-discovery','exit_code':None,'failure':'incomplete','evidence_ids':[1]}]}
         plan = live_review.discovery_plan('challenger', scope, [first, second])
         self.assertEqual(plan[-1]['action'], 'unavailable')
         second['tool_runs'][0].update(exit_code=0, failure=None)
@@ -353,12 +367,12 @@ class LiveOverviewTests(unittest.TestCase):
 
     def test_finished_engine_reuses_retained_work_with_individual_response_gaps(self):
         import copy
-        scope = {'origins':['https://owned.example'], 'tools':['artex_engine_v1']}
+        scope = {'origins':['https://owned.example'], 'tools':['scoped_discovery_v1']}
         report = {'role':'investigator', 'evidence':[
             {'id':1, 'status':200, 'url':'https://owned.example/'},
             {'id':2, 'status':200, 'url':'https://owned.example/large', 'error':'browser_json_too_wide'},
             {'id':3, 'status':None, 'url':'https://owned.example/unavailable', 'error':'request_error'}],
-            'tool_runs':[{'tool':'artex-engine', 'exit_code':0, 'failure':None,
+            'tool_runs':[{'tool':'patchriot-discovery', 'exit_code':0, 'failure':None,
                          'output_truncated':False, 'evidence_ids':[1, 2, 3]}]}
         original = copy.deepcopy(report)
         plan = live_review.discovery_plan('reproducer', scope, [report], 'investigate_validate_v1')
@@ -389,7 +403,7 @@ class LiveOverviewTests(unittest.TestCase):
                          [{'role':'investigator','tool_runs':[{'tool':'nuclei','exit_code':1,'failure':'timeout'}]}]]:
             plan = live_review.discovery_plan('reproducer', scope, previous)
             self.assertTrue(all(p['action']=='recover' for p in plan))
-            self.assertNotIn('artex-engine', [p['tool'] for p in plan])
+            self.assertNotIn('patchriot-discovery', [p['tool'] for p in plan])
 
     def test_two_large_role_reports_reach_the_runner_without_truncation(self):
         previous = [{"role": role, "evidence": [{"id": 1, "body_excerpt": "x" * (4 * 1024 * 1024 - 4096)}]}
@@ -475,7 +489,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_finished_discovery_rejects_queued_calls_but_allows_the_reviewer(self):
         adapter.engine_stopping.set()
-        for path in ['/patchriot/artex/v1/chat/completions', '/patchriot/artex/http']:
+        for path in ['/patchriot/discovery/v1/chat/completions', '/patchriot/discovery/http']:
             result, requests = self.exchange([], 'POST', path, '{}')
             self.assertEqual(result[0], 429)
             self.assertEqual(requests, [])
@@ -499,7 +513,7 @@ class BridgeTests(unittest.TestCase):
                 frames=[{'type':'start','id':1,'status':429,'content_type':'application/json'},
                         {'type':'chunk','id':1,'hex':payload[:10].hex()},
                         {'type':'chunk','id':1,'hex':payload[10:].hex()}, {'type':'end','id':1}]
-                result, requests=self.exchange(frames,'POST','/patchriot/artex/v1/chat/completions','{}')
+                result, requests=self.exchange(frames,'POST','/patchriot/discovery/v1/chat/completions','{}')
                 self.assertEqual(result[0],429)
                 self.assertTrue(adapter.engine_stopping.is_set())
                 self.assertEqual(adapter.engine_stop_reason,expected)
@@ -647,7 +661,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(wire), 1)
 
     def test_oversized_engine_input_ends_discovery_without_stopping_the_reviewer(self):
-        result, wire = self.exchange([], 'POST', '/patchriot/artex/v1/chat/completions',
+        result, wire = self.exchange([], 'POST', '/patchriot/discovery/v1/chat/completions',
             headers={'Content-Length':str(adapter.MAX_REQUEST + 1)})
         self.assertEqual(result[0], 413)
         self.assertEqual(wire, [])
@@ -661,7 +675,7 @@ class BridgeTests(unittest.TestCase):
             {'type':'chunk','id':1,'hex':b'{"error":"engine_http_budget_reached"}'.hex()},
             {'type':'end','id':1},
         ]
-        result, _ = self.exchange(frames, 'POST', '/patchriot/artex/http', '{}')
+        result, _ = self.exchange(frames, 'POST', '/patchriot/discovery/http', '{}')
         self.assertEqual(result[0], 429)
         self.assertTrue(adapter.engine_stopping.is_set())
         self.assertEqual(adapter.engine_stop_reason, 'target_request_budget')
@@ -674,7 +688,7 @@ class BridgeTests(unittest.TestCase):
     def test_an_invalid_discovery_probe_does_not_end_all_discovery(self):
         frames = [{'type':'start','id':1,'status':400,'content_type':'application/json'},
                   {'type':'end','id':1}]
-        result, _ = self.exchange(frames, 'POST', '/patchriot/artex/http', '{}')
+        result, _ = self.exchange(frames, 'POST', '/patchriot/discovery/http', '{}')
         self.assertEqual(result[0], 400)
         self.assertFalse(adapter.engine_stopping.is_set())
 
@@ -684,14 +698,14 @@ class BridgeTests(unittest.TestCase):
             {'type':'chunk','id':1,'hex':b'{"error":"provider_rate_limited"}'.hex()},
             {'type':'end','id':1},
         ]
-        result, wire = self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+        result, wire = self.exchange(frames, 'POST', '/patchriot/discovery/v1/chat/completions', '{}')
         self.assertEqual(result[0], 429)
         self.assertEqual(json.loads(result[2])['error'], 'provider_rate_limited')
         self.assertEqual(len(wire), 1, 'Do not replay a paid request')
         self.assertFalse(adapter.engine_stopping.is_set())
         self.assertFalse(adapter.bridge_stopping.is_set())
         for attempt in range(2):
-            result, wire = self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+            result, wire = self.exchange(frames, 'POST', '/patchriot/discovery/v1/chat/completions', '{}')
             self.assertEqual(len(wire), 1)
             self.assertEqual(adapter.engine_stopping.is_set(), attempt == 1)
         self.assertEqual(adapter.engine_stop_reason, 'provider_rate_limited')
@@ -710,12 +724,12 @@ class BridgeTests(unittest.TestCase):
         ok[0]['status'] = 200
         ok[1]['hex'] = b'{"choices":[]}'.hex()
         for _ in range(6):
-            self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+            self.exchange(frames, 'POST', '/patchriot/discovery/v1/chat/completions', '{}')
             self.assertFalse(adapter.engine_stopping.is_set())
-            self.exchange(ok, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+            self.exchange(ok, 'POST', '/patchriot/discovery/v1/chat/completions', '{}')
         self.assertEqual(adapter.engine_recovery.snapshot(), {'rate_limit_responses':6,
             'successful_replies_after_rate_limit':6, 'unrecovered_rate_limit_responses':0})
-        self.exchange(frames, 'POST', '/patchriot/artex/v1/chat/completions', '{}')
+        self.exchange(frames, 'POST', '/patchriot/discovery/v1/chat/completions', '{}')
         self.assertTrue(adapter.engine_stopping.is_set())
 
     def test_phase_name_is_data_and_events_remain_bounded(self):

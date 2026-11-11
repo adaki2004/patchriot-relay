@@ -17,8 +17,8 @@ mod wallet;
 #[cfg(test)]
 pub const MODEL: &str = LiveProvider::MODELS[0];
 pub const MAX_FRAME: usize = 512 * 1024;
-pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
-const ENGINE_HTTP: &str = "/patchriot/artex/http";
+pub const ENGINE_CHAT: &str = "/patchriot/discovery/v1/chat/completions";
+const ENGINE_HTTP: &str = "/patchriot/discovery/http";
 pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
 // addition to the byte limit without cutting the expanded role allowance in half.
@@ -101,19 +101,6 @@ const HTTP_RECORD_RESERVE: usize = 256 * 1024;
 const ENGINE_HTTP_LIMIT: usize = MAX_HTTP_REQUESTS - 500;
 const ENGINE_EVIDENCE_LIMIT: usize = HTTP_EVIDENCE_BUDGET - 2 * 1024 * 1024;
 pub type Progress = Mutex<LiveProgress>;
-
-/// Generated form data identifies an authorized test, not the internal engine.
-/// Reject before sending rather than changing a probe behind the report's back.
-fn engine_branded_data(body: &Value) -> bool {
-    let Some(data) = body.get("data").and_then(Value::as_str) else {
-        return false;
-    };
-    if let Ok(value) = serde_json::from_str::<Value>(data) {
-        return value.to_string().to_ascii_lowercase().contains("artex");
-    }
-    url::form_urlencoded::parse(data.as_bytes())
-        .any(|(_, value)| value.to_ascii_lowercase().contains("artex"))
-}
 
 fn assessment_format() -> Value {
     let text = |max| json!({"type":"string","minLength":1,"maxLength":max});
@@ -584,7 +571,11 @@ impl LiveBroker {
     pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
         let engine = request.path == ENGINE_CHAT;
         if !is_chat_path(&request.path)
-            || engine && !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1)
+            || engine
+                && !self
+                    .scope
+                    .tools
+                    .contains(&LiveToolProfile::ScopedDiscoveryV1)
         {
             return Err("engine_not_selected");
         }
@@ -715,7 +706,7 @@ impl LiveBroker {
             .ok_or("provider_budget_reached")?;
         {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
-            // ARTEX has its own response format and planner. Stop it cleanly
+            // Discovery calls have a separate response format. Stop them cleanly
             // instead of injecting the later reviewer's final-report schema.
             // Leave time and inference for that reviewer to check its leads.
             if engine && self.engine_budget_reached(&count, reservation) {
@@ -926,11 +917,13 @@ impl LiveBroker {
     }
 
     async fn engine_http(&self, mut body: Value) -> Result<Value, &'static str> {
-        if !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1) {
+        if !self
+            .scope
+            .tools
+            .contains(&LiveToolProfile::ScopedDiscoveryV1)
+            || !self.scope.runs_check(workflow::CheckId::PublicAnalysis)
+        {
             return Err("engine_not_selected");
-        }
-        if engine_branded_data(&body) {
-            return Err("use_authorized_security_test_data_instead_of_engine_branding");
         }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
@@ -1425,7 +1418,7 @@ impl LiveBroker {
                             .http(request.body.clone().unwrap_or(Value::Null))
                             .await
                     }
-                    ("POST", "artex/http") => {
+                    ("POST", "discovery/http") => {
                         reference
                             .engine_http(request.body.clone().unwrap_or(Value::Null))
                             .await
@@ -1728,8 +1721,8 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
         if let Ok(run) = parsed {
             bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
-            if records.len() < 31 && bytes <= 512 * 1024 && run.valid(evidence) {
-                if run.tool == "artex-engine" {
+            if records.len() < 40 && bytes <= 512 * 1024 && run.valid(evidence) {
+                if matches!(run.tool.as_str(), "patchriot-discovery" | "patchriot-deep") {
                     records.retain(|previous: &LiveToolRun| {
                         !(previous.tool == run.tool
                             && previous.started_at == run.started_at
@@ -2018,7 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_engine_message_preserves_the_following_report() {
         let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         let request = json!({"type":"request","request":{"id":1,"method":"POST","path":ENGINE_CHAT,
             "body":{"model":MODEL,"messages":[{"role":"user","content":{"unsupported":"fixture"}}]}}});
         let script = format!(
@@ -2077,7 +2070,7 @@ mod tests {
             "stop_reason":"done","anonymous_evidence_count":1,
             "findings_preview":[{"description":"fixture-session-cookie"}]})
         .to_string();
-        let run = json!({"tool":"artex-engine","version":"fixture","arguments":[],
+        let run = json!({"tool":"patchriot-discovery","version":"fixture","arguments":[],
             "started_at":1,"duration_ms":1,"exit_code":0,"failure":null,"evidence_ids":[],
             "output_sha256":hex::encode(Sha256::digest(output.as_bytes())),
             "output_excerpt":output,"output_truncated":false});
@@ -2098,7 +2091,7 @@ mod tests {
         let receipt = saved
             .tool_runs
             .iter()
-            .find(|r| r.tool == "artex-engine")
+            .find(|r| r.tool == "patchriot-discovery")
             .unwrap();
         let parsed: Value = serde_json::from_str(&receipt.output_excerpt).unwrap();
         assert_eq!(parsed["coverage_complete"], true);
@@ -2113,7 +2106,7 @@ mod tests {
     }
     #[test]
     fn engine_start_receipt_survives_interruption_and_is_replaced_on_completion() {
-        let mut run = json!({"tool":"artex-engine","version":"fixture","arguments":["/opt/artex/artex","https://example.com"],
+        let mut run = json!({"tool":"patchriot-discovery","version":"fixture","arguments":["/patchriot/deep_checks.py","https://example.com"],
             "started_at":1,"duration_ms":1,"exit_code":null,"failure":"incomplete","evidence_ids":[],
             "output_sha256":format!("{:x}", Sha256::digest(b"")),"output_excerpt":"","output_truncated":false});
         let mut events = vec![json!({"event":"live_tool","data":{"run":run}})];
@@ -2134,6 +2127,7 @@ mod tests {
         LiveBroker::new(
             file.path(),
             LiveScope {
+                check_groups: None,
                 authentication: None,
                 auth_check_path: None,
                 session_login: None,
@@ -2196,7 +2190,7 @@ mod tests {
     #[tokio::test]
     async fn bounded_model_requests_do_not_spend_the_retained_output_allowance() {
         let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT;
         // Actual framed requests, rejected locally by the already-used engine
         // budget. No model or website is called. Repeated conversation history
@@ -2205,7 +2199,7 @@ mod tests {
 import json,sys
 for i in range(1,76):
     print(json.dumps({'type':'request','request':{'id':i,'method':'POST',
-        'path':'/patchriot/artex/v1/chat/completions','body':{
+        'path':'/patchriot/discovery/v1/chat/completions','body':{
         'model':'abliterated-model-large-v2','messages':[{'role':'user','content':'x'*(480*1024)}]}}}),flush=True)
     for line in sys.stdin:
         if json.loads(line)['type']=='end': break
@@ -2261,7 +2255,7 @@ for _ in range(270): print(frame,flush=True)
     #[tokio::test]
     async fn rejected_engine_retries_do_not_consume_the_reviewers_call_allowance() {
         let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT;
         // Exercise the real supervised pipe and real 429 responses. The engine
         // has spent its allowance; these retries must never contact a provider
@@ -2269,7 +2263,7 @@ for _ in range(270): print(frame,flush=True)
         let script = r#"
             i=1
             while [ "$i" -le 60 ]; do
-                printf '%s\n' '{"type":"request","request":{"id":'"$i"',"method":"POST","path":"/patchriot/artex/v1/chat/completions","body":{"model":"abliterated-model-large-v2","messages":[{"role":"user","content":"fixture"}]}}}'
+                printf '%s\n' '{"type":"request","request":{"id":'"$i"',"method":"POST","path":"/patchriot/discovery/v1/chat/completions","body":{"model":"abliterated-model-large-v2","messages":[{"role":"user","content":"fixture"}]}}}'
                 while IFS= read -r frame; do
                     case "$frame" in *'"type":"end"'*) break ;; esac
                 done
@@ -2796,7 +2790,7 @@ for _ in range(270): print(frame,flush=True)
                 let mut broker = broker();
                 let owned = Arc::get_mut(&mut broker).unwrap();
                 owned.provider = provider;
-                owned.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+                owned.scope.tools.push(LiveToolProfile::ScopedDiscoveryV1);
                 let request = Request {
                     id: 1,
                     method: "POST".into(),
@@ -2950,7 +2944,7 @@ for _ in range(270): print(frame,flush=True)
         let inner = Arc::get_mut(&mut broker).unwrap();
         inner.scope.methods.push("POST".into());
         inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
-        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        inner.scope.tools.push(LiveToolProfile::ScopedDiscoveryV1);
         let input = json!({"method":"POST","url":"https://example.com/account",
             "headers":{"Content-Type":"application/json"},"data":r#"{"current_password":"fixture-old","new_password":"fixture-new"}"#});
         assert_eq!(
@@ -2986,7 +2980,7 @@ for _ in range(270): print(frame,flush=True)
         });
         let scope=serde_json::from_value::<LiveScope>(json!({"origins":["https://owned.example"],
             "methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1",
-            "tools":["artex_engine_v1","authenticated_http_v1"],"authentication":"basic","auth_check_path":"/private"})).unwrap().normalized().unwrap();
+            "tools":["scoped_discovery_v1","authenticated_http_v1"],"authentication":"basic","auth_check_path":"/private"})).unwrap().normalized().unwrap();
         let key = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(key.path(), "synthetic-fixture-provider-key").unwrap();
         let credentials = TestCredentials::Basic {
@@ -3033,12 +3027,12 @@ for _ in range(270): print(frame,flush=True)
                 source_role: None,
             })
             .collect();
-        let workflow = AssessmentWorkflow { version: 1, checks };
+        let workflow = AssessmentWorkflow { version: 2, checks };
         assert!(broker.accept_workflow(&serde_json::to_value(workflow).unwrap()));
         let progress = Progress::default();
         broker.update_progress(&progress, LivePhase::Investigating, 0, None);
         assert_eq!(
-            progress.lock().unwrap().workflow.as_ref().unwrap().checks[5].state,
+            progress.lock().unwrap().workflow.as_ref().unwrap().checks[6].state,
             CheckState::Pending
         );
         assert!(!broker.accept_workflow(&json!({"version":1,"checks":[]})));
@@ -3047,7 +3041,7 @@ for _ in range(270): print(frame,flush=True)
     fn evidence_review_starts_with_follow_up_investigation() {
         let broker = broker();
         let workflow = AssessmentWorkflow {
-            version: 1,
+            version: 2,
             checks: CheckId::ALL
                 .into_iter()
                 .map(|id| CheckProgress {
@@ -3085,28 +3079,19 @@ for _ in range(270): print(frame,flush=True)
         }
     }
     #[tokio::test]
-    async fn engine_generated_identity_is_rejected_before_target_io() {
+    async fn unselected_discovery_is_rejected_before_target_io() {
         let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
-        for data in [
-            r#"{"name":"ARTEX Test","email":"artex.test@example.com"}"#,
-            r#"{"name":"\u0041RTEX Test"}"#,
-            "name=%41rTeX+Test",
-        ] {
-            assert_eq!(
-                broker
-                    .engine_http(
-                        json!({"method":"POST","url":"https://example.com/contact","data":data})
-                    )
-                    .await
-                    .unwrap_err(),
-                "use_authorized_security_test_data_instead_of_engine_branding"
-            );
-            assert!(broker.counters.lock().unwrap().evidence.is_empty());
-        }
-        assert!(!engine_branded_data(
-            &json!({"data":r#"{"name":"Authorized security test","email":"security-test@example.com"}"#})
-        ));
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
+        inner.scope.check_groups = Some(vec![workflow::CheckId::PublicMapping]);
+        assert_eq!(
+            broker
+                .engine_http(json!({"method":"GET","url":"https://example.com/"}))
+                .await
+                .unwrap_err(),
+            "engine_not_selected"
+        );
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
     }
 
     #[tokio::test]
@@ -3197,7 +3182,7 @@ for _ in range(270): print(frame,flush=True)
             ),
         };
         assert_eq!(broker.chat(&request).unwrap_err(), "engine_not_selected");
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         assert_eq!(
             broker
                 .engine_http(json!({"method":"GET","url":"https://outside.example/"}))

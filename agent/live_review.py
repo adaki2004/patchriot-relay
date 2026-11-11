@@ -5,6 +5,10 @@ from urllib.parse import urlsplit
 # Two role reports plus bounded scope/team metadata; matches the protocol.
 MAX_INPUT = 2 * 32 * 1024 * 1024 + 256 * 1024
 
+# Suite aggregates whose component receipts may retain authenticated or failed
+# individual requests without invalidating the aggregate.
+SUITES = ('patchriot-discovery', 'patchriot-deep')
+
 
 def reusable_partial(record, report, scope):
     """Budget exhaustion is not a reason to repeat an entire broad scan.
@@ -13,7 +17,7 @@ def reusable_partial(record, report, scope):
     truncated receipts and startup/transport failures retain the recovery path.
     This selects targeted follow-up work; it never marks coverage complete.
     """
-    if (record.get('tool') != 'artex-engine' or record.get('exit_code') != 0
+    if (record.get('tool') not in SUITES or record.get('exit_code') != 0
             or record.get('failure') != 'incomplete' or record.get('output_truncated')):
         return None
     try:
@@ -21,9 +25,10 @@ def reusable_partial(record, report, scope):
     except (ValueError, TypeError):
         return None
     if (not isinstance(detail, dict) or detail.get('receipt_schema') != 1
-            or detail.get('engine') != 'ARTEX' or detail.get('coverage_complete') is not False
+            or detail.get('engine') not in ('Patchriot scoped discovery', 'Patchriot deep checks')
+            or detail.get('coverage_complete') is not False
             or detail.get('failure') != 'incomplete'
-            or detail.get('stop_reason') not in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress', 'provider_repetition')):
+            or detail.get('stop_reason') not in ('time_budget', 'target_request_budget', 'model_budget', 'no_target_progress', 'no_engine_progress', 'provider_repetition', 'checks_incomplete')):
         return None
     refs = record.get('evidence_ids', [])
     for evidence in report.get('evidence', []):
@@ -54,14 +59,23 @@ def discovery_plan(role, scope, previous, review_policy=None):
     """
     runs_discovery(role)  # Validate the assigned role.
     required = ['patchriot-baseline', 'patchriot-crawl', 'nuclei', 'ares-web-surface']
-    if 'artex_engine_v1' in scope.get('tools', []):
-        required.append('artex-engine')
+    if 'scoped_discovery_v1' in scope.get('tools', []):
+        required.append('patchriot-discovery')
+    if 'public_deep' in (scope.get('check_groups') or []):
+        required.append('patchriot-deep')
+    from workflow import TOOLS
+    selected = scope.get('check_groups')
+    if selected is not None:
+        required = [tool for tool in required if TOOLS[tool] in selected]
     plan = []
     for tool in required:
         attempts = []
         partial = None
         for report in previous[:2]:
-            records = [r for r in report.get('tool_runs', []) if r.get('tool') == tool]
+            records = [r for r in report.get('tool_runs', []) if r.get('tool') == tool
+                       and '--discovery-suite' not in r.get('arguments', [])
+                       and ('--deep-suite' not in r.get('arguments', [])
+                            or r.get('arguments', [])[:1] == ['/patchriot/deep_checks.py'])]
             if records:
                 expected = len(scope['origins']) if tool in ('patchriot-crawl', 'nuclei', 'ares-web-surface') else 1
                 evidence = {e.get('id'): e for e in report.get('evidence', [])}
@@ -71,12 +85,12 @@ def discovery_plan(role, scope, previous, review_policy=None):
                 public_refs = any(id in evidence and not evidence[id].get('authenticated')
                                   and not evidence[id].get('login') and not evidence[id].get('error')
                                   and type(evidence[id].get('status')) is int for id in refs)
-                # Finished engine passes can retain individual capture or
+                # Finished suite passes can retain individual capture or
                 # transport gaps. Reuse preserves those records for review.
                 completed = public_refs and origins_complete and len(records) >= expected and bool(refs) and all(
                     r.get('exit_code') == 0 and not r.get('failure') and not r.get('output_truncated') and r.get('evidence_ids') for r in records) and all(
-                    id in evidence and (not evidence[id].get('authenticated') or tool == 'artex-engine') and not evidence[id].get('login')
-                    and (tool == 'artex-engine' or not evidence[id].get('error')
+                    id in evidence and (not evidence[id].get('authenticated') or tool in SUITES) and not evidence[id].get('login')
+                    and (tool in SUITES or not evidence[id].get('error')
                          and type(evidence[id].get('status')) is int) for id in refs)
                 attempts.append((report.get('role'), completed))
                 if len(records) == 1:
@@ -111,7 +125,7 @@ def engine_coverage(records):
     """Expose recorded engine coverage alongside model-authored summaries."""
     coverage = []
     for record in records:
-        if record.get('tool') != 'artex-engine':
+        if record.get('tool') not in SUITES:
             continue
         try:
             detail = json.loads(record.get('output_excerpt', ''))
@@ -258,7 +272,7 @@ def public_browser_prompt():
             "Do not run scanners or investigate unrelated vulnerabilities in this preparation step. " + PUBLIC_BROWSER)
 
 
-def prompt(role, browser=False, review_policy=None, access_prepared=False, engine_ran=False, paired=False, public_browser=False):
+def prompt(role, browser=False, review_policy=None, access_prepared=False, engine_ran=False, paired=False, public_browser=False, deep=False):
     duties = {
         "investigator": "Act as Scout: map the approved website, follow its real resources and test concrete weaknesses. Prefer a few well-supported findings to a long checklist.",
         "reproducer": "Act as Recon: read previous.json, independently repeat the earlier probes, test their assumptions and try to disprove each material claim. Cite your own request IDs. Also investigate important gaps.",
@@ -267,15 +281,19 @@ def prompt(role, browser=False, review_policy=None, access_prepared=False, engin
     validation_only = review_policy == 'investigate_validate_v1' and role == 'reproducer'
     if validation_only:
         duties[role] = ('Act as the independent validator. Validate the investigator findings with fresh, minimal positive and negative controls. '
-            'Read validation-brief.json and the exact cited previous evidence. Do not run ARTEX, repeat broad discovery or start a new general vulnerability hunt. '
+            'Read validation-brief.json and the exact cited previous evidence. Do not repeat scoped scanners, repeat broad discovery or start a new general vulnerability hunt. '
             'For each claim decide reproduced, not_reproduced or needs_review from your own evidence. '
             'If the investigator has no findings, check its evidence and bounded negative controls on the principal tested surfaces; an empty findings list is valid. '
             'Preserve coverage gaps you cannot resolve by a focused check. Complete the report when the validation list is finished.')
-    initial = ("The pinned runner performed the discovery bundle: a bounded link crawl, curated Nuclei checks, a versioned baseline suite, ARES-derived HTTP fingerprints and scoped scanner controls. Inspect each receipt: unavailable or unfinished tools are coverage gaps. If artex_engine_v1 is selected, inspect /work/artex-results.json for this role's engine run."
+    initial = ("The pinned runner scheduled only the selected check groups. Read tool-results.json to see which baseline, crawl, Nuclei, fingerprint and deeper checks actually ran. Inspect each receipt: unavailable or unfinished tools are coverage gaps. Inspect /work/discovery-results.json for the bounded discovery suite and its per-account checks."
                if runs_discovery(role) else
-               "This role runs fresh controls and reuses discovery from previous.json. A reuse_partial entry means the broad scan stopped at a limit after saving real responses: inspect that evidence, test material leads and address specific gaps instead of repeating the whole scan. Its coverage remains incomplete. The runner may recover a missing or failed discovery tool once; discovery_plan says what ran, was reused or remains unavailable. Inspect current tool-results.json and any current artex-results.json for recovery work. Use fresh requests to test material claims and their assumptions. Preserve remaining gaps instead of implying full coverage.")
+               "This role runs fresh controls and reuses discovery from previous.json. A reuse_partial entry means the broad scan stopped at a limit after saving real responses: inspect that evidence, test material leads and address specific gaps instead of repeating the whole scan. Its coverage remains incomplete. The runner may recover a missing or failed discovery tool once; discovery_plan says what ran, was reused or remains unavailable. Inspect current tool-results.json and any current discovery-results.json for recovery work. Use fresh requests to test material claims and their assumptions. Preserve remaining gaps instead of implying full coverage.")
+    if deep:
+        initial += (" The opt-in deep pass (where selected) additionally recorded /work/deep-results.json: script and route mining against a missing-path control, "
+                    "access-control path mutations, injected-header reflection with a clean cache re-request, observed-parameter probes and cross-account object rows. "
+                    "Deep rows are leads: a differing body is not disclosure and a flipped status is not authorization proof without a concrete control.")
     result = f"""You are the {role} conducting an authorized live website security test. {duties[role]}
-Read /work/workflow.json first. Public baseline, mapping, signatures, fingerprints and public analysis are the common checklist for both black and grey modes. Grey adds verified access and signed-in checks; it never substitutes login work for public work. Incomplete public stages remain gaps even if authentication succeeds. Use remaining investigation time for missing public controls before expanding signed-in work. Record bounded checks of discovered input handling, session/CSRF boundaries and object access where the scope and disposable data allow; report unavailable test identities explicitly. Never infer unlimited throughput from a few accepted requests or perform password guessing/load tests to fill a checklist.
+Read /work/workflow.json and the signed scope.check_groups first. Unselected groups are not in scope: do not launch their scanners or turn them into a new investigation. A not_applicable stage is not missing work to recover. Scope checks, access verification and evidence validation always apply. The selected public checklist is shared by black and grey modes. Grey adds verified access and signed-in checks; it never substitutes login work for public work. Incomplete public stages remain gaps even if authentication succeeds. Use remaining investigation time for missing public controls before expanding signed-in work. Record bounded checks of discovered input handling, session/CSRF boundaries and object access where the scope and disposable data allow; report unavailable test identities explicitly. Never infer unlimited throughput from a few accepted requests or perform password guessing/load tests to fill a checklist.
 Start with the overview below, then inspect the relevant entries in /work/scope.json, /work/previous.json and /work/tool-results.json. Load each JSON file separately with Python json.load; print selected fields rather than concatenating or dumping entire files. If terminal output is shortened, read the original file in smaller pieces; do not try to repair the shortened display or its spillover copy. {initial} Inspect recorded outputs and request IDs; these are leads, not proved findings. IDs in tool-results.json belong to your current role, while IDs in previous.json belong to earlier roles and must not be copied into your citations. Report unavailable, failed or truncated tool coverage. Spend your own probes on meaningful leads and missing checks. When revisiting the same issue, keep its exact title and cite the request that demonstrates it first, followed by controls. A different affected endpoint or cause is a separate finding. The exact approved HTTPS origins and objective are in scope.json. Read /patchriot/live-review-skill.txt for the testing method.
 You have a normal terminal inside a disposable isolated container. Write Python analysis scripts, parse HTML/JavaScript, compare responses and design your own non-destructive HTTP probes. This is live testing, not an offline snapshot exercise.
 For every target request use Python /patchriot/live_http.py METHOD URL --header 'Name: value', or import request from live_http with sys.path.insert(0, '/patchriot'). It returns evidence.id, actual status, selected headers, body and a hash. recorded_header_names lists exactly which response headers the relay captures. Only infer absence for a name in that list; other headers were not observed. Use --save-body /work/page.txt to save large responses, then inspect specific parts with Python; the CLI preview is shortened. The reply also shows remaining_cost_allowance_microusd. Start your final report before the allowance is depleted. Use only scope.methods. An active scope (web_active_v1 or web_active_v2) additionally permits POST against the explicitly authorized website and disposable test data with JSON or URL-encoded data, at most 16 KiB; use --data and the appropriate Content-Type. For baseline scopes, do not submit forms; only the relay can perform the exact declared session login. If login fails, report that authenticated coverage is missing; do not attempt another login or call a token endpoint yourself. A declared Basic/bearer account or configured form/JSON login is handled by the relay once per role; session cookies are injected into approved requests; never request or print credentials. Use --anonymous for comparison requests. No browser login, MFA/SSO, real purchases, fund transfers, brute force, load tests or exploit persistence. Never change passwords, initiate or confirm password recovery, change account email, roles or MFA, delete accounts, or revoke sessions. Supplied accounts and existing records are not disposable. Test these controls only in an owner-prepared disposable fixture; otherwise record them as untested. Never use browser credential-fill for password-change or recovery forms. Do not install unreviewed tools or contact other hosts. A denied URL is a scope limit, not evidence that a website is vulnerable. The relay, not you, enforces origin, DNS, rate and spend limits. API keys are not available inside this container.
@@ -292,7 +310,7 @@ Read password_change_control before writing account-state claims. An accepted_ev
 Exact current-role HTTP records collected by discovery and live_http are cached in /work/http-evidence/<id>.json. Read the matching record before citing it; check its method, URL, request body, response and truncation. List selected fields to find relevant IDs instead of dumping all files. These are working copies of the relay's retained evidence, not extra requests or independent confirmation. A tool's ID range, command number or approximate ID is not a citation. If a record is missing or does not support the claim, make a scoped control request or leave the claim in limitations. Do not turn expected public data, missing API documentation or unsupported methods into vulnerabilities without a concrete security impact.
 Overview evidence-ID arrays are previews. When evidence_ids_shortened is true, read the complete IDs in tool-results.json for current-role tools or previous.json for prior roles. Every evidence ID retained by an engine tool run in current tool-results.json belongs to this role, including IDs omitted from the overview preview. Use request_count and the complete list before describing engine coverage.
 For cross-account access claims, establish the object's owner and the requesting identity from retained evidence. A record seen in an earlier role may belong to the same supplied account; a different UUID or earlier report does not prove foreign ownership. Without another authorized identity or a known foreign-owned test object, record the missing control as a limitation rather than claiming an authorization bypass. Never obtain another person's credentials or expand scope to fill that gap.
-ARTEX records describe the upstream engine's bounded discovery run, not independent confirmation. Command URLs may use local mirrors; target_mapping identifies the approved HTTPS origin. Read stop_reason, coverage_complete, failures and limitations before findings. Reproduce material leads with your own control requests through live_http; do not copy engine conclusions as verified facts. An unfinished engine run must remain an explicit coverage gap in your report. Never imply that every ARTEX skill or external tool ran.
+Discovery receipts describe bounded ZAP, Nuclei, route, schema and context checks, not independent confirmation. Read stop_reason, coverage_complete, failures and limitations before leads. Reproduce material leads with your own control requests through live_http. A completed plan is not exhaustive coverage. No shell execution, payload installation, persistence, database takeover or third-party callbacks on the target are authorized. Validate suspected injection using bounded non-persistent HTTP controls and stop before executing commands or extracting private data.
 A managed bot challenge or CAPTCHA is an access limitation, not evidence about the application behind it. Do not reverse-engineer or solve challenge scripts, spoof a browser to defeat them, or keep probing the blocked path. Record the gap and continue other reachable approved application paths. Ordinary use of the site's approved browser login remains allowed.
 The ares-web-surface receipt is the adapted ARES HTTP fingerprint component, not the full framework. Its technology hints and content signatures are leads only. An admin URL, 200 response, public API schema, redirect or 403 is not a security finding without demonstrated impact. Check the missing-path control and exact saved responses before following a lead. Do not report secrets verbatim.
 Use the available time for useful investigation within the shared role allowance. Stop after sufficient evidence, or if the budget runs low; reserve time for a final report. Do not repeat failed probes without a reason. An optional tool stopping or finding nothing does not prevent you from reporting useful evidence. Describe the actual missing checks; do not estimate a coverage percentage without a defined test set.
@@ -305,7 +323,7 @@ Choose one enum value, never the pipe-separated example. EVERY finding, includin
         result += (f"\nTwo accounts were supplied. Your browser and default HTTP context use the {selected} account. "
             "Use live_http.py --account testing or --account reference for explicit HTTP controls and retain each evidence record's account label. "
             "Compare only supplied identities and disposable test objects whose ownership you can establish. "
-            "The reference account permits authenticated GET, HEAD and OPTIONS after login. The relay blocks other signed-in writes, including settings changes. Record checks requiring reference-account POST as unavailable. Password changes, when explicitly permitted, are handled by the engine's testing-account control. "
+            "The reference account permits authenticated GET, HEAD and OPTIONS after login. The relay blocks other signed-in writes, including settings changes. Record checks requiring reference-account POST as unavailable. Automated scanner stages do not change passwords. If account-change testing was requested, record that part as untested; keep supplied accounts usable. "
             "For validation, sign in only with the protected reference account. This role assignment preserves the testing account's end state. "
             "It supplies no evidence that a password was changed. Check prior retained requests for an actual account change before describing one. "
             "Report any control you cannot freshly reproduce and leave an unknown mutation status explicit. Do not retry the testing account's supplied password.\n")
@@ -323,7 +341,7 @@ Choose one enum value, never the pipe-separated example. EVERY finding, includin
                                 "Use fresh controls only for the supplied claims and material evidence gaps; do not repeat discovery.")
         result += "\nThis is the validation stage: finish after the supplied claim list and bounded negative controls are assessed. Do not spend the remaining allowance on unrelated exploration.\n"
     if engine_ran:
-        result += ("\nThe engine has finished its single investigation pass. Inspect artex-results.json and saved evidence. "
+        result += ("\nThe engine has finished its single investigation pass. Inspect discovery-results.json and saved evidence. "
             "Your remaining task is evidence review and focused controls for material leads or specific gaps, "
             "not another general scan. Do not rerun the public suite or spend the remaining allowance on unrelated exploration. "
             "Finish the report once these checks are done; the next role independently validates findings.\n")

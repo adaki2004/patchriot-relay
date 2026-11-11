@@ -546,6 +546,7 @@ mod tests {
     #[test]
     fn credentials_and_cookie_echoes_are_redacted_and_anonymous_controls_send_neither() {
         let scope = LiveScope {
+            check_groups: None,
             origins: vec!["https://owned.example".into()],
             objective: "fixture".into(),
             methods: vec!["GET".into()],

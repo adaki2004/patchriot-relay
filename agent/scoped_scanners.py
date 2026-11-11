@@ -222,16 +222,26 @@ def schema_checks(client, urls, execute=capture):
             reply = client('POST', url, {'Content-Type': 'application/json'}, data=query['output'])
         else:
             reply = client('GET', url)
+        status = reply.get('evidence', {}).get('status')
+        if status in (404, 405):
+            results.append({'url': url, 'state': 'inapplicable', 'reason': 'no_schema_at_candidate'})
+            continue
+        if status is not None and not 200 <= status < 300:
+            client.gaps.append('schema_unavailable')
+            continue
         if reply.get('body_truncated'):
             client.gaps.append('schema_truncated')
             continue
         try:
             schema = json.loads(reply.get('body', ''))
         except ValueError:
-            client.gaps.append('schema_unavailable')
+            results.append({'url': url, 'state': 'inapplicable', 'reason': 'candidate_is_not_a_schema'})
             continue
         if not isinstance(schema, dict):
             client.gaps.append('schema_object_required')
+            continue
+        if not graphql_mode and not any(key in schema for key in ('openapi', 'swagger')):
+            results.append({'url': url, 'state': 'inapplicable', 'reason': 'candidate_is_not_a_schema'})
             continue
         with tempfile.TemporaryDirectory(prefix='patchriot-schema-') as directory:
             source = Path(directory) / 'schema.json'

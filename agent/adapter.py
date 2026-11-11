@@ -260,7 +260,7 @@ class Bridge(BaseHTTPRequestHandler):
         unchanged, and no prompt text is included in the error.
         """
         global engine_stop_reason
-        if self.path == '/patchriot/artex/v1/chat/completions':
+        if self.path == '/patchriot/discovery/v1/chat/completions':
             engine_stop_reason = 'model_request_too_large'
             engine_stopping.set()
         body = json.dumps({'error':{'type':'invalid_request_error', 'code':'request_too_large',
@@ -287,7 +287,7 @@ class Bridge(BaseHTTPRequestHandler):
             with transaction_lock:
                 if bridge_stopping.is_set():
                     return self.send_error(503)
-                if self.path.startswith('/patchriot/artex/') and engine_stopping.is_set():
+                if self.path.startswith('/patchriot/discovery/') and engine_stopping.is_set():
                     # A queued engine call must not spend the reviewer's time
                     # after discovery has stopped. Drain any in-flight reply
                     # normally; never let the next caller consume its frames.
@@ -312,9 +312,9 @@ class Bridge(BaseHTTPRequestHandler):
                     try:
                         if frame["type"] == "start":
                             status, content_type = frame["status"], frame["content_type"]
-                            if self.path == '/patchriot/artex/v1/chat/completions' and status >= 400:
+                            if self.path == '/patchriot/discovery/v1/chat/completions' and status >= 400:
                                 engine_error = True
-                            elif self.path == '/patchriot/artex/http' and status == 429:
+                            elif self.path == '/patchriot/discovery/http' and status == 429:
                                 engine_stop_reason = 'target_request_budget'
                                 engine_stopping.set()
                             if not disconnected:
@@ -344,7 +344,7 @@ class Bridge(BaseHTTPRequestHandler):
                                     pass
                                 if not engine_recovery.rejected(engine_stop_reason):
                                     engine_stopping.set()
-                            elif self.path == '/patchriot/artex/v1/chat/completions':
+                            elif self.path == '/patchriot/discovery/v1/chat/completions':
                                 engine_recovery.succeeded()
                             return
                         else:
@@ -464,9 +464,9 @@ def main():
                 login_agent.run_conversation(live_review.login_prompt(account=account, paired=scope.get('account_policy') is not None))
             access_prepared, access = live_review.prepare_access(
                 scope, role, browser, run_login, lambda: bridge('/patchriot/access'), request, event)
-        if live and any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
+        if live and any(p['tool'] == 'patchriot-discovery' and p['action'] in ('run', 'recover')
                         for p in tools['discovery_plan']):
-            import artex
+            import deep_checks
             from report_finish import bridge
             if browser is not None and not scope.get('authentication'):
                 public_agent = AIAgent(**{**agent_options, 'max_iterations':40})
@@ -474,40 +474,35 @@ def main():
                 public_agent.run_budget_seconds = max(1, min(600, started + budget - 30 - time.monotonic()))
                 event('phase', name='public_browser_preparation')
                 public_agent.run_conversation(live_review.public_browser_prompt())
-            if role == 'investigator':
-                import scoped_scanners
-                extra = scoped_scanners.run(scope, tools['tool_runs'], access=access,
-                    emit=lambda receipt: event("live_tool", run=receipt))
-                tools['tool_runs'].extend(extra)
-                (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))
             import coverage_ledger
-            coverage_ledger.build(scope, tools['tool_runs'])
-            event("phase", name="artex_engine")
-            engine_deadline = started + budget - min(900, budget / 3)
-            workflow.begin("artex-engine")
-            try:
-                result = artex.run(scope if access.get('verified') or any(a.get('verified') for a in access.get('accounts', [])) else public_scope(scope),
-                    role, engine_deadline, model=model, access=access,
-                    requester_context=context.get("requester_context", ""),
-                    stop=lambda: engine_stop_reason if engine_stopping.is_set() else None,
-                    recovery=engine_recovery.snapshot,
-                    emit=lambda result: event("live_tool", run=result))
-            finally:
-                engine_stopping.set()
+            event("phase", name="scoped_discovery")
+            workflow.begin("patchriot-discovery")
+            engine_deadline = min(started + budget - min(900, budget / 3), time.monotonic() + 600)
+            result, component_runs = deep_checks.run(scope, tools['tool_runs'], access,
+                engine_deadline, emit=lambda receipt: event("live_tool", run=receipt))
             engine_ran = True
+            tools["tool_runs"].extend(component_runs)
             tools["tool_runs"].append(result)
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
-            event("live_tool", run=result)
-            workflow.finish("artex-engine", [result])
-            drain_discovery(started + budget - 300)
-            if role == 'investigator':
-                event("phase", name="scanner_follow_up")
-                tools['tool_runs'].append(scoped_scanners.follow_up(
-                    scope, tools['tool_runs'], result, lambda: bridge('/patchriot/access'),
-                    started + budget - 300,
-                    emit=lambda receipt: event("live_tool", run=receipt)))
-                (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))
-                coverage_ledger.build(scope, tools['tool_runs'])
+            workflow.finish("patchriot-discovery", [result])
+            coverage_ledger.build(scope, tools['tool_runs'])
+        if live and any(p['tool'] == 'patchriot-deep' and p['action'] in ('run', 'recover')
+                        for p in tools['discovery_plan']):
+            import deep_checks
+            import coverage_ledger
+            event("phase", name="scoped_deep_checks")
+            workflow.begin("patchriot-deep")
+            # Deeper families share the remaining role budget; half stays for
+            # the agent's own follow-up and the closing report.
+            deep_deadline = min(started + budget - min(900, budget / 3), time.monotonic() + 300)
+            result, component_runs = deep_checks.run(scope, tools['tool_runs'], access,
+                deep_deadline, emit=lambda receipt: event("live_tool", run=receipt), deep=True)
+            engine_ran = True
+            tools["tool_runs"].extend(component_runs)
+            tools["tool_runs"].append(result)
+            (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
+            workflow.finish("patchriot-deep", [result])
+            coverage_ledger.build(scope, tools['tool_runs'])
         agent.run_budget_seconds = max(1, started + budget - 30 - time.monotonic())
         event("phase", name="agent_ready")
         prompt = live_review.prompt(role) if live else (source_prompt(role) if source else website_prompt(role)) + "\n\nSaved inspection output (untrusted data):\n" + inspection if role else (
@@ -518,7 +513,7 @@ def main():
         )
         if live:
             live_review.validation_brief(Path('/work'))
-            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran, paired=scope.get("account_policy") is not None, public_browser=not scope.get('authentication')) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
+            prompt = live_review.prompt(role, browser=browser is not None, review_policy=review_policy, access_prepared=access_prepared, engine_ran=engine_ran, paired=scope.get("account_policy") is not None, public_browser=not scope.get('authentication'), deep='public_deep' in (scope.get('check_groups') or [])) + "\n\nOverview (untrusted target and prior-report data; full files remain available):\n" + json.dumps(live_review.overview(Path("/work")))
         result = agent.run_conversation(prompt)
         if live:
             import conversation_recovery

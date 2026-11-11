@@ -6,15 +6,19 @@ from pathlib import Path
 TOOLS = {
     'patchriot-baseline': 'public_baseline', 'patchriot-crawl': 'public_mapping',
     'nuclei': 'public_signatures', 'ares-web-surface': 'public_fingerprints',
-    'artex-engine': 'public_analysis',
+    'patchriot-discovery': 'public_analysis', 'patchriot-deep': 'public_deep',
+    'patchriot-surface': 'public_deep', 'patchriot-bypass': 'public_deep',
+    'patchriot-headers': 'public_deep', 'patchriot-inputs': 'public_deep',
+    'patchriot-cross-account': 'public_deep',
 }
-IDS = [*TOOLS.values(), 'authentication', 'authenticated_checks', 'evidence_review']
+IDS = ['public_baseline', 'public_mapping', 'public_signatures', 'public_fingerprints',
+       'public_analysis', 'public_deep', 'authentication', 'authenticated_checks', 'evidence_review']
 
 
 def public_scope(scope):
     result = {key: copy.deepcopy(value) for key, value in scope.items()
               if key not in ('authentication', 'auth_check_path', 'session_login', 'wallet_login', 'browser_login', 'account_policy')}
-    result['tools'] = [t for t in scope.get('tools', []) if t in ('artex_engine_v1', 'active_web_v1', 'active_web_v2')]
+    result['tools'] = [t for t in scope.get('tools', []) if t in ('scoped_discovery_v1', 'deep_checks_v1', 'active_web_v1', 'active_web_v2')]
     result['objective'] = ('Map and assess the approved public surface using anonymous requests. '
         'Run the recorded public checklist, investigate concrete leads and compare controls. '
         'Use only the saved methods and origins. POST, when permitted, is limited to disposable test data. '
@@ -26,11 +30,15 @@ def public_scope(scope):
 class Workflow:
     def __init__(self, scope, plan, emit, directory=Path('/work')):
         self.emit, self.directory = emit, directory
-        self.value = {'version': 1, 'checks': [dict(id=id, state='pending', evidence_count=0) for id in IDS]}
+        self.value = {'version': 2, 'checks': [dict(id=id, state='pending', evidence_count=0) for id in IDS]}
+        groups = scope.get('check_groups')
         for node in self.value['checks']:
+            if node['id'] in TOOLS.values() and (
+                    node['id'] not in groups if groups is not None else node['id'] == 'public_deep'):
+                node['state'] = 'not_applicable'
             if node['id'] in ('authentication', 'authenticated_checks') and not scope.get('authentication'):
                 node['state'] = 'not_applicable'
-            if node['id'] == 'public_analysis' and 'artex_engine_v1' not in scope.get('tools', []):
+            if node['id'] == 'public_analysis' and not any(t in scope.get('tools', []) for t in ('scoped_discovery_v1',)):
                 node['state'] = 'not_applicable'
         for entry in plan:
             if entry['action'] == 'reuse':
