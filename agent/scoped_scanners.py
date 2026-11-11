@@ -326,6 +326,23 @@ def follow_up(scope, records, engine, access, deadline, fetch=request,
     Only successful GET evidence supplies seeds; scanner payload generation
     remains in the selected rule and behind the same broker permissions.
     """
+    # A failed optional preparation read must remain an explicit coverage gap,
+    # not abort delivery of discovery evidence or assume signed-in access.
+    if callable(access):
+        started, observed = time.monotonic(), int(time.time())
+        try:
+            access = access()
+            if not isinstance(access, dict):
+                raise ValueError('invalid access response')
+        except (OSError, ValueError, TypeError):
+            result = record('zap', ZAP_VERSION, ['scoped', '--engine-discoveries'],
+                started, observed, [], json.dumps({'phase': 'engine_discoveries',
+                    'state': 'blocked', 'reason': 'access_state_unavailable',
+                    'contexts': [], 'gaps': ['follow_up_access_unavailable']}),
+                0, 'incomplete')
+            emit(result)
+            return result
+
     def seed(identifier):
         if type(identifier) is not int or identifier <= 0:
             return None

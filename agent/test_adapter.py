@@ -448,6 +448,31 @@ class BridgeTests(unittest.TestCase):
         adapter.bridge_stopping.clear()
         adapter.engine_stopping.clear()
 
+    def test_discovery_handoff_waits_for_the_inflight_reply_before_follow_up(self):
+        done = threading.Event()
+        errors = []
+        def finish():
+            try:
+                adapter.drain_discovery(adapter.time.monotonic() + 2)
+                done.set()
+            except Exception as error:
+                errors.append(error)
+        with adapter.transaction_lock:
+            thread = threading.Thread(target=finish)
+            thread.start()
+            self.assertTrue(adapter.engine_stopping.wait(1))
+            self.assertFalse(done.wait(.05))
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(done.is_set())
+
+    def test_discovery_handoff_does_not_take_the_final_report_reserve(self):
+        with adapter.transaction_lock:
+            with self.assertRaisesRegex(TimeoutError, '^discovery_response_drain_timeout$'):
+                adapter.drain_discovery(adapter.time.monotonic() - 1)
+        self.assertTrue(adapter.engine_stopping.is_set())
+
     def test_finished_discovery_rejects_queued_calls_but_allows_the_reviewer(self):
         adapter.engine_stopping.set()
         for path in ['/patchriot/artex/v1/chat/completions', '/patchriot/artex/http']:

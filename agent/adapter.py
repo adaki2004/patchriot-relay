@@ -63,6 +63,20 @@ class EngineRecovery:
 engine_recovery = EngineRecovery()
 
 
+def drain_discovery(deadline):
+    """Finish the current broker reply before short-timeout report-side calls.
+
+    Stopping discovery rejects queued engine requests, but cannot cancel a
+    reply already on the pipe. Keep its frames together without replaying work
+    or extending the role deadline. Leave the final report's reserve intact.
+    """
+    engine_stopping.set()
+    remaining = max(0, min(390, deadline - time.monotonic()))
+    if not transaction_lock.acquire(timeout=remaining):
+        raise TimeoutError('discovery_response_drain_timeout')
+    transaction_lock.release()
+
+
 def report_validation(**details):
     # Phase is part of the supervisor wire contract; a new event type would
     # abort the role before the final result can be delivered.
@@ -485,10 +499,11 @@ def main():
             (Path("/work") / "tool-results.json").write_text(json.dumps(tools))
             event("live_tool", run=result)
             workflow.finish("artex-engine", [result])
+            drain_discovery(started + budget - 300)
             if role == 'investigator':
                 event("phase", name="scanner_follow_up")
                 tools['tool_runs'].append(scoped_scanners.follow_up(
-                    scope, tools['tool_runs'], result, bridge('/patchriot/access'),
+                    scope, tools['tool_runs'], result, lambda: bridge('/patchriot/access'),
                     started + budget - 300,
                     emit=lambda receipt: event("live_tool", run=receipt)))
                 (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))

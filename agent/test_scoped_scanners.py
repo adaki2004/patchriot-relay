@@ -150,6 +150,32 @@ class ScopedScannerTests(unittest.TestCase):
                 self.assertEqual(len(run['evidence_ids']), 1)
                 self.assertNotIn('secret', run['output_excerpt'])
 
+    def test_follow_up_access_failure_keeps_a_gap_without_scanning_or_exposing_errors(self):
+        for failure in [TimeoutError('private token=secret'), ValueError('private account')]:
+            with self.subTest(failure=type(failure).__name__):
+                access, emit = Mock(side_effect=failure), Mock()
+                with patch.object(scanners, 'zap') as scan:
+                    run = scanners.follow_up(self.scope, [], {'evidence_ids': [1]}, access,
+                        time.monotonic() + 120, self.fetch, emit=emit)
+                access.assert_called_once_with()
+                scan.assert_not_called()
+                emit.assert_called_once_with(run)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(run['failure'], 'incomplete')
+                self.assertEqual(run['evidence_ids'], [])
+                detail = json.loads(run['output_excerpt'])
+                self.assertEqual(detail['gaps'], ['follow_up_access_unavailable'])
+                self.assertNotIn('private', run['output_excerpt'])
+
+    def test_follow_up_reads_fresh_access_once_before_selecting_inputs(self):
+        access = Mock(return_value={'verified': False})
+        with tempfile.TemporaryDirectory() as folder:
+            run = scanners.follow_up(self.scope, [], {'evidence_ids': []}, access,
+                time.monotonic() + 120, self.fetch, directory=Path(folder))
+        access.assert_called_once_with()
+        self.assertIsNone(run['failure'])
+        self.assertEqual(json.loads(run['output_excerpt'])['state'], 'inapplicable')
+
     def test_engine_handoff_rejects_unavailable_or_unsafe_seeds_and_caps_work(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
