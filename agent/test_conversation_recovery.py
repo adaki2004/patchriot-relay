@@ -37,10 +37,28 @@ class ConversationRecoveryTests(unittest.TestCase):
             result=recovery.recover(failed,'Approved role',time.monotonic()+500,factory,call=Mock(return_value={'valid':True}))
             self.assertIs(result,failed);factory.assert_called_once();agent.close.assert_called_once()
 
+    def test_provider_and_compression_timeout_exits_use_the_same_bounded_recovery(self):
+        for exit_reason in [None, 'context_compression_timeout']:
+            with self.subTest(exit_reason=exit_reason):
+                failed = self.failure()
+                failed.pop('turn_exit_reason')
+                if exit_reason:
+                    failed['turn_exit_reason'] = exit_reason
+                agent = Mock(); agent.run_conversation.return_value = failed
+                factory = Mock(return_value=agent)
+                result = recovery.recover(failed, 'role', time.monotonic()+500, factory)
+                self.assertIs(result, failed)
+                factory.assert_called_once()
+                agent.run_conversation.assert_called_once()
+                agent.close.assert_called_once()
+
     def test_no_restart_for_provider_failure_success_or_target_text(self):
         for result in [{'completed':True,'final_response':'context_overflow'},
                        {'failed':True,'failure_reason':'provider_unavailable'},
-                       {**self.failure(),'compression_exhausted':False}]:
+                       {**self.failure(),'compression_exhausted':False},
+                       {**self.failure(),'completed':True},
+                       {**self.failure(),'failure_reason':'provider_unavailable'},
+                       {'completed':False,'failed':True,'final_response':json.dumps(self.failure())}]:
             factory=Mock()
             self.assertIs(recovery.recover(result,'role',time.monotonic()+500,factory),result)
             factory.assert_not_called()

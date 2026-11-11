@@ -15,9 +15,11 @@ LIMITATION = ('The conversation context was restarted once after reaching its li
 
 def recover(result, prompt, deadline, factory, emit=lambda **_: None, call=report_finish.bridge):
     # Runtime metadata, never an error-looking string in target/model content.
+    # Hermes's provider-error and truncated-stream exits omit turn_exit_reason;
+    # all exhausted-context exits share these typed failure fields.
     if not (result.get('failed') is True
+            and result.get('completed') is False
             and result.get('compression_exhausted') is True
-            and result.get('turn_exit_reason') == 'context_compression_exhausted'
             and result.get('failure_reason') == 'context_overflow'):
         return result
     remaining = deadline - time.monotonic()

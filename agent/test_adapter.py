@@ -21,6 +21,34 @@ import live_review
 
 @unittest.skipUnless(os.environ.get('PATCHRIOT_HERMES_SMOKE') == '1', 'requires the pinned isolated Hermes image')
 class CompressionRuntimeTests(unittest.TestCase):
+    def test_real_provider_overflow_exit_can_start_one_evidence_recovery(self):
+        script = '''import time
+from unittest.mock import Mock
+from agent.turn_overflow import _Recovery
+import conversation_recovery
+agent=Mock(); agent.model='owned-fixture'; agent.log_prefix=''
+state=_Recovery(agent=agent, api_messages=[], system_message='', effective_task_id=None,
+    api_call_count=5, max_compression_attempts=3, messages=[], active_system_prompt='',
+    conversation_history=[], approx_tokens=70000, compression_attempts=3)
+result=state.count_attempt().result
+assert result['failed'] is True and result['completed'] is False
+assert result['compression_exhausted'] is True and result['failure_reason']=='context_overflow'
+assert 'turn_exit_reason' not in result
+continuation=Mock(); continuation.run_conversation.return_value=result
+factory=Mock(return_value=continuation)
+assert conversation_recovery.recover(result, 'Owned fixture', time.monotonic()+500, factory) is result
+factory.assert_called_once()
+continuation.run_conversation.assert_called_once()
+continuation.close.assert_called_once()
+agent._persist_session.assert_called_once()
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            env={'PATH':os.environ['PATH'],'HOME':temp,'HERMES_HOME':temp,
+                 'PYTHONPATH':'/opt/hermes:/tests','PYTHONDONTWRITEBYTECODE':'1'}
+            result=subprocess.run([sys.executable,'-c',script],env=env,
+                capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stderr[-2000:])
+
     def test_pinned_context_overflow_has_typed_recovery_metadata(self):
         script = '''from unittest.mock import Mock
 from agent.conversation_loop import _provider_overflow_exhausted_result
@@ -300,6 +328,9 @@ class LiveOverviewTests(unittest.TestCase):
             self.assertIn('negative control', prompt)
             self.assertIn('Unselected groups are not in scope', prompt)
             self.assertIn('Never change passwords', prompt)
+            self.assertIn('same rejection or no security-relevant difference', prompt)
+            self.assertIn('finding nothing is a valid result', prompt)
+            self.assertIn('allowance is a ceiling, not a target', prompt)
             if role == 'reproducer':
                 self.assertIn('independently investigate up to three', prompt)
                 self.assertIn('never imply Scout independently confirmed it', prompt)
