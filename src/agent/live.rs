@@ -1581,7 +1581,9 @@ impl LiveBroker {
             run.arguments
                 .iter_mut()
                 .for_each(|v| *v = self.access.redact_limited(v, 4096).0);
-            let (cleaned, shortened) = self.access.redact_limited(&run.output_excerpt, 24 * 1024);
+            let (cleaned, shortened) = self
+                .access
+                .redact_tool_excerpt(&run.output_excerpt, 24 * 1024);
             run.output_truncated |= shortened;
             if cleaned != run.output_excerpt {
                 run.output_sha256 = hex::encode(Sha256::digest(cleaned.as_bytes()));
@@ -2045,6 +2047,52 @@ mod tests {
         ] {
             assert!(!recoverable_engine_error(&request, reason));
         }
+    }
+    #[test]
+    fn saved_engine_receipt_remains_json_after_a_short_cookie_is_observed() {
+        let broker = broker();
+        broker.access.remember_secret("1".into()).unwrap();
+        broker
+            .access
+            .remember_secret("fixture-session-cookie".into())
+            .unwrap();
+        let output = json!({"receipt_schema":1,"coverage_complete":true,
+            "stop_reason":"done","anonymous_evidence_count":1,
+            "findings_preview":[{"description":"fixture-session-cookie"}]})
+        .to_string();
+        let run = json!({"tool":"artex-engine","version":"fixture","arguments":[],
+            "started_at":1,"duration_ms":1,"exit_code":0,"failure":null,"evidence_ids":[],
+            "output_sha256":hex::encode(Sha256::digest(output.as_bytes())),
+            "output_excerpt":output,"output_truncated":false});
+        let report = AgentRun {
+            outcome: "completed",
+            events: vec![
+                json!({"event":"live_tool","data":{"run":run}}),
+                json!({"event":"phase","data":{"name":"agent_ready"}}),
+            ],
+            ..Default::default()
+        };
+        let settings: Settings = serde_json::from_value(json!({
+            "docker_socket":"/unused", "image":"fixture", "model_url":"https://example.com",
+            "model":"fixture", "model_digest":"fixture"
+        }))
+        .unwrap();
+        let saved = broker.result(&report, &settings, true, true);
+        let receipt = saved
+            .tool_runs
+            .iter()
+            .find(|r| r.tool == "artex-engine")
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&receipt.output_excerpt).unwrap();
+        assert_eq!(parsed["coverage_complete"], true);
+        assert_eq!(parsed["receipt_schema"], 1);
+        assert_eq!(parsed["anonymous_evidence_count"], 1);
+        assert!(!receipt.output_excerpt.contains("fixture-session-cookie"));
+        assert_eq!(
+            receipt.output_sha256,
+            hex::encode(Sha256::digest(receipt.output_excerpt.as_bytes()))
+        );
+        assert!(!receipt.output_truncated);
     }
     #[test]
     fn engine_start_receipt_survives_interruption_and_is_replaced_on_completion() {

@@ -104,7 +104,63 @@ impl Access {
             .map(|(username, _)| username.as_str())
     }
     pub fn redact_limited(&self, value: &str, limit: usize) -> (String, bool) {
-        let mut text = self.redact(value);
+        Self::limit_text(self.redact(value), limit)
+    }
+    /// Tool receipts contain typed counters and flags as well as untrusted
+    /// strings. Redacting their serialized bytes can turn `1` into bare
+    /// `REDACTED`, making an otherwise complete receipt unreadable.
+    pub fn redact_tool_excerpt(&self, value: &str, limit: usize) -> (String, bool) {
+        let Ok(mut parsed) = serde_json::from_str(value) else {
+            return self.redact_limited(value, limit);
+        };
+        self.redact_tool_json(&mut parsed);
+        Self::limit_text(serde_json::to_string(&parsed).expect("JSON receipt"), limit)
+    }
+    fn redact_tool_json(&self, value: &mut serde_json::Value) {
+        use serde_json::Value;
+        match value {
+            Value::String(text) => *text = self.redact(text),
+            Value::Array(items) => items
+                .iter_mut()
+                .for_each(|item| self.redact_tool_json(item)),
+            Value::Object(fields) => {
+                for (key, mut child) in std::mem::take(fields) {
+                    self.redact_tool_json(&mut child);
+                    let mut key = self.redact(&key);
+                    // Two private keys may redact to the same marker. Retain
+                    // both values without restoring either original key.
+                    let mut suffix = 2;
+                    while fields.contains_key(&key) {
+                        key = format!("REDACTED_{suffix}");
+                        suffix += 1;
+                    }
+                    fields.insert(key, child);
+                }
+            }
+            _ => {
+                let raw = value.to_string();
+                // Discovered short cookie flags such as "1" and "true" do
+                // not make every typed counter/boolean a credential. Supplied
+                // credentials and longer discovered secrets stay protected,
+                // even if a tool echoes them as a JSON scalar rather than text.
+                let sensitive = self
+                    .secrets
+                    .lock()
+                    .expect("redaction state poisoned")
+                    .iter()
+                    .enumerate()
+                    .any(|(index, secret)| {
+                        !secret.is_empty()
+                            && (index < self.supplied_secret_count || secret.chars().count() >= 8)
+                            && raw.contains(secret.as_str())
+                    });
+                if sensitive {
+                    *value = Value::String(self.redact(&raw));
+                }
+            }
+        }
+    }
+    fn limit_text(mut text: String, limit: usize) -> (String, bool) {
         let shortened = text.len() > limit;
         if shortened {
             let mut end = limit;
@@ -341,6 +397,58 @@ mod tests {
         let (bounded, shortened) = access.redact_limited("x ☃ x", 11);
         assert_eq!(bounded, "REDACTED ");
         assert!(shortened);
+    }
+    #[test]
+    fn structured_receipts_keep_flags_while_redacting_private_keys_and_scalar_echoes() {
+        use serde_json::{Value, json};
+        let scope: LiveScope = serde_json::from_value(json!({
+            "origins":["https://owned.example"], "methods":["GET"], "authentication":"basic"
+        }))
+        .unwrap();
+        let access = Access::new(
+            &scope,
+            Some(&TestCredentials::Basic {
+                username: "fixture-account".into(),
+                password: "246813".into(),
+            }),
+        )
+        .unwrap();
+        for secret in ["1", "true", "fixture-session-key", "876543210"] {
+            access.remember_secret(secret.into()).unwrap();
+        }
+        let receipt = json!({
+            "receipt_schema":1, "coverage_complete":true, "failure":null,
+            "findings_returned":1, "private": {
+                "fixture-session-key":"cookie=1 password=246813",
+                "REDACTED":"second value", "password_echo":246813,
+                "session_echo":876543210, "nested":["fixture-session-key",true]
+            }
+        })
+        .to_string();
+        assert!(serde_json::from_str::<Value>(&access.redact(&receipt)).is_err());
+        let (cleaned, shortened) = access.redact_tool_excerpt(&receipt, 24 * 1024);
+        assert!(!shortened);
+        assert!(
+            !cleaned.contains("246813")
+                && !cleaned.contains("876543210")
+                && !cleaned.contains("fixture-session-key")
+        );
+        let parsed: Value = serde_json::from_str(&cleaned).unwrap();
+        assert_eq!(parsed["receipt_schema"], 1);
+        assert_eq!(parsed["coverage_complete"], true);
+        assert_eq!(parsed["failure"], Value::Null);
+        assert_eq!(parsed["findings_returned"], 1);
+        assert_eq!(parsed["private"].as_object().unwrap().len(), 5);
+        assert_eq!(parsed["private"]["password_echo"], "REDACTED");
+        assert_eq!(parsed["private"]["session_echo"], "REDACTED");
+        assert_eq!(parsed["private"]["nested"], json!(["REDACTED", true]));
+        let (bounded, shortened) =
+            access.redact_tool_excerpt(&json!({"text":"é".repeat(100)}).to_string(), 31);
+        assert!(shortened && bounded.len() <= 31);
+        assert_eq!(
+            access.redact_tool_excerpt("plain cookie=1", 100),
+            ("plain cookie=REDACTED".into(), false)
+        );
     }
     #[test]
     fn short_observed_values_do_not_corrupt_code_but_supplied_credentials_stay_private() {
