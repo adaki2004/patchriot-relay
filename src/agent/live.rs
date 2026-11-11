@@ -341,29 +341,44 @@ impl LiveBroker {
                                 .as_ref()
                                 .and_then(|b| b.browser.lock().ok()?.proof.clone())
                         });
-                    workflow.checks[5].state = if proof.is_some() {
+                    let authentication = workflow
+                        .checks
+                        .iter_mut()
+                        .find(|c| c.id == CheckId::Authentication)
+                        .expect("validated workflow contains authentication");
+                    authentication.state = if proof.is_some() {
                         CheckState::Recorded
                     } else if count.evidence.iter().any(|e| e.login || e.authenticated) {
                         CheckState::Running
                     } else {
                         CheckState::Pending
                     };
-                    workflow.checks[5].evidence_count = if proof.is_some() { 2 } else { 0 };
+                    authentication.evidence_count = if proof.is_some() { 2 } else { 0 };
                     if count.evidence.iter().any(|e| {
                         e.authenticated
                             && !e.login
                             && proof.as_ref().is_none_or(|p| p.authenticated_id != e.id)
                     }) {
-                        workflow.checks[6].state = CheckState::Running;
+                        workflow
+                            .checks
+                            .iter_mut()
+                            .find(|c| c.id == CheckId::AuthenticatedChecks)
+                            .expect("validated workflow contains authenticated checks")
+                            .state = CheckState::Running;
                     }
                 }
                 // The outer investigator checks leads after discovery, before
                 // producing its report. That work belongs to evidence review;
                 // waiting until the result event hid this entire phase.
+                let review = workflow
+                    .checks
+                    .iter_mut()
+                    .find(|c| c.id == CheckId::EvidenceReview)
+                    .expect("validated workflow contains evidence review");
                 if matches!(phase, LivePhase::Investigating | LivePhase::Finishing)
-                    && workflow.checks[7].state == CheckState::Pending
+                    && review.state == CheckState::Pending
                 {
-                    workflow.checks[7].state = CheckState::Running;
+                    review.state = CheckState::Running;
                 }
             }
             *current = LiveProgress {
@@ -3032,7 +3047,17 @@ for _ in range(270): print(frame,flush=True)
         let progress = Progress::default();
         broker.update_progress(&progress, LivePhase::Investigating, 0, None);
         assert_eq!(
-            progress.lock().unwrap().workflow.as_ref().unwrap().checks[6].state,
+            progress
+                .lock()
+                .unwrap()
+                .workflow
+                .as_ref()
+                .unwrap()
+                .checks
+                .iter()
+                .find(|c| c.id == CheckId::Authentication)
+                .unwrap()
+                .state,
             CheckState::Pending
         );
         assert!(!broker.accept_workflow(&json!({"version":1,"checks":[]})));
@@ -3063,19 +3088,89 @@ for _ in range(270): print(frame,flush=True)
             broker.update_progress(&progress, phase, 0, None);
             let observed = progress.lock().unwrap();
             let checks = &observed.workflow.as_ref().unwrap().checks;
-            assert_eq!(checks[7].state, expected);
-            assert_eq!(checks[4].state, CheckState::Pending);
-            assert_eq!(checks[7].evidence_count, 0);
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|c| c.id == CheckId::EvidenceReview)
+                    .unwrap()
+                    .state,
+                expected
+            );
+            assert!(
+                checks
+                    .iter()
+                    .filter(|c| c.id != CheckId::EvidenceReview)
+                    .all(|c| c.state == CheckState::Pending)
+            );
+            assert!(checks.iter().all(|c| c.evidence_count == 0));
         }
         for state in [CheckState::Incomplete, CheckState::Recorded] {
             let mut saved = workflow.clone();
-            saved.checks[7].state = state;
+            saved
+                .checks
+                .iter_mut()
+                .find(|c| c.id == CheckId::EvidenceReview)
+                .unwrap()
+                .state = state;
             assert!(broker.accept_workflow(&serde_json::to_value(saved).unwrap()));
             broker.update_progress(&progress, LivePhase::Investigating, 0, None);
             assert_eq!(
-                progress.lock().unwrap().workflow.as_ref().unwrap().checks[7].state,
+                progress
+                    .lock()
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .checks
+                    .iter()
+                    .find(|c| c.id == CheckId::EvidenceReview)
+                    .unwrap()
+                    .state,
                 state
             );
+        }
+    }
+    #[test]
+    fn sign_in_progress_never_overwrites_deep_scan_or_public_checks() {
+        for version in [1, 2] {
+            let mut broker = broker();
+            Arc::get_mut(&mut broker).unwrap().scope.authentication = Some(TestAuthKind::Basic);
+            let workflow = AssessmentWorkflow {
+                version,
+                checks: CheckId::ALL
+                    .into_iter()
+                    .filter(|id| version == 2 || *id != CheckId::PublicDeep)
+                    .map(|id| CheckProgress {
+                        id,
+                        state: CheckState::Pending,
+                        evidence_count: 0,
+                        source_role: None,
+                    })
+                    .collect(),
+            };
+            assert!(broker.accept_workflow(&serde_json::to_value(&workflow).unwrap()));
+            broker.browser.lock().unwrap().proof = Some(BrowserAccessProof {
+                authenticated_id: 1,
+                anonymous_id: 2,
+                check: BrowserAccessCheck::ProtectedResource,
+            });
+            let progress = Progress::default();
+            broker.update_progress(&progress, LivePhase::ScopedTools, 0, None);
+            let observed = progress.lock().unwrap();
+            let checks = &observed.workflow.as_ref().unwrap().checks;
+            let auth = checks
+                .iter()
+                .find(|c| c.id == CheckId::Authentication)
+                .unwrap();
+            assert_eq!(auth.state, CheckState::Recorded);
+            assert_eq!(auth.evidence_count, 2);
+            assert!(
+                checks
+                    .iter()
+                    .filter(|c| c.id != CheckId::Authentication)
+                    .all(|c| c.state == CheckState::Pending && c.evidence_count == 0)
+            );
+            assert!(observed.workflow.as_ref().unwrap().valid());
         }
     }
     #[tokio::test]
