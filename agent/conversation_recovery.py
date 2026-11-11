@@ -26,7 +26,11 @@ def recover(result, prompt, deadline, factory, emit=lambda **_: None, call=repor
     agent = None
     try:
         emit(attempted=True, recovered=False, reason='context_overflow')
-        agent = factory(min(600, remaining - 20), 32)
+        allowance = min(600, remaining - 20)
+        recovery_deadline = time.monotonic() + allowance
+        # Reserve time and three turns for the existing formatting repair. Both
+        # phases share this deadline; repair must not add another three minutes.
+        agent = factory(max(1, allowance - 45), 29)
         instruction = (
             '\n\nThe previous conversation exceeded its context window. Continue this SAME role '
             'from the retained /work files and current-role /work/http-evidence records. '
@@ -40,7 +44,7 @@ def recover(result, prompt, deadline, factory, emit=lambda **_: None, call=repor
             'limitations; an additional context-recovery limitation will be attached automatically.'
         )
         resumed = agent.run_conversation(prompt + instruction)
-        resumed = report_finish.finish(agent, resumed, min(deadline, time.monotonic() + 180), call=call)
+        resumed = report_finish.finish(agent, resumed, recovery_deadline, call=call)
         if not (resumed.get('completed') is True and not resumed.get('failed')):
             return result
         assessment = json.loads(resumed.get('final_response', ''))

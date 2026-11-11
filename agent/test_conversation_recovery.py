@@ -2,7 +2,7 @@ import copy
 import json
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import conversation_recovery as recovery
 
 
@@ -21,7 +21,7 @@ class ConversationRecoveryTests(unittest.TestCase):
         self.assertTrue(result['completed']); self.assertFalse(result['failed'])
         self.assertEqual(failed, original)
         seconds, turns = factory.call_args.args
-        self.assertLessEqual(seconds,280); self.assertEqual(turns,32)
+        self.assertLessEqual(seconds,235); self.assertEqual(turns,29)
         self.assertEqual(agent.run_conversation.call_count,1)
         self.assertFalse(agent.run_conversation.call_args.kwargs, 'Never replay the overflowing history')
         self.assertNotIn('large transcript',agent.run_conversation.call_args.args[0])
@@ -54,6 +54,14 @@ class ConversationRecoveryTests(unittest.TestCase):
         calls=Mock(side_effect=[{'valid':True},{'valid':False}])
         self.assertIs(recovery.recover(failed,'role',time.monotonic()+500,Mock(return_value=agent),call=calls),failed)
         agent.close.assert_called_once()
+
+    def test_formatting_repair_shares_the_continuation_deadline(self):
+        resumed={'completed':True,'final_response':json.dumps({'summary':'x','findings':[],'limitations':[]})}
+        agent=Mock();agent.run_conversation.return_value=resumed;factory=Mock(return_value=agent)
+        with patch.object(recovery.time,'monotonic',return_value=100), patch.object(recovery.report_finish,'finish',return_value=resumed)as finish:
+            recovery.recover(self.failure(),'role',900,factory,call=Mock(return_value={'valid':True}))
+        factory.assert_called_once_with(555,29)
+        self.assertEqual(finish.call_args.args[2],700, 'Repair must stay inside the same ten minutes')
 
 
 if __name__ == '__main__':
