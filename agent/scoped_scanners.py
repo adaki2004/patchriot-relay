@@ -32,7 +32,22 @@ class Requests:
         self.discovery = discovery
         self.records, self.replies, self.gaps = [], {}, []
         self.calls = 0
+        self.slowest_request_seconds = 0.0
         self.lock = threading.Lock()
+
+    def can_start(self, requests):
+        """Plan a whole serial probe/control group before spending its first request.
+
+        Timing is an estimate, not an extension of the deadline. A slower reply
+        can still cause a real timeout, which __call__ keeps as incomplete.
+        """
+        with self.lock:
+            remaining = self.deadline - time.monotonic()
+            expected = self.slowest_request_seconds * 1.25 * requests + 0.25
+            if requests > 0 and self.calls + requests <= self.limit and remaining > expected:
+                return True
+            self.gaps.append('route_sample_limit' if self.calls and remaining > 0 else 'scanner_budget_reached')
+            return False
 
     def __call__(self, method, url, headers=None, **kwargs):
         # The scanner can run threads. Reserve its request slot before I/O.
@@ -44,10 +59,12 @@ class Requests:
                 self.gaps.append('outside_approved_scope')
                 return {'error': 'outside_approved_scope'}
             self.calls += 1
+        started = time.monotonic()
         reply = fetch_checked(self.fetch, method, url, headers, authenticated=self.account is not None,
                               account=self.account or 'testing', discovery=self.discovery, **kwargs)
         evidence = reply.get('evidence', {})
         with self.lock:
+            self.slowest_request_seconds = max(self.slowest_request_seconds, time.monotonic() - started)
             if evidence.get('id'):
                 self.records.append(evidence)
                 self.replies[evidence['id']] = reply

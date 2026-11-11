@@ -179,6 +179,7 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
             slice_seconds = min(seconds, max(0, (deadline - time.monotonic()) / remaining_slots))
             client = Requests(scope, min(deadline, time.monotonic() + slice_seconds), fetch,
                               account, limit=limit, discovery=True)
+            context_started = time.monotonic()
             urls = seeds[account]
             if function == schema_checks:
                 urls = sorted(urls, key=lambda u: not bool(re.search('openapi|swagger|graphql', u, re.I)))
@@ -193,6 +194,8 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
                 refs.append(e['id']); all_evidence[e['id']] = e
             family_gaps.extend(client.gaps)
             family_contexts.append({'account': account or 'anonymous', 'requests': len(client.records),
+                                    'allocated_seconds': round(slice_seconds, 2), 'request_limit': limit,
+                                    'duration_ms': round((time.monotonic() - context_started) * 1000),
                                     'result': compact(detail), 'gaps': sorted(set(client.gaps))})
         gaps.extend(family_gaps)
         detail = {'phase': 'scoped_deep_checks' if deep else 'scoped_discovery',
@@ -233,6 +236,8 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
         'limitations': ['Completion means the bounded plan ran, not exhaustive vulnerability coverage.',
             'Scanner leads require control requests and human review. No command execution, persistence, credential changes or database takeover checks.',
             'Public checks precede verified account checks; missing access is never a clean grey-box pass.']}
+    if 'route_sample_limit' in gaps:
+        summary['limitations'].append('Route sampling stopped before another complete comparison would exceed the request or time allowance; inspect component samples for untested paths.')
     (directory / ('deep-results.json' if deep else 'discovery-results.json')).write_text(
         json.dumps({**summary, 'details': details}))
     receipt = record(suite_tool, VERSION, arguments, started, observed, sorted(all_evidence),

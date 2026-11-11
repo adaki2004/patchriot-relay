@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import deep_checks as deep
 import deep_extra as extra
@@ -21,19 +22,11 @@ def scope(**overrides):
     return value
 
 
-class Client:
+class Client(Requests):
     """Minimal stand-in for the recording request client."""
 
     def __init__(self, fetch, sc=None, account=None, limit=40):
-        self.fetch, self.scope, self.account = fetch, sc or scope(), account
-        self.deadline, self.limit, self.calls, self.records, self.gaps = time.monotonic() + 60, limit, 0, [], []
-
-    def __call__(self, method, url, headers=None, **kwargs):
-        self.calls += 1
-        reply = self.fetch(method, url, headers, account=self.account, **kwargs)
-        reply['evidence'].setdefault('id', len(self.records) + 1)
-        self.records.append(reply['evidence'])
-        return reply
+        super().__init__(sc or scope(), time.monotonic() + 60, fetch, account, limit=limit)
 
 
 def reply(url, code=200, body='', headers=None):
@@ -156,6 +149,48 @@ class CrossAccountTests(unittest.TestCase):
 
 
 class SuiteTests(unittest.TestCase):
+    def test_unexpected_mid_comparison_timeout_is_still_incomplete(self):
+        clock = [1000.0]
+        with patch('time.monotonic', lambda: clock[0]), tempfile.TemporaryDirectory() as folder:
+            def fetch(method, url, headers=None, **kwargs):
+                clock[0] += 35.0
+                return reply(url, body='late reply')
+            result, _ = deep.run(scope(), [], {}, 1030.0, fetch=fetch,
+                directory=Path(folder), deep=True,
+                functions=[('patchriot-bypass', '1', extra.bypass, 30, 40)])
+        summary = json.loads(result['output_excerpt'])
+        self.assertFalse(summary['coverage_complete'])
+        self.assertIn('scanner_budget_reached', summary['collection_errors'])
+
+    def test_slow_replies_leave_complete_comparisons_and_explicit_sampling_limits(self):
+        for function in (extra.bypass, extra.inputs):
+            with self.subTest(family=function.__name__), tempfile.TemporaryDirectory() as folder:
+                clock = [1000.0]
+                calls = []
+
+                def fetch(method, url, headers=None, **kwargs):
+                    clock[0] += 2.0
+                    calls.append(url)
+                    value = reply(url, body='owned fixture')
+                    value['evidence'].update(method=method,
+                        authenticated=kwargs.get('authenticated', False), account=kwargs.get('account', 'testing'))
+                    return value
+
+                sc = scope(authentication='session', auth_check_path='/private')
+                access = {'verified': True, 'protected_url': ORIGIN + '/private'}
+                with patch('time.monotonic', lambda: clock[0]):
+                    result, parts = deep.run(sc, [], access, 1060.0, fetch=fetch,
+                        directory=Path(folder), deep=True,
+                        functions=[('patchriot-' + function.__name__, '1', function, 60, 40)])
+                summary = json.loads(result['output_excerpt'])
+                self.assertTrue(summary['coverage_complete'], summary)
+                self.assertLessEqual(clock[0], 1060.0)
+                self.assertTrue(all(n > 0 for n in summary['account_evidence_counts'].values()))
+                detail = json.loads(parts[0]['output_excerpt'])
+                self.assertIn('route_sample_limit', detail['gaps'])
+                self.assertNotIn('scanner_budget_reached', detail['gaps'])
+                self.assertTrue(all(c['result']['sampled_urls'] > 0 for c in detail['contexts']))
+
     def test_deep_mode_uses_deep_families_and_its_own_receipts(self):
         calls = []
 

@@ -106,20 +106,23 @@ def surface(client, urls):
 
 def bypass(client, urls):
     """Compare access-control path mutations with the unmutated originals."""
-    original, flipped = [], []
-    # Reserve the control, all variants and both method checks for each URL.
-    sampled = urls[:min(8, client.limit // (len(BYPASS) + 3))]
-    for url in sampled:
+    original, flipped, sampled = [], [], 0
+    for url in urls[:8]:
+        candidates = list(dict.fromkeys(candidate for variant in BYPASS
+            if (candidate := scoped_url(variant.replace('{}', urlsplit(url).path or '/'), url, client.scope))
+            and candidate != url))
+        methods = [method for method in ('HEAD', 'OPTIONS') if method in client.scope['methods']]
+        # Fit the original, every variant and method control before starting.
+        if not client.can_start(1 + len(candidates) + len(methods)):
+            break
+        sampled += 1
         base_status, _, _ = status(client('GET', url))
         original.append({'url': url, 'status': base_status})
-        for variant in BYPASS:
-            candidate = scoped_url(variant.replace('{}', urlsplit(url).path or '/'), url, client.scope)
-            if not candidate or candidate == url or client.calls >= client.limit:
-                continue
+        for candidate in candidates:
             code, _, _ = status(client('GET', candidate))
             if base_status in (401, 403) and code and 200 <= code < 300:
                 flipped.append({'url': candidate, 'control': base_status, 'status': code})
-        for method in ('HEAD', 'OPTIONS'):
+        for method in methods:
             code, headers, _ = status(client(method, url))
             allow = headers.get('allow') or headers.get('access-control-allow-methods')
             if base_status == 404 and code and 200 <= code < 300:
@@ -127,7 +130,7 @@ def bypass(client, urls):
             elif allow:
                 flipped.append({'url': url, 'method': method, 'allow': allow})
     return {'controls': original, 'flipped': flipped[:16],
-            'sampled_urls': len(sampled), 'available_urls': len(urls),
+            'sampled_urls': sampled, 'available_urls': len(urls),
             'limitations': ['Cases, separators and method switching only; no payload or verb tampering.']}
 
 
@@ -135,8 +138,11 @@ def headers(client, urls):
     """Injected-header reflection, then a clean re-request to detect caching."""
     reflected, persisted = [], []
     # Each reflected header needs a clean control; budget both before starting.
-    sampled = urls[:min(6, client.limit // (2 * len(INJECT_HEADERS)))]
-    for url in sampled:
+    sampled = 0
+    for url in urls[:6]:
+        if not client.can_start(2 * len(INJECT_HEADERS)):
+            break
+        sampled += 1
         for name, value in INJECT_HEADERS:
             reply = client('GET', url, headers={name: value})
             code, headers_out, body = status(reply)
@@ -146,7 +152,7 @@ def headers(client, urls):
                 if value in (clean_body or '') or value in (clean_headers.get('location') or ''):
                     persisted.append({'url': url, 'header': name})
     return {'reflected': reflected, 'persisted': persisted,
-            'sampled_urls': len(sampled), 'available_urls': len(urls),
+            'sampled_urls': sampled, 'available_urls': len(urls),
             'limitations': ['A reflected header alone is not host-header injection; the clean re-request is the cache check.']}
 
 
@@ -171,7 +177,7 @@ def inputs(client, urls):
     observed, sampled = [], 0
     for url, query in candidates[:6]:
         required = 1 + sum(3 + int(bool(FILE_PARAM.match(name))) for name, _ in query[:3])
-        if client.calls + required > client.limit:
+        if not client.can_start(required):
             break
         sampled += 1
         code, _, body = status(client('GET', url))

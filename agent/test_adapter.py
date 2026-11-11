@@ -258,7 +258,7 @@ class LiveOverviewTests(unittest.TestCase):
             {'tool':'patchriot-discovery', 'output_excerpt':'truncated {'},
             {'tool':'patchriot-discovery', 'output_excerpt':'[]'}, {'tool':'nuclei'}]), [])
 
-    def test_validation_only_never_restarts_missing_discovery_and_preserves_claim_evidence(self):
+    def test_validator_reuses_discovery_and_preserves_claim_evidence(self):
         scope = {'origins':['https://owned.example'], 'tools':['scoped_discovery_v1']}
         previous = [{'role':'investigator', 'assessment':{'summary':'Owned fixture', 'findings':[
             {'title':'Fixture claim', 'evidence_ids':[7]}]}, 'evidence':[{'id':7,'url':'https://owned.example/api','status':403}]}]
@@ -290,6 +290,20 @@ class LiveOverviewTests(unittest.TestCase):
         prompt = live_review.prompt('reproducer', review_policy='investigate_validate_v1')
         self.assertIn('Do not repeat scoped scanners', prompt)
         self.assertIn('fresh', prompt)
+
+    def test_evidence_followup_allows_focused_discovery_without_relaxing_scope(self):
+        for role in ('investigator', 'reproducer'):
+            prompt = live_review.prompt(role, browser=True, access_prepared=True,
+                engine_ran=role == 'investigator', review_policy='investigate_validate_v1', deep=True)
+            self.assertIn('perform a focused vulnerability investigation', prompt)
+            self.assertIn('All target traffic must still use the relay', prompt)
+            self.assertIn('negative control', prompt)
+            self.assertIn('Unselected groups are not in scope', prompt)
+            self.assertIn('Never change passwords', prompt)
+            if role == 'reproducer':
+                self.assertIn('independently investigate up to three', prompt)
+                self.assertIn('never imply Scout independently confirmed it', prompt)
+                self.assertNotIn('fresh controls only for the supplied claims', prompt)
 
 
     def test_limited_scan_hands_evidence_to_targeted_review_without_broad_rescan(self):
