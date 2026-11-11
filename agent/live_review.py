@@ -163,6 +163,33 @@ def overview(directory):
                               for t in tools["tool_runs"][:20]]}
 
 
+def prepare_access(scope, role, browser, run_login, access_status, request, emit):
+    """Each role proves its own access, independently of discovery reuse.
+
+    Prior reports can orient validation but cannot prove this worker's session.
+    A later role uses the protected reference account when two were supplied;
+    the testing account may have been changed with the requester's permission.
+    The broker still decides scope, identity and proof validity.
+    """
+    runs_discovery(role)  # validate the assigned role, never model-selected
+    requested = bool(scope.get('authentication'))
+    prepared = requested and browser is not None
+    if prepared:
+        accounts = (['reference', 'testing'] if role == 'investigator' else ['reference']) if scope.get('account_policy') is not None else ['testing']
+        for account in accounts:
+            browser.activate(account)
+            run_login(account)
+            verification = browser.verify_observed(account)
+            emit('phase', name='access_preparation', account=account, **verification)
+    elif requested and scope.get('auth_check_path'):
+        protected = scope['origins'][0] + scope['auth_check_path']
+        request('GET', protected, authenticated=True)
+        request('GET', protected, authenticated=False)
+    access = access_status()
+    access['requested'] = requested
+    return prepared, access
+
+
 def validation_brief(directory):
     """A compact index into saved evidence, never a substitute for fresh controls."""
     previous = json.loads((directory / 'previous.json').read_text())

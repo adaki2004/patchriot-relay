@@ -890,6 +890,49 @@ class SourceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             inspect_source.inspect(json.dumps(too_many).encode(), [])
 
+class RoleAccessPreparationTests(unittest.TestCase):
+    def test_recon_reuses_discovery_but_must_still_establish_fresh_browser_proof(self):
+        browser, login, emit = Mock(), Mock(), Mock()
+        browser.verify_observed.return_value = {'verified': True, 'checks': 2}
+        scope = {'origins':['https://owned.example'], 'authentication':'session', 'browser_login':{}}
+        prepared, access = live_review.prepare_access(scope,'reproducer',browser,login,
+            lambda: {'verified': True}, Mock(), emit)
+        self.assertTrue(prepared)
+        browser.activate.assert_called_once_with('testing')
+        login.assert_called_once_with('testing')
+        browser.verify_observed.assert_called_once_with('testing')
+        self.assertTrue(access['verified'])
+        self.assertTrue(access['requested'])
+
+    def test_direct_wallet_validator_records_both_fresh_controls(self):
+        request = Mock()
+        scope = {'origins':['https://owned.example'],'authentication':'wallet','auth_check_path':'/private'}
+        prepared, access = live_review.prepare_access(scope,'reproducer',None,Mock(),
+            lambda: {'verified':True},request,Mock())
+        self.assertFalse(prepared)
+        self.assertEqual(request.call_args_list,[
+            unittest.mock.call('GET','https://owned.example/private',authenticated=True),
+            unittest.mock.call('GET','https://owned.example/private',authenticated=False)])
+        self.assertTrue(access['requested'])
+
+    def test_later_role_preserves_changed_testing_account_and_does_not_invent_proof(self):
+        scope={'origins':['https://owned.example'],'authentication':'session','account_policy':{}}
+        browser,login=Mock(),Mock()
+        browser.verify_observed.return_value={'verified':False,'checks':4}
+        prepared,access=live_review.prepare_access(scope,'reproducer',browser,login,
+            lambda: {'verified':False},Mock(),Mock())
+        self.assertTrue(prepared)  # attempted is deliberately not verified
+        self.assertFalse(access['verified'])
+        login.assert_called_once_with('reference')
+        browser.activate.assert_called_once_with('reference')
+        browser.verify_observed.assert_called_once_with('reference')
+
+    def test_black_box_never_attempts_login_or_credential_checks(self):
+        browser,login,request=Mock(),Mock(),Mock()
+        prepared,access=live_review.prepare_access({'origins':['https://owned.example']},'investigator',browser,login,lambda:{},request,Mock())
+        self.assertFalse(prepared);self.assertFalse(access['requested'])
+        login.assert_not_called();request.assert_not_called();browser.activate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

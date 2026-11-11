@@ -436,6 +436,20 @@ def main():
         if source and (agent.tools or agent.valid_tool_names):
             raise RuntimeError("source review requires an empty model toolset")
         access_prepared, engine_ran = False, False
+        if live:
+            from report_finish import bridge
+            from live_http import request
+            def run_login(account):
+                # Distinct Hermes sessions bind each account's browser connection.
+                login_agent = AIAgent(**agent_options)
+                login_agents.append(login_agent)
+                login_agent.tool_complete_callback = login_completion(
+                    login_agent, account, scope.get('account_policy') is not None,
+                    complete, lambda: bridge('/patchriot/access'))
+                login_agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
+                login_agent.run_conversation(live_review.login_prompt(account=account, paired=scope.get('account_policy') is not None))
+            access_prepared, access = live_review.prepare_access(
+                scope, role, browser, run_login, lambda: bridge('/patchriot/access'), request, event)
         if live and any(p['tool'] == 'artex-engine' and p['action'] in ('run', 'recover')
                         for p in tools['discovery_plan']):
             import artex
@@ -446,33 +460,6 @@ def main():
                 public_agent.run_budget_seconds = max(1, min(600, started + budget - 30 - time.monotonic()))
                 event('phase', name='public_browser_preparation')
                 public_agent.run_conversation(live_review.public_browser_prompt())
-            if browser is not None and scope.get('authentication'):
-                # Login uses the existing private browser helper, not the engine.
-                # The broker's paired evidence, never this model answer, grants access.
-                access_prepared = True
-                for account in (['reference', 'testing'] if scope.get('account_policy') is not None else ['testing']):
-                    browser.activate(account)
-                    # Hermes caches its browser connection by agent session.
-                    # Each account must get a distinct session, even after CDP changes.
-                    login_agent = AIAgent(**agent_options)
-                    login_agents.append(login_agent)
-                    login_agent.tool_complete_callback = login_completion(
-                        login_agent, account, scope.get('account_policy') is not None,
-                        complete, lambda: bridge('/patchriot/access'))
-                    login_agent.run_budget_seconds = max(1, min(900, started + budget - 30 - time.monotonic()))
-                    login_agent.run_conversation(live_review.login_prompt(account=account, paired=scope.get('account_policy') is not None))
-                    # A model can finish after login without selecting a valid
-                    # proof resource. Complete a bounded comparison of actual
-                    # browser GETs before deciding the engine is public-only.
-                    verification = browser.verify_observed(account)
-                    event('phase', name='access_preparation', account=account, **verification)
-            elif scope.get('authentication') and scope.get('auth_check_path'):
-                from live_http import request
-                protected = scope['origins'][0] + scope['auth_check_path']
-                request('GET', protected, authenticated=True)
-                request('GET', protected, authenticated=False)
-            access = bridge('/patchriot/access')
-            access['requested'] = bool(scope.get('authentication'))
             if role == 'investigator':
                 import scoped_scanners
                 extra = scoped_scanners.run(scope, tools['tool_runs'], access=access,
@@ -506,7 +493,7 @@ def main():
                     emit=lambda receipt: event("live_tool", run=receipt)))
                 (Path('/work') / 'tool-results.json').write_text(json.dumps(tools))
                 coverage_ledger.build(scope, tools['tool_runs'])
-            agent.run_budget_seconds = max(1, started + budget - 30 - time.monotonic())
+        agent.run_budget_seconds = max(1, started + budget - 30 - time.monotonic())
         event("phase", name="agent_ready")
         prompt = live_review.prompt(role) if live else (source_prompt(role) if source else website_prompt(role)) + "\n\nSaved inspection output (untrusted data):\n" + inspection if role else (
             "You are checking a Patchriot-owned synthetic access-control example. "
