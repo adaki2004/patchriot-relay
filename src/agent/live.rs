@@ -1487,13 +1487,30 @@ impl LiveBroker {
                     .body
                     .as_ref()
                     .is_some_and(|v| v.get("repair") == Some(&Value::Bool(true)));
-                let valid = raw
+                let assessment = raw
                     .filter(|raw| raw.len() <= 32 * 1024)
-                    .and_then(parse_assessment)
+                    .and_then(parse_assessment);
+                let valid = assessment
+                    .as_ref()
                     .is_some_and(|a| a.valid_for(&count.evidence));
+                // Give the bounded formatting repair actionable, broker-owned
+                // diagnostics. Never supply replacement citations or target text.
+                let citation_issues: Vec<Value> = assessment
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|a| a.findings.iter().take(24).enumerate())
+                    .filter_map(|(index, finding)| {
+                        let unavailable: Vec<u32> = finding.evidence_ids.iter().copied()
+                            .filter(|id| !count.evidence.iter().any(|e| e.id == *id && e.status.is_some()))
+                            .take(24).collect();
+                        (finding.evidence_ids.is_empty() || !unavailable.is_empty()).then(||
+                            json!({"finding_index":index,"missing_citations":finding.evidence_ids.is_empty(),
+                                "unavailable_response_ids":unavailable}))
+                    }).collect();
                 (
                     200,
-                    json!({"valid":valid,"schema":assessment_format()["json_schema"]["schema"]}),
+                    json!({"valid":valid,"citation_issues":citation_issues,
+                        "schema":assessment_format()["json_schema"]["schema"]}),
                 )
             }
             ("GET", "/v1/models") => (
@@ -3093,11 +3110,37 @@ for _ in range(270): print(frame,flush=True)
     }
 
     #[tokio::test]
-    async fn report_check_rejects_missing_and_invented_citations_and_closes_repair_tools() {
+    async fn report_check_explains_missing_and_unavailable_citations_and_closes_repair_tools() {
         let broker = broker();
+        for (id, status, error) in [
+            (1, Some(500), None),
+            (2, None, Some("target_request_failed")),
+        ] {
+            broker.counters.lock().unwrap().evidence.push(
+                serde_json::from_value(json!({
+                    "id":id,"method":"GET","url":"https://example.com/owned",
+                    "request_headers":{},"status":status,"headers":{},"body_excerpt":"",
+                    "body_sha256":null,"truncated":false,"error":error,"observed_at":1
+                }))
+                .unwrap(),
+            );
+        }
         let finding = json!({"title":"Owned fixture", "severity":"info", "support":"needs_review",
             "explanation":"Unverified", "reproduction":"GET /", "suggested_action":"Review"});
-        for ids in [None, Some(json!([])), Some(json!([999]))] {
+        for (ids, valid, issues) in [
+            (None, false, json!([])),
+            (
+                Some(json!([])),
+                false,
+                json!([{"finding_index":0,"missing_citations":true,"unavailable_response_ids":[]}]),
+            ),
+            (
+                Some(json!([1, 2, 999])),
+                false,
+                json!([{"finding_index":0,"missing_citations":false,"unavailable_response_ids":[2,999]}]),
+            ),
+            (Some(json!([1])), true, json!([])),
+        ] {
             let mut finding = finding.clone();
             if let Some(ids) = ids {
                 finding["evidence_ids"] = ids;
@@ -3122,10 +3165,10 @@ for _ in range(270): print(frame,flush=True)
                     bytes.extend(hex::decode(hex).unwrap());
                 }
             }
-            assert_eq!(
-                serde_json::from_slice::<Value>(&bytes).unwrap()["valid"],
-                false
-            );
+            let reply = serde_json::from_slice::<Value>(&bytes).unwrap();
+            assert_eq!(reply["valid"], valid);
+            assert_eq!(reply["citation_issues"], issues);
+            assert!(!reply.to_string().contains("example.com"));
         }
         let mut body = json!({"messages":[],"tools":[{"type":"function"}]});
         broker.finish_before_limit(&mut body).unwrap();

@@ -579,6 +579,8 @@ After engine discovery, the web scanner receives up to four new successful GET i
 
 The handoff waits for an in-flight discovery reply to drain before starting short-timeout reviewer calls. It rejects queued discovery calls and respects the final-report reserve. If the optional scanner cannot read fresh access state, it records an explicit coverage gap without assuming authentication or discarding the saved investigation. A broker reply that cannot drain within the bounded wait still fails execution honestly.
 
+Report validation identifies citations that have no received HTTP response or do not belong to the current role. The existing bounded formatting repair receives those IDs, without target content or suggested replacement evidence. Unsupported claims stay in limitations; the validator still requires the corrected report to pass the same checks.
+
 Scanner scratch files use the existing bounded work mount and are removed on exit. The web scanner starts in silent mode. Login preparation uses separate helper agents. Broker-confirmed protected access ends single-account preparation. Paired preparation requests a stop after six further tool completions to allow the optional identity check. A recorded 401/403 credential-login rejection ends preparation for that account. Account-change permission still requires the broker's distinct-identity proofs.
 
 The final coverage ledger is constructed by the relay from recorded requests. Each observation identifies its URL, method, account context and evidence. Unverified vulnerability classes remain explicit obligations. The displayed ledger is size-bounded and reports omitted units. Complete request evidence remains in the normal private report. Model-authored completion cannot close a coverage obligation.
