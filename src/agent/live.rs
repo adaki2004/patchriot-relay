@@ -1091,6 +1091,7 @@ impl LiveBroker {
                         "content-length",
                         "transfer-encoding",
                         "proxy-authorization",
+                        "accept-encoding",
                     ]
                     .contains(&k.to_ascii_lowercase().as_str())
             })
@@ -1132,7 +1133,8 @@ impl LiveBroker {
             .map_err(|_| "unsupported_method")?;
         let mut request = client
             .request(method, destination)
-            .header("user-agent", "Patchriot-authorized-review/0.0.2");
+            .header("user-agent", "Patchriot-authorized-review/0.0.2")
+            .header("accept-encoding", "identity");
         for (key, value) in &probe.headers {
             request = request.header(key, value);
         }
@@ -1315,6 +1317,9 @@ impl LiveBroker {
                     received.clear();
                 }
                 let (redacted, shortened) = if login {
+                    // Only the private Rust login/wallet handlers use this
+                    // branch (CSRF/challenge parsing). engine_http always uses
+                    // login=false. Do not expose this internal reply to a model.
                     (String::from_utf8_lossy(&received).into_owned(), false)
                 } else {
                     self.access

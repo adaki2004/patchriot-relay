@@ -11,6 +11,8 @@
 /models/
 /artifacts/
 /runtime-logs/
+agent-settings.json
+/agent/toolchain.json
 *.sqlite
 *.sqlite-*
 # Build and dependency output

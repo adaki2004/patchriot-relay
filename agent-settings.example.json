@@ -1,0 +1,9 @@
+{
+  "docker_socket": "/var/run/docker.sock",
+  "image": "sha256:REPLACE_WITH_YOUR_TESTED_IMAGE_ID",
+  "model_url": "https://cloud-api.near.ai/v1",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated",
+  "model_digest": "provider-managed-not-attested",
+  "live_provider_key_file": "/absolute/private/primary.key",
+  "max_attempt_seconds": 3600
+}

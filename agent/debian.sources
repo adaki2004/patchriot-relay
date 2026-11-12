@@ -1,0 +1,15 @@
+# Frozen package index for this image; update deliberately with the image tests.
+# Archived Release files retain their signature checks. Only their expiry is ignored.
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian/20261112T000000Z/
+Suites: trixie trixie-updates
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
+Check-Valid-Until: no
+
+Types: deb
+URIs: https://snapshot.debian.org/archive/debian-security/20261112T000000Z/
+Suites: trixie-security
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
+Check-Valid-Until: no

@@ -2,11 +2,39 @@
 import argparse
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 EVIDENCE_DIRECTORY = Path('/work/http-evidence')
+WORK_DIRECTORY = Path('/work')
+# Leave room for the final report and scanner bookkeeping. This helper cannot
+# police arbitrary writes by other tools; the container tmpfs remains bounded.
+REPORT_RESERVE_BYTES = 8 * 1024 * 1024
+
+
+def save_body(destination, body):
+    path = Path(destination).resolve()
+    if not path.is_relative_to(WORK_DIRECTORY.resolve()) or path == WORK_DIRECTORY.resolve():
+        return {'save_body_error': 'outside_work_directory'}
+    data = body.encode('utf-8')
+    temporary = None
+    try:
+        if shutil.disk_usage(WORK_DIRECTORY).free < REPORT_RESERVE_BYTES + len(data):
+            return {'save_body_error': 'report_space_reserved'}
+        # Do not destroy an earlier saved body if this write fails partway.
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as saved:
+            temporary = Path(saved.name)
+            saved.write(data)
+        os.replace(temporary, path)
+        return {'saved_body': str(path)}
+    except OSError:
+        return {'save_body_error': 'unavailable'}
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def binary_response(reply):
@@ -51,6 +79,9 @@ def retain_evidence(reply):
         return reply
     try:
         EVIDENCE_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if shutil.disk_usage(EVIDENCE_DIRECTORY).free < REPORT_RESERVE_BYTES + 64 * 1024:
+            reply['evidence_cache_error'] = 'report_space_reserved'
+            return reply
         path = EVIDENCE_DIRECTORY / f"{record['id']}.json"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w') as saved:
@@ -122,14 +153,10 @@ if __name__ == "__main__":
         result = request(args.method, args.url, {k.strip(): v.strip() for k, v in headers.items()}, data=args.data, authenticated=not args.anonymous, account=args.account)
     body = result.get("body", "")
     if args.save_body:
-        path = Path(args.save_body).resolve()
-        if not path.is_relative_to("/work"):
-            raise SystemExit("Save analysis files under /work")
         if result.get('body_unavailable'):
             result['save_body_error'] = result['body_unavailable']
         else:
-            path.write_text(body)
-            result["saved_body"] = str(path)
+            result.update(save_body(args.save_body, body))
     result["body"] = body[:args.body_chars]
     result["display_shortened"] = len(body) > args.body_chars
     print(json.dumps(result))

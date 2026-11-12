@@ -2,16 +2,39 @@
 Description=Patchriot relay (%i)
 Wants=network-online.target
 After=network-online.target docker.service
-StartLimitIntervalSec=0
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=patchriot
 Group=patchriot
 SupplementaryGroups=docker
+# Docker access is privileged. These restrictions limit this broker process;
+# they do not turn a docker-group account into an unprivileged host user.
 UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/patchriot-relay/%i
+# Broker limits only; Docker's containers have their own enforced limits.
+MemoryMax=1G
+TasksMax=128
 ExecStart=/usr/local/bin/patchriot-relay connect --state-dir /var/lib/patchriot-relay/%i --agents --agent-config /var/lib/patchriot-relay/%i/agent-settings.json --live-tests
-Restart=always
+Restart=on-failure
 RestartSec=30
 TimeoutStopSec=60
 KillMode=control-group
