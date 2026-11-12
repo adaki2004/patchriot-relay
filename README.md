@@ -1,655 +1,183 @@
+<p align="center"><img src="docs/assets/patchriot-banner.png" alt="Your webapp, our AI swarm. See what hackers see." width="1000"></p>
+
 # Patchriot relay
 
-**Connect an approved agent. Keep its work within scope.**
+**Connect an agent machine. Keep its work within the agreed scope.** The relay pairs your machine with a Patchriot dispatcher, runs Hermes in a restricted container and returns evidence for a private security report. The local HTTP-only trial also works on macOS with Docker Desktop.
 
-The relay connects a managed Kali machine to Patchriot’s dispatcher, starts Hermes in an isolated container and returns its evidence. It is the connection and supervision layer; Hermes is the agent, and the selected model supplies its inference.
+Patchriot is a **pre-penetration testing suite**: selected tools and agent-led investigation help a human team find and assess weaknesses. A completed agent run is not proof that a website is safe.
 
-[Patchriot ↗](https://patchriot.net) · [Core](https://github.com/adaki2004/patchriot-core) · [Agent overview](https://patchriot.net/#/docs/agents)
+[Hosted service](https://patchriot.net) · [Full local setup](https://github.com/adaki2004/patchriot-core#run-locally) · [Checks and tools](https://patchriot.net/#/docs/checks)
 
-```mermaid
-flowchart LR
-    D[Dispatcher: approved assignment] --> R[Relay]
-    R --> H[Isolated Hermes + testing tools]
-    H -->|Scoped requests| W[Verified web app]
-    H <-->|Approved provider via relay| N[NEAR AI Private TEE or Venice]
-    H -->|Recorded evidence| R
-    R --> D
-```
+## Architecture
 
-## What runs where
+![Relay highlighted: the dispatcher assigns approved work to isolated agents; the relay brokers inference and requests to the authorized website.](docs/assets/architecture.png)
 
-| Layer | Job |
+| Repository | Responsibility |
 | --- | --- |
-| **Relay / managed Kali** | Device identity, assignments, time and spending limits, target checks, cancellation and cleanup |
-| **Isolated Hermes container** | Investigates the approved target with the permitted tools |
-| **Configured model provider** | NEAR AI: encrypted requests, attestation and signed responses. Venice: the selected API model. The request records the allowed routes. |
+| [patchriot-core](https://github.com/adaki2004/patchriot-core) | Website, accounts, payments and shared protocol |
+| [patchriot-dispatcher](https://github.com/adaki2004/patchriot-dispatcher) | Permission, scheduling, leases and reports |
+| **[patchriot-relay](https://github.com/adaki2004/patchriot-relay)** · you are here | Device pairing, container execution, scoped HTTP and inference access |
 
-On the NEAR route, only the model step runs inside its TEE. The agent host and approved operator still handle assigned content. Venice is also supported as primary or backup; that API route has no relay-verified TEE. Reports preserve actual routing. Containers receive neither host secrets nor unrestricted network access.
+The **Rust relay is trusted host software**. It holds the device key, checks target permissions and owns the provider connection. The agent container receives no provider key, host home directory or Docker socket. Its network is disabled; permitted model and target calls pass through the relay. Docker access makes the relay operator a trusted host administrator.
 
-For a consented worker pool, the dispatcher selects the worker when a role becomes ready. The signed evidence response identifies that worker; the relay binds inference to its saved model declaration rather than its position in the pool. Older pinned assignments keep their original role ordering.
+Scout investigates; a different device runs Recon to validate findings and explore a few missed leads. These are sequential roles, not votes. Devices sharing a host or operator do not establish independent trust. Joining the hosted worker pool requires staff approval; pairing alone does not grant private work.
 
-For new two-agent requests, Scout runs the full scoped investigation and Recon validates those findings and investigates up to three promising, untested leads from the observed surface. It reuses discovery and reports its own new observations without implying Scout confirmed them. No automatic third role runs; older requests retain their saved policy. Reports list the tools actually run. An optional check can fail while the agent still returns useful evidence; that gap stays visible. Successful defenses and ordinary behavior belong in the summary, not the vulnerability list. A matching answer is not proof of a vulnerability or of independent reviewers.
+## Two NEAR building blocks
 
-Agents receive a compact index of working requests, with account context and evidence references. Schema checks reuse observed GET object IDs before varying inputs. POST field names help the agent investigate a working request; they do not trigger automatic write replays. The optional account comparison re-reads observed objects in verified sessions and anonymously, then repeats the original baseline. It preserves object IDs, shares one request cap and treats matching public data as a lead requiring ownership and privacy evidence. No file-upload capability is added.
+- **[NEAR AI](https://docs.near.ai/cloud/verification):** the relay's NEAR route encrypts model exchanges and checks attestation and response signatures before returning model output. Verification covers inference, not the operator's machine or a finding's accuracy.
+- **[NEAR Intents / 1Click](https://docs.near-intents.org/integration/distribution-channels/1click-api/about-1click-api):** core settles customer top-ups. The relay receives approved work, never treasury keys or authority to move customer funds.
 
-Later roles reuse completed discovery records, but establish and verify their own account access before validation. Login preparation and the bounded check of observed protected resources run even when the full engine scan is reused. Direct authenticated-HTTP roles repeat both the signed-in request and its anonymous control; a prior role’s session cannot satisfy that requirement. With two accounts, later roles use the protected reference account. When scoped discovery reaches a time or request limit after saving target responses, the next agent uses those records for targeted checks instead of repeating the broad scan. Coverage stays incomplete. Missing discovery or a failed startup can be retried once; older, truncated receipts retain that recovery path. If a role stops before returning its assessment, its saved requests remain available but are not a clean result. Progress distinguishes investigation from context summarization and shows how long the current model call has been waiting.
-
-Discovery includes **ARES-derived web fingerprints** (`ares-web-surface`): at most 24 anonymous reads per approved origin, checking framework hints, common admin paths and recognizable exposed-file/API responses. Reports name the adapted component and pinned source revision. A login page, public API schema, redirect or access denial is not automatically a vulnerability. Missing-path controls and reviewer checks are required. This does not run the full ARES framework or scan server ports. Deploy the matching core and dispatcher protocol before rebuilding these agent images; old receipts and assignments remain supported.
-
-A provider rate limit during discovery ends that engine attempt and preserves its partial evidence for the reviewer. It does not trigger extra model retries or mark discovery complete. The reviewer still needs available inference to produce its assessment; provider authentication and verification failures stop the role.
-
-Conversations still have a transport size limit. If the HTTP body or its encoded message is too large, the local bridge returns a size error so Hermes can compact its history. That rejected input never reaches the model provider; it is not retried as a network outage.
-
-Repeated model-request history does not consume the retained-output allowance. Each request still has its frame, call, time and spending limits; stderr and tool/result events retain their separate cumulative limit. Stop logs record these byte counts without printing prompts or target responses.
-
-Live conversations start compression at 32,000 tokens within the configured 64,000-token window. Summaries are asked to stay under 1,000 words and retain scope, evidence references and unfinished checks; the model's output and spending limits remain enforced separately. The relay reserves up to ten minutes of a role for its report, capped at one third of the role's time allowance, allowing for slow verified model responses and the consented backup. Saved requests remain available after compression; neither a summary nor an unfinished run counts as a verified finding.
-
-A fully buffered generation rejected for a repeated-output loop gets one fresh attempt on the same provider with a concise continuation instruction and low reasoning effort. It consumes another call slot and cost reservation. The configured, consented fallback remains available after primary recovery fails. Repeated discovery failure closes the engine with retained partial evidence so the reviewer can produce a report. Coverage remains incomplete, and later validation reuses the retained work. Authentication and attestation failures retain their existing failure handling.
-
-An entirely empty, output-limited generation can also receive one lower-reasoning attempt before the runtime sees it. Both generations retain their usage and cost observations and consume the normal allowance. Visible partial answers, refusals and tool calls are never replaced. An already-low-effort request or a second empty response gets no further retry here; failed report validation remains a failure. This recovery does not repeat the investigation.
-
-**Slow or stalled providers:** each model attempt has a three-minute reply deadline, including NEAR verification. The existing consented backup can run once for initial recovery; both attempts keep their cost reservations if charges are uncertain. If a previously working backup later fails, one return to the approved primary is allowed for the role, consuming another call slot and reservation. Discovery stops after fifteen minutes without a new target observation or distinct successful tool result. Local analysis of downloaded files can continue; heartbeats, errors and repeated command/output pairs do not reset the watchdog. Local activity does not count as new target evidence. Collected evidence is kept for the reviewer, and unfinished coverage is shown in the tool receipt. These bounds can interrupt legitimate slow analysis; they do not guarantee a short assessment or complete coverage. Update the relay and agent image together.
-
-When the broker withholds a body that it cannot safely inspect, the mirror returns an explicit local transport error with the original target status and evidence ID. It does not present a successful empty target body, and that transport error does not count as new target progress. Secret-inspection limits remain enforced. Engine or browser jobs have a four-GiB cgroup memory ceiling without extra swap; simpler jobs retain two GiB. Process limits, filesystem isolation and network restrictions remain enforced. Operators must size host concurrency for these per-job ceilings.
-
-Browser status shows when the login window has expired, even while page requests are busy. Reloading cannot renew it. Agents are instructed to preserve any established session, report missing access and continue reachable checks. Managed bot challenges are access limits; agents are instructed not to solve or reverse-engineer them.
-
-The request selects the login method. Supplied-account tests use that account's form; agents are instructed not to divert into wallet or social login. The broker enforces the selected method independently of those instructions.
-
-Adapter 23 also opens an isolated public browser for black-box reviews. Agents can follow visible controls and submit a small public form or chat message when the saved scope permits POST. This grants no account login, credential access or extra hostname. Visitor cookies stay within that public browser; supplied accounts and anonymous controls remain separate. Blocked external services stay visible as coverage gaps. An outer staging password is separate from application login, so reports must qualify exposure behind that gate.
-
-Late workflow messages cannot change the trusted checklist. The runner ignores at most three during investigation so a stray progress message does not erase the assessment; repeated messages or malformed startup checklists still stop it. Service logs record the phase, last tool category and rejection reason without commands, target text or credentials. Stage logs distinguish browser preparation, discovery and report validation. Update the binary and pinned image together.
-
-Supplied accounts are preserved across reviewers. Ordinary assessments do not authorize password changes, password recovery, account deletion, role changes or MFA changes. The HTTP broker rejects recognizable password/recovery routes and credential-change fields on discovery, HTTP and browser requests, including requests labeled as login. Agents report those checks as untested; testing them requires a separate disposable fixture and recovery plan. This semantic filter cannot recognize every application-specific mutation. Fresh JSON tokens and sensitive JSON/form fields are registered for redaction before retained evidence or model input, in addition to the supplied secret and session cookies. These controls do not make arbitrary target content private from the approved model provider.
-
-Discovery handoffs contain a complete JSON summary, stop reason, evidence references and shortened finding previews. Structured tool receipts are redacted as JSON, so short cookie flags cannot corrupt numeric counters or completion booleans. String content, private object keys and scalar echoes of supplied credentials or longer discovered secrets remain redacted; byte limits and truncation markers still apply. Full engine details remain in the current role's temporary work directory; they are not a permanent transcript archive. NEAR logs separately time attestation, completion and signature checks, including cancelled phases, without printing prompts or responses.
-
-Adapter 20 supports an optional testing account and protected reference account for browser-based session login. Both have separate browser profiles, browser-tool daemon directories, cookies and bearer sessions under one shared request, inference and spending allowance. Two-account jobs require the advertised `multi_account_v1` capability. The investigator checks access separately for each account before one engine investigation with anonymous and verified account-specific mirrors. An observed username or email field can additionally establish identity. Missing identity proof leaves password-change permission inactive while protected-resource access can still support authenticated checks. Later validators use the reference account and saved investigation evidence. Each signed-in request records its account slot.
-
-The engine handoff retains its recent facts, negative controls and stated gaps alongside findings. The overview includes bounded fact previews and relay-recorded evidence IDs for accepted password-change attempts and fresh-login controls. These records help reviewers distinguish attempted changes, accepted responses and independently demonstrated effects. Original HTTP evidence remains the basis for findings.
-
-After the bounded login flow, the reference account permits authenticated GET, HEAD and OPTIONS, plus parsed GraphQL query POSTs when POST is approved. Mutations, subscriptions, batches and ambiguous query documents remain blocked for that account. The testing account retains its approved active scope and credential-change controls.
-
-Prepared account sessions are preserved during investigation. HTTP, engine and browser requests reject recognizable authenticated logout and session-revocation routes, including GET logout links. Anonymous controls remain available. Application-specific revocation paths can escape this semantic check. Reports are instructed to retain earlier authenticated coverage when access is lost later and identify the affected subsequent checks.
-
-Password-change testing requires explicit scope permission, active POST permission and two verified, distinct account identities. The relay permits at most one narrowly recognized self-service password-change request for the testing account per role, substitutes the current and generated replacement passwords privately, and redacts them from evidence. After an accepted change, one private login control replays the observed JSON/form login in a fresh session. Nested JSON values are supported. Recognized CSRF fields and headers are refreshed from the selected login page or fresh cookies. Cookie and bearer sessions are checked against the previously verified protected resource and supplied identity, with an anonymous control. The original session is preserved for revocation checks. The result records fresh identity proof or an explicit verification gap. Multi-step, ambiguous token and unsupported CSRF flows can remain unverified. The reference account remains protected. Password recovery, deletion, email, role and MFA changes remain outside this permission. Unsupported routes and payloads remain coverage gaps. A later validator cannot replay a disposed account's login with its former password, so findings requiring that exact session may remain unverified. Paired browser jobs use a bounded four-GiB memory and 512-process allowance. Deploy matching protocol, admission migration, relay and adapter before admitting paired work.
-
-Inference receipts separate conservative uncached spending allowances from observed provider response costs. Per-route records retain input/output/cache tokens, USD and DIEM separately, and the number of responses supplying each field. Missing usage is unknown, not free inference; provider-returned costs are observations rather than reconciled invoices. The uncached guard still retains reservations for failed or unmetered calls.
-
-Adapter 15 gives discovery at most half the role's HTTP request and evidence allowance. The remaining capacity is available for browser login and the reviewer's own checks. Hitting that discovery limit preserves its partial results and moves on; it does not establish complete coverage. Update the relay binary alongside this image; older binaries reject its new adapter version.
-
-The reviewer can inspect the exact saved HTTP records from discovery, browser requests and login comparisons before citing a finding. These working copies contain the relay's redacted evidence, never raw session headers or cookies. Reading them does not repeat the requests. Scanner output remains a lead to check, and a completed report is not proof that every claim is correct. Agents are instructed to establish who owns a record before claiming cross-account access; a single supplied account may leave that check unresolved.
-
-The browser reuses explicitly public, immutable scripts, styles, fonts and images within a role. Pages, APIs, login responses and direct probes remain fresh. When the HTTP allowance is spent, browser polling stops and the agent writes its report from collected evidence, with unfinished checks disclosed.
-
-Completed reports are saved before upload. Temporary delivery failures retry the same report while its lease stays active; they never rerun paid inference. Large report uploads have a separate 30-second timeout. Expired or cancelled work cannot be revived by a retry.
-
-If Hermes reports its typed conversation-context exhaustion, the adapter may make one fresh continuation in the same container from retained evidence. This is limited to 32 turns and ten minutes within the original role's remaining time, request and inference budgets. It does not restart discovery or reset permissions. Only a newly completed report that passes the broker's current-role citation checks can replace the interrupted response; it includes a context-recovery limitation. Other failures, invalid recovery reports and insufficient remaining time retain the original failure.
-
-Interrupted execution and rejected delivery preserve one bounded recovery file, `last-interrupted-work.json`, in the private device state directory with mode `0600`. It contains the lease ID, collected evidence and execution/cost receipt. It is an operator diagnostic artifact and requires operator-managed deletion after recovery. The relay keeps the paid-start marker and waits for the lease to close when a restarted process receives that assignment again.
-
-
-> **DON’T TRUST! VERIFY!** Read this source and its dependencies—or ask your own security agent to review them. Inspect the container, network and permission settings before pairing a machine or sharing private work.
+NEAR AI and Venice may be primary or backup. Backup use requires saved requester consent and is recorded in the result. Invalid attestation, bad credentials and exhausted budgets do not trigger silent recovery. The separate Venice route does not claim NEAR attestation verified by Patchriot.
 
 ## Tool inventory and provenance
 
-The image pins its Hermes base digest, Debian package snapshot and hashes for every Python package added to that base. Rebuilds do not consult a rolling Debian mirror or resolve new Python dependencies. These pins make inputs reviewable; they do not prove byte-identical image outputs or that dependencies are free of vulnerabilities. Update the snapshot and lock deliberately, run the isolated image fixtures and install the resulting immutable digest.
-
-
-Adapter 25 runs the same anonymous baseline in both modes. Grey-box adds independently verified account contexts; a failed login never counts as authenticated coverage. The bounded discovery bundle has a ten-minute ceiling inside the original role budget. Each component records its name, version, request references and completion state. Hermes then tests evidence-based hypotheses; Recon validates findings and checks a few untested leads. Completion describes this selected plan, not exhaustive security coverage.
-
-Schema checks use approved OpenAPI server paths or Swagger base paths. An inferred API mount needs an observed JSON response and a missing-path control. The sample covers distinct read operations before adding input variations, with up to 48 generated cases within the remaining allowance. Publicly discovered schemas also feed verified account checks. Receipts retain tested, unsampled and deferred operations; a redirected alternate document does not invalidate a usable schema. POST remains available to agents under the saved permission, including JSON/form checks and permitted GraphQL queries. A schema alone does not authorize generated state-changing requests.
-
-**Optional deep pass.** A separate opt-in group (`public_deep`) runs after discovery with its own five bounded families: script and route mining against a missing-path control; access-control path and method mutations; injected host and forwarding headers with a clean re-request for cache confirmation; probes against observed GET parameters or a small common-parameter sample; and object-access comparisons using supplied, verified accounts. It stays on GET, HEAD and OPTIONS inside the approved origin, and keeps one receipt per family under its own request cap. GET endpoints can still have side effects. Rows are leads: a reflected value, flipped status or differing body still needs a control. The dispatcher requires the `deep_checks_v1` capability and adapter 25 before assigning this work. Missing accounts in black-box mode or no discovered object routes are reported as not applicable, not as successful account testing. The group is never scheduled by omission, an interrupted family remains `incomplete`, and unticked groups are `not_applicable` rather than missing. The deep pass shares the role budget and reserves the closing report window. Before starting a path, header or input comparison, the runner checks that its requests and estimated response time fit the remaining allowance. Sampling limits remain visible; an actual mid-comparison timeout remains incomplete. Per-account receipts include allocated time, elapsed time, request limits and sampled routes.
-
-Family time slices reflect their expected work inside the same overall deadline. Surface discovery saves its missing-page control first and reserves time for route probes before reading more scripts. An intentionally smaller sample is recorded with deferred counts; a failed request, expired login or actual timeout remains incomplete.
-
-| Component | Upstream / role | Supply-chain control |
-| --- | --- | --- |
-| Hermes Agent 0.22.5 | [NousResearch](https://github.com/NousResearch/hermes-agent), investigator and validator; terminal/browser tools | Immutable upstream image digest |
-| Nuclei 3.11.1 | [ProjectDiscovery](https://github.com/projectdiscovery/nuclei), six repository-reviewed HTTP templates | Official release SHA-256; no template updates or callbacks |
-| ZAP 2.17.0 | [ZAP project](https://github.com/zaproxy/zaproxy), passive checks and selected reflected-input rule | Official release SHA-256; loopback scanner API |
-| ffuf 2.1 | [ffuf](https://github.com/ffuf/ffuf), small observed-path list with missing-path control | Signed distribution package; installed version recorded |
-| Schemathesis 4.33.1 | [Schemathesis](https://github.com/schemathesis/schemathesis), bounded schema-generated cases | Exact package version; dependencies recorded in image manifest |
-| Chromium + Playwright 1.60.0 | [Chromium](https://www.chromium.org/) / [Microsoft](https://github.com/microsoft/playwright-python), scoped browser and account access | Signed distribution package / pinned Python version |
-| agent-browser 0.26.0 | [Vercel](https://github.com/vercel-labs/agent-browser), browser controls used by Hermes | Official npm archive SHA-256 |
-| ARES-derived fingerprints | Pinned source revision in NOTICE; adapted HTTP signatures only | Repository-reviewed source, no full upstream framework |
-| Patchriot baseline, crawl, access controls, HTTP probes, route discovery, optional deep pass and coverage ledger | Original adapters and evidence accounting | Versioned source; all target I/O through the relay |
-
-The image also contains Python, Java, shell utilities, curl, jq and ripgrep, plus upstream runtime dependencies. `/patchriot/toolchain.json` lists all installed distribution and Python packages, selected executable hashes and the scanner/template hashes. This inventory describes availability; individual report receipts describe what actually ran. Target pages cannot install a new tool or grant network access. No database service or autonomous upstream engine is started by discovery.
-
-Official provenance and reputation reduce supply-chain uncertainty; neither makes software provably free of vulnerabilities or malicious changes. Task containers remain unprivileged, network-isolated, read-only at the root, and without host credentials or Docker socket. Inspect the full dependency inventory and immutable image digest before release. New assignments require `scoped_discovery_v1` and adapter 25; historical scopes and evidence retain their original identifiers for integrity, and are not silently replayed on a different toolchain.
-
-## Joining the managed service
-
-Pairing is for approved staff. Initialize a device, pair it through the administrator’s account, then approve its capabilities separately. Public contributors cannot enroll themselves in this beta. A company installation can use its own approved machines and private mesh.
-
-## Configuration
-
-The relay uses CLI arguments, its private state directory and a JSON settings file; it does **not** read `.env`. Copy [agent-settings.example.json](agent-settings.example.json) outside the checkout, replace its immutable image ID and key path, and select your provider from the routing table below. The example illustrates the NEAR route, not a production preference.
-
-| Setting | Purpose |
+| Tool | What Patchriot uses |
 | --- | --- |
-| `docker_socket` | Local Docker socket; access is privileged. Never mount it into task containers. |
-| `image` | Tested image’s exact `sha256:` ID from `docker image inspect`; tags are rejected. |
-| `model_url`, `model` | An allowed URL/model pair matching this device’s pairing declaration. |
-| `model_digest` | Model-file digest for local models; `provider-managed-not-attested` for API-managed weights. The NEAR route verifies its separate runtime attestation. |
-| `live_provider_key_file` | Absolute path to the primary provider key, mode `600`, owned by the relay user. Never supplied to the container. |
-| `secondary_model`, `secondary_key_file` | Optional backup pair; set both or neither, using the other supported DeepSeek route. Dispatcher consent must also allow it. |
-| `max_attempt_seconds` | Local per-role ceiling: defaults to 600, maximum 10800. The dispatcher’s saved allowance can be lower. |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Investigation, follow-up hypotheses and report validation |
+| [Nuclei](https://github.com/projectdiscovery/nuclei) | Repository-reviewed HTTP templates, without updates or external callbacks |
+| [ARES-derived fingerprints](https://github.com/Mafifrizi/ARES) | Adapted HTTP signatures only; the full framework is not run |
+| [ffuf](https://github.com/ffuf/ffuf) | Small candidate-path samples with missing-page controls |
+| [ZAP](https://www.zaproxy.org/) | Selected passive checks and an authorized reflected-input rule |
+| [Schemathesis](https://github.com/schemathesis/schemathesis) | Bounded read cases from supported observed API schemas |
+| [Chromium](https://www.chromium.org/), [Playwright](https://github.com/microsoft/playwright), [agent-browser](https://github.com/vercel-labs/agent-browser) | Restricted browser exploration, login and access comparisons |
+| Patchriot adapters | Headers, route discovery, optional deeper probes, account comparisons and evidence accounting |
 
-Use `doctor --state-dir STATE --agent-config SETTINGS` to check local readiness before `connect --agents --agent-config SETTINGS`. The hosted agent also needs `--website-reviews --live-tests` and staff approval; source access is a separate opt-in. Private key files, images and provider availability must be prepared before connection.
+Every report identifies the tools actually used. A missing schema or absent second account cannot count as successful testing. Selected checks can finish with a sample limit; interrupted checks remain incomplete. All target I/O stays behind the same origin, DNS, method, time and byte limits.
 
-## Install and operate
+The [Dockerfile](agent/Dockerfile) pins the Hermes base, Debian snapshot and downloaded dependencies. `/patchriot/toolchain.json` inside the image records versions and hashes. Pins make inputs reviewable; they do not prove identical rebuilds or vulnerability-free dependencies. Upstream licenses and revisions are in [NOTICE](NOTICE).
 
-Expand the relevant section for releases, pairing, health checks or running a supervised service. These commands set up an agent machine; customers only need the hosted website.
+<a id="what-the-safety-limits-mean"></a>
 
-<details>
-<summary>Download the relay</summary>
+## Run an agent
 
-Review the source yourself, or ask your agent to inspect it and install it only if that review passes. Use a separate VPS without production credentials. After a merge to `main`, the release workflow builds a **Linux x86-64** download on the [Releases page](https://github.com/adaki2004/patchriot-relay/releases). Prototype releases use `v0.0.1-dev.<commit>`. Download `patchriot-relay-linux-x86_64.tar.gz` and `SHA256SUMS` from the same release, or build from source if no matching release is available:
-
-```sh
-sha256sum --ignore-missing --check SHA256SUMS &&
-  tar -xzf patchriot-relay-linux-x86_64.tar.gz &&
-  cd patchriot-relay &&
-  ./patchriot-relay demo
-```
-
-The archive includes agent/sandbox setup files, service examples and license notices. Use `./patchriot-relay` instead of `cargo run --locked --` in the commands below. Matching relay and protocol source is attached separately; macOS users can build from source. Model weights and the external agent runtime are installed separately.
-
-Release checksums detect corruption but are not an independent signature: a repository/release compromise could replace both archive and checksums. Review the source at the recorded commit or build it yourself when you need an independent check.
-
-**Releases do not update running agents automatically.** Stop the relay before replacing its binary, preserve its state directory and configuration, then restart it under the same Unix account. You do not need to pair it again.
-
-</details>
-
-<details>
-<summary>Try the owned example</summary>
-
-Place `patchriot-core` beside this repository for its shared protocol crate. Use **Rust 1.94.1** on Linux or macOS.
+Start core and dispatcher using the [local setup](https://github.com/adaki2004/patchriot-core#run-locally). Keep all three repositories as siblings. Install Git, Rust 1.94.1 and Docker Desktop (macOS) or Docker Engine with cgroup v2 (Linux). The image includes Hermes and its tools; no local GPU, model download or separate Kali/VM installation is needed for the HTTP-only trial. Allow at least 4 GiB of container memory per active agent. Use your own supported provider key.
 
 ```sh
-cargo run --locked -- demo
-```
-
-The demo runs an original access-control bug, a patch and a clean control in separate processes. It reports success only when the original permits cross-user access and both corrected versions block it while preserving legitimate access. This is a known regression example, not an AI-discovered finding.
-
-</details>
-
-<details>
-<summary>Pair your machine</summary>
-
-Agents connect through Patchriot's configured gateway. Device signatures and staff approval control access. Use the connection details supplied during staff pairing; private mesh deployments also require the network setup below. Public contributor pairing remains disabled.
-
-### Private Tailscale connection
-
-If **Pair an agent** shows an HTTPS `device.tailnet.ts.net` address, first ask the administrator to admit your machine to that Tailscale network. Network admission and Patchriot device approval are separate. Then run this read-only check with the address they supplied:
-
-```sh
-tailscale status
-./patchriot-relay mesh-check --dispatcher https://device.tailnet.ts.net
-```
-
-`mesh-check` reads only `/health`, verifies normal HTTPS, checks the connection used a Tailscale IP and confirms the agent-only gateway. It loads no device key, submits no work and does not declare the operator approved. It times out rather than falling back to a public endpoint. It does not certify the tailnet's whole access policy.
-
-Use that same address with `init --dispatcher`, then continue pairing below. Signed requests, manual approval and private-review consent still apply. A stopped Tailscale connection stops communication; existing work must stop before its lease expires. Keep Tailscale credentials on the host, outside agent containers and relay pairing forms. Use [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve), not public Funnel, at the dispatcher gateway.
-
-For the hosted service, only staff can open **Pair an agent** and see connection details. Public contributors cannot pair yet. Pair the relay, enter its five-minute code, complete your short operator profile and wait for approval. You do not need to run core or dispatcher. We recommend a separate VPS.
-
-Approved users can see your agent’s OS/version, architecture, relay and runner versions, model, website tools, report count and heartbeat. Keep personal information out of model/version declarations. Host labels, addresses, operator profiles and assigned work stay private. The relay reads Linux distribution details from `os-release` without executing it and reports them in signed heartbeats. Upgrading an existing relay updates these details without pairing again. Update dispatcher before relays; older heartbeats remain accepted.
-
-<details>
-<summary><strong>Developer example: pair with a local installation</strong></summary>
-
-Start your own core website and dispatcher using their READMEs. These addresses point to services on your computer:
-
-```sh
-cargo run --locked -- init --state-dir .local/relay-one --dispatcher http://127.0.0.1:7411 --audience patchriot-local-v1 --label "My relay" --compute-group "my-machine"
-cargo run --locked -- pair --state-dir .local/relay-one
-cargo run --locked -- connect --state-dir .local/relay-one
-```
-
-1. Sign in to the website and enter the five-minute code under **Pair a relay**.
-2. Complete the short operator profile and data-handling consent.
-3. An administrator approves the device under **Agent approvals**.
-
-</details>
-
-If the code expires, run `pair` again with the same `--state-dir` and use the new code. Keep the existing state: it contains your device key. A code claimed by another account requires that account or a separate device identity; refreshing the website cannot transfer it.
-
-After pairing, staff approve the specific work modes and tool capabilities they checked. A heartbeat can report a capability but cannot approve it. New capabilities after an image upgrade need a staff update; this is a readiness check, not a guarantee about model weights or operator honesty.
-
-The Ed25519 key stays in your private state directory. The relay connects outward; it needs no public inbound port. Use HTTPS or an authenticated tunnel outside loopback. Three devices on one machine should declare the same compute group.
-
-Use the **same Unix account** to initialize, pair and run each relay, including its systemd service and local status/pause commands. The relay rejects state owned by another account, even under `sudo`, so an accidental root invocation cannot replace the service's private files.
-
-For a Hermes installation, add `--runtime hermes --runtime-version VERSION --model MODEL` to `init`, using the version you inspected and the installed model name. Each agent needs its own state directory. These details are **operator declarations**, not verified model weights or a security qualification. A connection reports presence until you explicitly opt in to work.
-
-</details>
-
-<details>
-<summary>Control your contribution</summary>
-
-For a Linux host that should stay online, install the [systemd template](deploy/patchriot-relay@.service) and run `systemctl enable --now patchriot-relay@scout`. Create the `patchriot` OS account, give it access to the local Docker socket, and pair as that same user first. Each instance needs its own private `/var/lib/patchriot-relay/NAME` directory and `agent-settings.json`. The service starts after boot and restarts after a crash; `systemctl stop` remains an intentional stop. Three instances on one host still share one machine's capacity. Adding identities does not add compute.
-
-### Inspect and maintain a relay
-
-Run these as the Unix user that owns the device state. `doctor` is read-only apart from lock files; it checks identity-file permissions, the gateway's HTTPS health, connection state and the configured image/provider files. It sends no customer data or model request. A passing health check does not prove remote approval. It also does not prove inference credit is available. A live provider HTTP 402 is reported as `provider_payment_required`. After its saved result is acknowledged (or a fenced result is preserved), that worker pauses durably before taking more queued work. Restore the provider balance or key allowance, then explicitly `resume`; restarting the service does not clear this pause.
-
-| Command | Effect |
-| --- | --- |
-| `doctor --state-dir STATE --agent-config CONFIG` | Explain connection, pending-work and installed-image readiness |
-| `skills --state-dir STATE --agent-config CONFIG` | List capabilities of the installed adapter; model weights are not verified |
-| `self-heal --state-dir STATE --agent-config CONFIG` | Retry a saved result's delivery, then clean only this device's leftover containers; preserve pairing and paid-work markers |
-| `update-agent --state-dir STATE --agent-config CONFIG --candidate-config CANDIDATE` | Inspect a locally installed, immutable image and save settings for this device |
-| `install-skill --state-dir STATE --agent-config CONFIG --candidate-config CANDIDATE --skill NAME` | Require that the candidate image supplies the named supported capability, then save it |
-| `update-model --state-dir STATE --candidate-config CANDIDATE --new-state-dir NEW_STATE --runtime-version VERSION` | Create a new, paused identity for fresh pairing, approval and requester consent |
-
-Prefix each command with `patchriot-relay`. For a change, wait for work to finish, run `pause`, then stop the service. Maintenance refuses a running connection or saved unfinished work. Self-heal may resend an existing result; it never reruns the assessment, and a lost reply leaves the result queued. Prepare the candidate JSON using the configuration below; build or obtain its trusted image separately. No command downloads a skill or runs its installer on the host. Supported live skill names currently come from `skills`, such as `authenticated_http_v1` and `active_web_v1`.
-
-Updates write `STATE/agent-settings.json` and retain a private previous copy. Shared configuration files are untouched. Restart the service using the returned `--agent-config` path, check it with `doctor`, then `resume`. An adapter update keeps its model declaration; changing the model or declared Hermes version needs a newly paired identity. Existing requests keep their original team and consent.
-
-| Command after `cargo run --locked --` | Effect |
-| --- | --- |
-| `status --state-dir .local/relay-one` | Show local pairing and pause state |
-| `pause --state-dir .local/relay-one` | Stop accepting work and cancel an active agent check when its monitor observes the pause |
-| `resume --state-dir .local/relay-one` | Resume contribution |
-| `connect --state-dir .local/relay-one --fixtures` | Explicitly accept the fixed owned example |
-| `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` | Run isolated local-agent checks; setup below |
-
-Without either work option, the connection reports presence only. Heartbeats continue during model execution; stale devices become offline after 30 seconds. Owners can revoke a device in the website. Revoked keys cannot reconnect.
-
-With **three approved devices** connected in the same mode, choose **Reviews → New example review**. Three sequential roles check the same supplied bug and fix. Shared machines under one operator get one active assignment. Reports show device/operator counts; three processes on one host do not imply independent reviewers.
-
-**Earnings:** this pilot does not promise or calculate operator payments. Report counts show activity only. A paid contribution offer must state its reward and payout terms before you accept it.
-
-<details>
-<summary><strong>Retries, deadlines and connection failures</strong></summary>
-
-Results are saved locally before submission and retried after connection loss. Agent leases renew while healthy, with a saved attempt deadline. Defaults are ten minutes per attempt and 35 minutes per offline review. New live website tests have a separate waiting period: the role's clock starts when assigned, with the request's permission expiry still bounding execution. The dispatcher coordinates ready requests in order across devices on the same declared machine. Queued execution reserves the final minute for cleanup and submitting its result, so a slow model can report a timeout before the lease expires. Preflight and input delivery consume the same execution budget. The relay uses a monotonic clock and stops when it cannot renew. Server cancellation is checked during renewal; it is not an instantaneous push. Local signals interrupt a running agent directly.
-
-Cancelled, expired or replaced assignments cannot accept stale results. Restarting an agent connection first removes that device's labelled leftover containers. Temporary dispatcher connection failures, server errors and rate limits retry with a delay of up to 40 seconds. Active work still stops if its lease cannot renew. A runner/configuration error or invalid response stops the agent connection for inspection. For owned examples, the state directory keeps one private `last-agent-check.json` (at most 2 MiB) for diagnosis. Website snapshots, source bundles and their tool transcripts are not written to that file. A bounded pending report is saved until acknowledged. Keep state directories out of Git and shared backups.
-
-For slow or incomplete runs, the relay logs the model's declared finish reason (`length` means its output limit was reached), reported token counts and the agent's stopping condition. Missing metadata stays `not_reported`. These operational logs exclude prompts, answers and provider error text; they do not establish report quality.
-
-</details>
-
-</details>
-
-<details>
-<summary>Tool, time and spending limits</summary>
-
-The hosted service deletes private report content twelve hours after the requester first exports a finished report. The relay clears its pending result after accepted delivery; a repeated acknowledgement cannot restore a deleted server report. This cannot erase copies an operator saved outside the relay or data already sent to a model provider. Keep assigned material out of host logs, shared folders and backups; cleanup and operator conduct remain separate responsibilities.
-
-Live website reports permit up to 32 MiB of compact JSON per role, including recorded HTTP evidence and tool excerpts. The private delivery outbox and follow-up input support that size. Before its evidence allowance fills, the relay refuses new probes instead of removing records already cited in findings. Response capture and excerpt limits remain separate; truncated excerpts are marked. Update core and dispatcher/gateway first, then rebuild the adapter image and relay together. The offline example's 1 MiB printed-output limit is unchanged.
-
-The example runner and agent modes have separate limits:
-
-| Runner | What it can do | What its limits mean |
-| --- | --- | --- |
-| **Known example (`--fixtures`)** | Run only the test programs built into the relay | Default limits are 3 seconds and 8,192 bytes of printed text per test, counting normal output and errors together. This stops stuck or noisy tests. |
-| **Offline agent (`--agents`)** | Review the supplied example or explicitly shared website/source text in a container | Separate runtime, memory, inference and output limits. No target network access or host files/keys. |
-| **Live agent (`--agents --live-tests`)** | Investigate an approved website through the relay’s HTTP helper | The container has no direct network. The relay permits only approved origins and methods, records requests and limits rate and provider spending. |
-
-**8 KiB means test output, not prompt size or model context.** The example runner removes inherited environment variables, uses a temporary working directory and stops its process group on timeout or cancellation. That alone is not a sandbox for arbitrary code; it accepts only the built-in tests.
-
-Agent mode requires the container setup below and stops if it cannot use it. A webpage can still try to mislead the model. Permissions and isolation restrict what the agent can do even when its answer is wrong; output limits do not prevent prompt injection.
-
-**Untrusted input stays data.** Uploaded source, repository instructions, login responses and prior findings cannot grant a new origin, tool or credential. Source review reads fixed data files with no model tools and never runs repository hooks or package installers. Live HTTP calls pass through Rust checks for scope, DNS, redirects, methods and headers; test credentials are added outside the agent and redacted from evidence. The container has no host mounts, direct network or provider keys. These controls remain in force if a model follows a malicious instruction; they do not guarantee that its written finding is correct.
-
-Private work requires separate operator approval and requester consent. Assigned operators can see the plaintext they process. Model names, pairing and hosting-provider claims do not establish honesty or model weights.
-
-<details>
-<summary><strong>Test the sandbox (operators)</strong></summary>
-
-Use a local Linux Docker engine with cgroup v2; Docker Desktop also runs these probes inside its Linux VM. Build the tiny owned probe, then use its immutable image ID:
-
-```sh
-docker build --network=none -t patchriot-sandbox-probe:local sandbox
-PATCHRIOT_PROBE_IMAGE=$(docker image inspect --format '{{.Id}}' patchriot-sandbox-probe:local)
-cargo run --locked -- sandbox-check --socket /var/run/docker.sock --image "$PATCHRIOT_PROBE_IMAGE"
-```
-
-On macOS, pass your actual socket path, commonly `$HOME/.docker/run/docker.sock`. The socket stays outside the task container.
-
-**What gets tested:** no external network or host mounts; a read-only root; non-root execution; 64 MiB RAM, half a CPU and 32 tasks; small, non-executable temporary storage; bounded output; child-process, timeout and cancellation cleanup. The command checks both Docker's settings and what the probe can actually do. A failed check stops the suite and returns a failing exit code.
-
-This runs only owned probes. It does not establish model honesty or rule out kernel/runtime vulnerabilities. A force-killed relay or unavailable Docker engine can prevent cleanup; inspect containers labelled `io.patchriot.sandbox-check=1` after a hard stop. There is no fallback to running customer code on the host.
-
-</details>
-
-<details>
-<summary><strong>Run a local agent check (operators)</strong></summary>
-
-This runs Hermes against a tiny, owned access-control example and its **supplied patch**. Try it manually before opting in to queued work. An agent explaining this example has not demonstrated independent vulnerability discovery.
-
-Build the pinned runtime adapter and use its immutable image ID. The build downloads a checksum-pinned Nuclei release; running tasks still have no external container network:
-
-```sh
+cargo build --locked
 docker build -t patchriot-agent:local agent
 docker image inspect --format '{{.Id}}' patchriot-agent:local
-cargo run --locked -- agent-check --config .local/agent.json
+docker context inspect --format '{{.Endpoints.docker.Host}}'
 ```
 
-The operator's configuration has five required fields and an optional time limit; replace the example image and model digest with inspected values:
+### 1. Configure inference
 
-```json
-{
-  "docker_socket": "/var/run/docker.sock",
-  "image": "sha256:REPLACE_WITH_LOCAL_IMAGE_ID",
-  "model_url": "http://127.0.0.1:11434",
-  "model": "your-local-model:pilot",
-  "model_digest": "REPLACE_WITH_64_CHARACTER_MODEL_DIGEST",
-  "max_attempt_seconds": 600
-}
-```
+The relay uses CLI arguments and JSON; **it does not read `.env`**. The [example settings](agent-settings.example.json) use **NEAR AI first, Venice as backup**, with a 900-second ceiling per role. The [complete local walkthrough](https://github.com/adaki2004/patchriot-core#4-configure-near-ai-and-its-backup) creates these files and pairs both devices.
 
-Use an Ollama model that supports tools and a 64,000-token context. Its **stored model profile** must set `num_ctx 64000`; the compatible API does not apply that setting from chat requests. Inspect `/api/tags` for the digest and `/api/show` for the parameters. The relay checks both before starting. Keep the model server private, reachable only from the relay; the model URL accepts explicit loopback/private IPv4 addresses. This verifies the server's declaration, not remotely attested weights.
+Copy the settings outside the checkout. Use the exact image `sha256:` ID above, your Docker socket and absolute paths to your private `near-ai.key` and `venice.key` files. Each key file contains only its provider API key. Make all three files owner-only (`chmod 600`); keys never go into JSON, Git, core or dispatcher. Get a funded key from [NEAR AI](https://docs.near.ai/cloud/quickstart) and [Venice](https://docs.venice.ai/api-reference/api-spec).
 
-After pairing and approval, use `connect --state-dir .local/relay-one --agents --agent-config .local/agent.json` to accept owned-example checks submitted through the website. The profile name or its reported parent must match the device's paired model declaration. A different model needs its own declared device; do not relabel one model's result as another's.
+Set dispatcher’s `PATCHRIOT_INFERENCE_PRIMARY_MODEL` and `PATCHRIOT_INFERENCE_SECONDARY_MODEL` to the matching models below. For NEAR alone, remove both secondary fields from the JSON and leave dispatcher’s secondary setting unset. The backup is available only with requester consent and on eligible recovery errors.
 
-For a slow CPU pilot, set `max_attempt_seconds` to at most `10800` and rebuild the current adapter 18 image. Dispatcher must also allow the longer budget; neither side can override the other’s cap. The relay still reserves one minute for cleanup and reporting. This changes time allowances only, not tool permissions, call counts or evidence requirements.
+| Setting | Required value / purpose |
+| --- | --- |
+| `docker_socket` | Use the local path printed above, removing `unix://`. Docker Desktop may use a socket inside your home directory rather than `/var/run/docker.sock`. Remote Docker endpoints are not supported here. |
+| `image` | Inspected immutable image ID, not a mutable tag |
+| `model_url`, `model` | One matching supported pair below; also used when pairing |
+| `model_digest` | `provider-managed-not-attested` for API-managed weights; NEAR verifies its separate runtime evidence |
+| `live_provider_key_file` | Absolute path to a mode-0600 key file owned by the relay user |
+| `max_attempt_seconds` | Per-role ceiling, default 600, maximum 10800; dispatcher allowance can be lower |
+| `secondary_model`, `secondary_key_file` | Optional: both set or both omitted; select the other supported provider |
 
-**Boundary:** agent and tools → container pipes → Rust relay → one configured local model. The agent has no external network, host mounts, credentials or Docker socket. It runs non-root with a read-only root, 2 GiB RAM, two CPUs, 128 tasks and bounded temporary storage. The relay permits only selected metadata reads and chat generation; model downloads, deletion and arbitrary endpoints are blocked. Limits are four model calls, 192 output tokens per call, 64 KiB per request, 256 KiB per response, 1 MiB agent output and ten minutes overall by default. CPU prompt processing can take several minutes; this pilot budget is not a production latency target.
+| Provider | Model | API |
+| --- | --- | --- |
+| NEAR AI | `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` | `https://cloud-api.near.ai/v1` |
+| Venice | `deepseek-v4-1-flash-1017-uncensored` | `https://api.venice.ai/api/v1` |
 
-Configure the model server's separate CPU/RAM limits as well; the limits above cover the agent and its tools. Manual output includes full bounded tool events; queued reports contain the parsed observations, model/image digests, timing and a bounded explanation. The explanation alone cannot pass the check. Cancellation stops the request and removes the container. If cleanup cannot be confirmed, inspect containers labelled `io.patchriot.agent-check=1` before restarting. **Agent-reported evidence is not independent verification.** The CPU pilot uses one operator; more devices on that host do not add independent reviewers.
+The table lists the models supported by this relay version. Check provider availability and credit before accepting work; changing to an arbitrary model name is not supported. The local example does not set the hosted service’s route order.
 
-The pilot presents its terminal and process-management tools directly, without a separate tool-discovery step. If the runtime retries with a larger output request, the relay caps it at 192 tokens. Retries still count toward the four-call and time limits; the runtime cannot raise those limits. A truncated or missing tool result remains unresolved.
+### 2. Pair and approve
 
-</details>
-
-</details>
-
-<details>
-<summary>Opt in to private website reviews</summary>
-
-First test the owned example. Rebuild the pinned adapter from `agent/Dockerfile` and set its new immutable image ID in your configuration. Website review accepts adapter versions 2–7. The current build is version 7; longer CPU budgets require version 3 or later.
+Example for a local dispatcher and a NEAR-configured device. Match `--model` to your settings and `--audience` to dispatcher configuration:
 
 ```sh
-cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --website-reviews
+target/debug/patchriot-relay init \
+  --state-dir ../local-agent-one \
+  --dispatcher http://127.0.0.1:7411 \
+  --audience patchriot-local-v1 \
+  --label "Local agent one" --compute-group "my-machine" \
+  --runtime hermes --runtime-version 0.22.5 \
+  --model deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated
+target/debug/patchriot-relay pair --state-dir ../local-agent-one
 ```
 
-An admin must allow **private reviews** for the device. The dispatcher proposes three exact devices; the requester sees their operators and declared models, then consents to sharing one snapshot and the earlier reports. This flag does not bypass those permissions. Shared machines run sequentially and remain labelled as shared infrastructure.
+In the local website, open **Agent approvals → Pair a relay**, claim the displayed code, then approve the device. Choose **Allow private reviews**, enable **Live website tests**, and approve only these capabilities for the HTTP trial:
 
-**Operators can see the plaintext they process.** A completed report is not a security certificate; claims still need evidence and human review.
+| Checkbox | Capability |
+| --- | --- |
+| Web and API checks | `scoped_discovery_v1` |
+| Signed-in HTTP requests | `authenticated_http_v1` |
+| Session login | `session_login_v1` |
+| Extra context and site gates | `run_context_v1` |
 
-<details>
-<summary><strong>What an agent receives and how reports are checked</strong></summary>
+Leave browser and other untested capabilities unapproved. Repeat with a second state directory and label for the two-agent review. Use the **same compute group** on the same machine to prevent oversubscription. Keep the same OS user for pairing and service execution.
 
-The relay downloads evidence only for its active lease, checks its hash and sends bounded data through the container's stdin. A fixed reader runs inside the container before inference; the agent receives its bounded output and reviews it. It shortens combined previews to fit, marks truncated text and preserves the source hashes. Missing text in a preview does not prove absence from the page. That required read counts as a tool execution, not a check independently chosen by the model. Saved HTML/scripts are inspected as text; there is no browsing, target networking or host execution. Snapshot files live in container temporary storage and disappear with cleanup. Operators can see plaintext, so only accept data you are permitted to process.
+<a id="private-tailscale-connection"></a>
 
-Each role gets at most four model calls, 512 output tokens per call and the earlier of its saved lease deadline and operator time limit. The relay requests a fixed JSON report format, with source hashes selected from the captured resources; the runtime cannot change it. Formatting does not establish accuracy: quotations must still match the cited resource, and the reasoning can still be wrong. Website mode omits the runtime's optional model-specific instructions to keep executing tools; the task supplies its own review instructions, and tools remain available. Later roles inspect earlier claims; no live exploit or patch test is implied. **A complete report is not a security certificate.** Invalid reports and unsupported quotations remain unresolved. Removing private approval stops affected reviews; it cannot recall information already seen.
+For remote machines, use the **agent-only gateway** over HTTPS or your private mesh. Never expose the internal dispatcher listener. `mesh-check --dispatcher https://HOST` checks a configured Tailscale route; it does not create the mesh.
 
-</details>
+### 3. Check the sandbox and connect
 
-</details>
-
-<details>
-<summary id="opt-in-to-live-website-tests">Opt in to live website tests</summary>
-
-This is a separate, manually approved pilot. Pair a device declaring Hermes and `abliterated-model-large-v2`, receive private-work approval and build **adapter 6**. Keep the provider key in a separate mode-`0600` file owned by the relay’s Unix account. The relay checks that file before advertising live capacity, on each work poll and before execution. An invalid key file stops admission before an assignment is accepted. It never enters the task container, browser or dispatcher.
-
-<details>
-<summary><strong>Hosted model configuration and start command</strong></summary>
-
-Use an immutable image ID from your inspected build. The provider-managed model digest below is an honest declaration, not proof of its weights:
-
-```json
-{
-  "docker_socket": "/var/run/docker.sock",
-  "image": "sha256:REPLACE_WITH_LOCAL_IMAGE_ID",
-  "model_url": "https://api.abliteration.ai/v1",
-  "model": "abliterated-model-large-v2",
-  "model_digest": "provider-managed-not-attested",
-  "live_provider_key_file": "/etc/patchriot/provider-key",
-  "max_attempt_seconds": 600
-}
-```
+For the **HTTP-only local trial**, run `doctor`, connect both agents and use the `scripts/local-audit.py` walkthrough in core:
 
 ```sh
-./patchriot-relay connect --state-dir /var/lib/patchriot/relay-one --agents --agent-config /etc/patchriot/live-agent.json --live-tests
+target/debug/patchriot-relay doctor \
+  --state-dir ../local-agent-one --agent-config /absolute/private/agent.json
+target/debug/patchriot-relay connect \
+  --state-dir ../local-agent-one --agents \
+  --agent-config /absolute/private/agent.json --live-tests
 ```
 
-Do not combine `--live-tests` with the offline website/source opt-ins. The requester approves the exact origins, three named operators and external-provider access. The requester proves control of every approved hostname with an expiring DNS TXT record. Domain proof approves the request for checkout; staff may instead authorize a configured owned test site with an explicit record. The hosted pilot needs provider credit. Core owns customer checkout and operator accounting; the relay never receives treasury keys.
+Start the second device in another terminal. Confirm both are online and eligible before creating a test. `doctor` inspects the installed image; its listed tools are not proof that every sandbox feature works on your host. Only approve the four HTTP capabilities above for this trial. Do not combine live mode with the older snapshot/source opt-ins.
 
-The trusted relay needs DNS/HTTPS access to the fixed provider and approved public targets. The local-only systemd example needs an explicit network-policy adjustment for this mode. The agent container stays non-root, read-only and without external networking, host mounts, keys or the Docker socket. Run it on a dedicated machine. An ordinary container is not a VM or a TEE.
-
-</details>
-
-**Two required roles, a third when needed:** Scout maps the application; Recon reproduces its claims with fresh requests and controls. The dispatcher assigns the reserved Verifier for serious findings, disagreement, unchecked claims or incomplete evidence. Roles run sequentially; older requests keep three required stages. Scout alone runs the discovery scanners and scoped discovery suite. Later roles inspect that record and make targeted checks instead of repeating the scan. Update dispatcher and gateway before enabling this policy in checkout; it does not require changing an existing adapter 11 image.
-
-Each role starts with a compact scope and prior-findings overview; full transcripts remain available in separate files. Every finding must cite relevant requests recorded during that role. Earlier claims it could not check belong in the limitations. The relay pins the provider's reasoning setting. When time or allowance runs low, it closes tools and requests a bounded JSON report with reduced reasoning. Malformed or unsupported reports remain incomplete.
-
-**Baseline tools:** adapters 6 and 7 run a bounded static-link crawl, Nuclei 3.11.1 with three curated checks (Git configuration exposure, directory-listing markers and CORS reflection), then control requests. Nuclei connects only to a local mirror; the mirror uses the same scoped HTTP broker as the agent. No remote template updates, broad CVE packs, browser execution or network scans. Tool versions, arguments, output excerpts and HTTP references are saved with the private report. Scanner matches are leads; no matches does not establish safety. The scanner sees selected headers and decoded text, so its loopback host/IP and suggested curl commands are not the target’s actual connection. Use the recorded HTTP evidence.
-
-**Target boundaries:** every probe rechecks the exact approved origin and resolves its hostname again. All returned addresses must be public; the HTTP connection is pinned to that set with TLS verification and no environment proxy. Redirect responses are recorded without following them. A CNAME does not authorize its canonical hostname. These checks cannot establish ownership of an upstream service hidden by the target's reverse proxy; the requester still needs permission from the relevant owners/providers. Even read-only requests can have side effects in a target application.
-
-**What the agent does:** Hermes gets the approved objective, scope, previous reports and the testing method in `agent/live-review-skill.txt`. Its terminal can analyze files and request live evidence through `live_http.py`. The relay enforces HTTPS origins, public DNS/IPs, the saved scope methods, no automatic redirects and at most two requests per second. Test-account access and POST require the explicit scope options described below. No real purchases, fund transfers or load testing are permitted. Responses are bounded; truncated content is marked.
-
-Each role permits up to 10,000 HTTP observations, 2,400 provider calls and a $30 conservative inference allowance. Completed responses with token usage use the provider’s uncached rates; missing usage keeps the full reservation. The runner asks for a final report before exhausting its allowance or execution time and closes tools for that response. These are spending estimates, not provider invoices. Recheck the chosen provider's rates before deployment. Each response allows up to 8,192 output tokens; model reasoning and evidence can still be incomplete. The call ceiling is a backstop, not a target: finish once enough evidence is collected. Two roles can use up to $60 of combined allowance. With the explicit three-hour maximum on both servers and relays, each role can take three hours; the validator is instructed to finish once its focused controls are complete. These are calibration ceilings, not expected durations or prices.
-
-Before returning a completed role, adapter 17 asks the relay to validate the report against its retained current-role evidence. An invalid report gets at most one bounded repair conversation with tools closed and the same overall time/call/spend limits. No citation is added automatically. If validation still fails, raw text and HTTP evidence remain available while unsupported structured findings are omitted. This is format/citation validation, not independent verification of a claim.
-
-Live activity is sent with signed lease renewals: current stage, recorded request count, model calls and finished tool runs. The private dashboard shows the last server receipt time; these counts do not measure security coverage. Deploy the updated dispatcher before this relay.
-
-Live roles run once. A private start marker prevents a relay restart from repeating paid inference for the same lease; saved result delivery may retry. Keep device state when upgrading. Cancellation or revoked permission stops the lease and container, but cannot undo requests already sent. Findings cite locally recorded HTTP IDs; the next role makes its own checks. Records are operator-reported, not independent attestation, and three identities on one machine are not three independent reviewers.
-
-</details>
+**macOS:** use Docker Desktop for the documented HTTP-only trial. It runs real Hermes inference and records HTTP evidence without requiring a separate VM. Docker Desktop on our tested Mac does not provide the AppArmor profile required by the full browser path, so do not approve browser capabilities there. Full browser tests remain available on the hosted service and compatible Linux agent hosts. Do not add `--no-sandbox`, privileged mode or host networking to make a failed browser check pass.
 
 <details>
-<summary>Check the controls</summary>
+<summary>Linux hosts: enabling the full browser sandbox</summary>
 
-GitHub checks run when a ready PR targets `main` and when that PR changes. Draft PRs and ordinary branch pushes do not run checks; newer PR commits cancel superseded runs. Run the commands below locally while developing.
-
-```sh
-cargo fmt --all --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
-python3 -m unittest discover -s agent -p 'test_*.py'
-cargo run --locked -- fixture slow --timeout-ms 100
-cargo run --locked -- fixture noisy --max-output-bytes 1024
-```
-
-The last two commands intentionally fail. Tests cover signals, descendants, environment leakage and malformed results. Linux CI additionally builds the probe and runs the Docker integration tests. **A completed test is evidence for that check, not a blanket safety verdict.**
-
-For real queue/retry tests, see core's `scripts/smoke-reviews.py`. CI uses a pinned protocol commit; private core access needs a `READ_TOKEN` Actions secret with read-only access to core. An existing `PATCHRIOT_READ_TOKEN` secret also works and takes precedence. Keep token values out of source.
-
-</details>
-
-<details>
-<summary>Opt in to private source reviews</summary>
-
-Build the current **adapter 11** image and save its immutable image ID in your configuration. Existing device identities remain valid. Add a separate flag when you are ready to accept code:
-
-```sh
-cargo run --locked -- connect --state-dir .local/relay-one --agents --agent-config .local/agent.json --source-reviews
-```
-
-You may also pass `--website-reviews` to accept both kinds. An admin must approve private work, and each requester confirms your device before sharing. Restarting without `--source-reviews` withdraws that opt-in.
-
-The dispatcher sends at most 12 text files, 16 KiB each and 48 KiB total. They arrive through stdin as one JSON bundle in temporary container storage. A fixed reader supplies bounded excerpts; filenames are never used as paths. **The model has no tools in this mode.** It cannot install dependencies, execute uploaded code, build or run tests. Longer text can be shortened; reports disclose the missing coverage. Required reads are counted separately from model judgment in the execution evidence.
-
-The three roles inspect and challenge claims against the same saved text. The role named “reproducer” checks quotations and explains what would still need a real test; it does not execute a reproduction. Reports can retain short quotations after the original files expire. Review your local retention and backup settings because operators can see plaintext.
-
-</details>
-
-<details>
-<summary>Keep a relay running</summary>
-
-Use systemd on a Linux VPS so the relay can restart after a crash and start at boot. Start with an inspected binary, a working local model and a tested agent configuration. The account running the relay can control Docker; trust it as a host administrator. The agent container itself never receives that socket.
-
-The example below installs **one agent** under a dedicated account. Run it from the unpacked release directory. If you already have this account or paired state, keep them; do not initialize another identity just to install a service.
-
-```sh
-sudo useradd --system --create-home --home-dir /var/lib/patchriot-agent --shell /usr/sbin/nologin patchriot-agent
-sudo usermod -aG docker patchriot-agent
-sudo install -d -m 755 /opt/patchriot-agent
-sudo install -m 755 patchriot-relay /opt/patchriot-agent/patchriot-relay
-sudo install -d -o root -g patchriot-agent -m 750 /etc/patchriot-agent
-sudo install -d -o patchriot-agent -g patchriot-agent -m 700 /var/lib/patchriot-agent/one
-sudo install -o root -g patchriot-agent -m 640 /path/to/your-tested-agent.json /etc/patchriot-agent/one.json
-sudo install -m 644 deploy/patchriot-relay-agent@.service /etc/systemd/system/
-```
-
-Initialize and pair **as `patchriot-agent`**, using the deployment URL and audience from the website. For example, prefix the displayed `init` and `pair` commands with `sudo -u patchriot-agent /opt/patchriot-agent/patchriot-relay`, and use `--state-dir /var/lib/patchriot-agent/one`. Enter the code in your account and wait for approval.
-
-The supplied unit expects an authenticated dispatcher tunnel on this host's loopback. Its network policy allows loopback only. For a direct HTTPS dispatcher or private model host, add its exact destination IPs—and your required DNS resolver—to a local `IPAddressAllow` drop-in first. Do not disable the deny rule. A changing destination needs a maintained allowlist or a local tunnel; the agent container keeps `network=none` either way.
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl start patchriot-relay-agent@one
-sudo systemctl status patchriot-relay-agent@one
-sudo journalctl -u patchriot-relay-agent@one -n 50 --no-pager
-# After a successful connection and example check:
-sudo systemctl enable patchriot-relay-agent@one
-# Stop it when needed:
-sudo systemctl stop patchriot-relay-agent@one
-```
-
-Use `sudo -u patchriot-agent /opt/patchriot-agent/patchriot-relay status --state-dir /var/lib/patchriot-agent/one` to inspect the saved identity. Replace `status` with `pause` or `resume` to control contribution. The supplied unit accepts owned examples only; private website reviews require a deliberate `--website-reviews` service override plus device approval and requester consent.
-
-<details>
-<summary><strong>Service limits and the lighter fixture service</strong></summary>
-
-[deploy/patchriot-relay-demo@.service](deploy/patchriot-relay-demo@.service) runs the owned demo as an unprivileged user with **64 MiB, 10% CPU and 32 tasks**. It expects a dispatcher tunnel on loopback, a binary at `/opt/patchriot-demo/patchriot-relay` and separate private state directories under `/var/lib/patchriot-demo/`.
-
-After installing the unit, initializing/pairing each instance as `patchriot-demo` and approving it, start `patchriot-relay-demo@one` with systemd. Inspect it with `systemctl status` and `journalctl -u`; stop it with `systemctl stop`. The unit is a fixture pilot, not the future customer-code sandbox.
-
-For continuous owned-agent checks, [deploy/patchriot-relay-agent@.service](deploy/patchriot-relay-agent@.service) uses a dedicated `patchriot-agent` account, a binary at `/opt/patchriot-agent/patchriot-relay`, private paired state at `/var/lib/patchriot-agent/one` and operator configuration at `/etc/patchriot-agent/one.json`. Replace `one` for each instance. Give that account ownership of its state; keep binaries/configuration administrator-owned and configuration readable by its group. **Its Docker access is privileged; trust this service account.** Task containers never receive the socket.
-
-The agent unit allows loopback connections by default. For a private model-server address, add only that address through a local systemd `IPAddressAllow` drop-in. Start with `systemctl start patchriot-relay-agent@one`; enable at boot only after testing. Three approved instances sharing a compute group can take turns automatically. Relay service limits are separate from the agent-container and model-server limits.
-
-</details>
-
-</details>
-
-<details>
-<summary>What's next</summary>
-
-Improve review evidence with stronger models and independent operators. GPU trials and confidential execution follow the CPU pilot. No stake or on-chain identity is required.
-
-Original material is [AGPL-3.0-only](LICENSE); attribution is in [NOTICE](NOTICE). Model weights and external runtimes retain their own licenses. This repository is private during development and intended for publication.
-
-### Test accounts and active scopes
-
-Adapter 8 advertises the engine plus `active_web_v1` and `authenticated_http_v1`. Deploy the matching dispatcher and migration 19 before updating agents. Old scopes and signed polls remain compatible. A Basic or bearer account is retrieved only through the assigned lease, held by the relay and excluded from container/model input. The broker adds authorization and ephemeral cookies only after exact-origin and public-IP checks; redirects are never followed automatically. Anonymous controls send neither. Known raw, URL-encoded and JSON-escaped credential/session values are redacted from retained text. Supplied credentials receive substring protection. Discovered values shorter than eight characters match at identifier boundaries so a probe value such as `x` cannot corrupt `except` or `index.js`; short values embedded in larger identifiers remain ambiguous. This is not a guarantee against every possible encoding. Operators can inspect their own host and must be trusted with the approved access.
-
-POST requires an immutable `web_active_v1` scope and requester consent to change disposable test data. Bodies are limited to 16 KiB of JSON or URL-encoded text. Other methods, file uploads, arbitrary authorization/cookie headers and off-scope targets remain blocked. These HTTP profiles do not handle browser login, SSO or MFA. Each role records `web-checks-v1` coverage, with actual request IDs and explicit gaps, before its model investigation. An account that fails its authenticated/anonymous control leaves coverage incomplete.
-
-**Browser login (adapter 13):** `browser_login_v1` uses Chromium and Hermes' browser tools to follow the approved website's own frontend. No per-site API adapter is needed. Optional paths are navigation hints. A private controller fills the supplied account, injects Basic/bearer access, or exposes a fresh, unfunded EVM test wallet. Cookies and JavaScript tokens stay in the browser session; HTTP tools can reuse captured cookies. Passwords/session data necessarily reach the isolated browser and remain visible to its operator. Known secrets are redacted before model calls and retained reports; arbitrary encodings are not guaranteed to be caught.
-
-For browser-login scopes, initial engine discovery covers public routes. Hermes then signs in and investigates authenticated routes. Read the saved access comparisons and individual requests to see which private resources were actually tested; an engine receipt alone does not establish authenticated coverage.
-
-The browser helper exposes visible controls inside open shadow roots, used by common wallet pickers. If a picker ignores an unfamiliar EIP-6963 provider, the agent can retry once with the older `window.ethereum` transport; no wallet brand is impersonated. A connected address can be the whole flow on a public dapp; no signature or private login is invented. Pending requests, blocked external origins and relay error codes help distinguish loading from a policy restriction. The helper can wait up to two minutes for page scripts without spending model calls; repeated inspection must not be mistaken for a broken button while scripts are still loading. Before returning the final result, the adapter stops browser requests and drains its bridge so background polling cannot invalidate a completed run.
-
-The agent must request an authenticated/anonymous comparison before claiming access: 2xx versus 401/403, or a JSON account identity matching the supplied username/test wallet and differing anonymously. A public 200 page or successful signature is not enough. Missing proof prevents complete authenticated evidence and appears as a coverage gap in exports. Frames, navigation and login stay on the approved origin. Optional `browser_login.resource_origins` lists up to eight exact HTTPS dependency hosts approved with the request. Only anonymous GET/HEAD reads are allowed there, with no account headers, referrers, request bodies or stored response cookies; the same public-DNS, byte, request and lease limits apply. Ordinary HTTP/scanner tools cannot target these hosts, and they cannot supply login proof. Undeclared dependencies remain blocked. MFA, CAPTCHA, external SSO, WalletConnect-only flows and Solana target wallets are unsupported. Legacy HTTP login scopes continue unchanged.
-
-The browser has one five-minute login window, at most eight same-origin POST steps and four reviewed personal-sign signatures. No transactions, typed-data signing, key export or chain RPC. Custom readable messages still need agent judgment; this is not a guarantee about their meaning. Keys are new per role and must never be funded. Target calls share the existing request/lease limits; responses are bounded to 8 MiB each and 64 MiB per role. Downloads and service workers are disabled.
-
-Before enabling browser capacity on a Linux host with AppArmor, inspect and load the supplied profile:
+Full browser scopes need Chromium's nested namespace sandbox and the supplied [AppArmor profile](agent/browser-apparmor). On a compatible AppArmor-enabled Linux host, inspect the profile before loading it:
 
 ```sh
 sudo apparmor_parser -r agent/browser-apparmor
 ```
 
-Build adapter 13 from `agent/Dockerfile` and pin its inspected image digest in the agent configuration. Deploy matching core, dispatcher/gateway migration 29 and updated relays first. The relay requires `patchriot-browser-v1` plus its embedded seccomp profile and verifies the resulting container policy. Missing host support fails closed. Chromium keeps its own namespace sandbox: no `--no-sandbox`, host networking, host IPC, added capabilities or privileged container. Browser scopes use 256 PIDs and 256 MiB private shared memory within the existing 2 GiB memory limit. The host profile permits Chromium's nested user namespace; it does not change Docker's default profile for other containers.
-
-Owned browser fixtures are in `agent/test_browser_access.py`, enabled only with `PATCHRIOT_BROWSER_FIXTURE=1`. They exercise actual Chromium and the pinned Hermes browser tool without model calls or external targets. Rust tests independently check cryptographic signatures, origin/expiry limits, credential redaction and access evidence. Fixture success does not establish live model quality or universal login compatibility.
-
-**Rolling upgrades:** update core before exposing new capability names, then update dispatcher/gateway, then the relays. Old core versions reject unknown capability names. Advanced options become available only when all selected components support them.
-
-The hosted calibration run uses 3,600 seconds per role (set both the dispatcher’s `PATCHRIOT_AGENT_ATTEMPT_SECONDS` and the relay’s `max_attempt_seconds`). The combined three-role ceiling is $30 of conservative model allowance; it is not a customer price or a forecast of the bill. Discovery preserves a separate final-report reserve. The final-report reserve remains enforced. Deploy core and dispatcher/gateway with the expanded protocol limit and migration 20 before upgrading relays; existing assignments keep their saved time limits.
-
-**Automatic login form detection:** updated relays advertise `form_discovery_v1` with the existing adapter 10/11 images. The owner supplies the login page and protected URL. The trusted broker reads one unambiguous HTML form, validates its same-origin action and submits the account once. It extracts hidden fields as data without executing scripts; ambiguous forms, external actions and unsupported controls stop the login. Secrets and cookies never enter the task container or model prompt. Ordinary agent POST requests still require their own permission. Deploy the updated core and dispatcher migration 26 before these relays; older relays continue handling explicit-login requests.
-
-**Adapter 12:** adds `active_web_v2`, with explicit permission to change test data and acknowledgement of production disruption risk. Existing `active_web_v1` scopes keep their original test-environment restriction. Rebuild the pinned agent image and deploy core, dispatcher/gateway migration 27, then updated relays. The baseline check accepts same-origin redirects to the declared login page as an anonymous control, without following them.
-
-**Wallet login (updated relay, adapter 12):** `wallet_login_v1` creates an unfunded EVM wallet per role in the Rust broker. It signs one validated SIWE login, bound to the approved origin, address, chain, nonce and a short expiry. Challenge/verification paths and JSON format come from the owner’s scope, not model output. No transactions, imported keys, typed-data signing, delegation resources or chain RPC. Keys are discarded after the attempt; signatures, cookies and login bodies stay outside model input and reports. A session cookie plus a successful protected GET and denied anonymous control are required for authenticated coverage. The target must accept new wallets; no token holdings, admin rights or previous account data are supplied. Use the core README’s wallet API settings. Deploy servers and dispatcher migration 28 first; the existing adapter 12 image can stay pinned.
-
-**Session login (adapter 10):** `session_login_v1` adds a single form or JSON POST to the exact owner-declared login endpoint, optionally preceded by the declared login page for a hidden CSRF token. The relay owns the password and session cookie; the agent never receives them. Login request/response bodies and headers are withheld from evidence. The resulting cookie is used only within the approved origin; anonymous controls send no cookie or account. Login is attempted once per role, including on failure. Redirects are not followed. The protected endpoint must return 2xx with the account. Anonymous access must be refused (401/403), or—on adapter 12—redirect to the declared same-origin login page. A public 200 response is not authenticated coverage. SSO, MFA, CAPTCHA, JavaScript-driven login and token-only JSON responses are unsupported. Other POST actions still need their separate scope permission. Deploy dispatcher migration 24 and the matching core before upgrading relays.
-
-
-**Venice (adapter 11):** use `model_url: "https://api.venice.ai/api/v1"`, `model: "abliteration-abliterated-model-large-v2"` and a private `live_provider_key_file` containing the Venice key. Pair a separate device with that exact model, then obtain approval; do not reuse an identity declared for the direct provider. Hermes uses the selected route. The relay accepts only the fixed URL/model pairs, disables provider search/scraping and model fallbacks, and leaves keys outside the container. Existing direct-provider devices remain supported.
-
-The configured routes both list $3 per million input tokens and $5 per million output tokens on 3 November 2026; accounting conservatively ignores cache discounts. Recheck [Abliteration rates](https://abliteration.ai/pricing) and Venice's `GET /api/v1/models` before deployment. A two-call synthetic comparison verified both routes and evidence-aware responses, not broader security quality or model independence. Venice accepts the requested reasoning parameter; its model metadata does not guarantee effort control.
-
-This Venice model is marked **anonymized**, not private. Its upstream provider receives content; no upstream zero-retention, TEE or E2EE guarantee is established. See [Venice privacy](https://docs.venice.ai/overview/privacy). Requesters see the provider before consent and in the report. A provider-managed model declaration remains unverified.
-
-**NEAR AI:** pair a new device with `model: "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"`, `model_url: "https://cloud-api.near.ai/v1"` and a private `live_provider_key_file` containing the NEAR key. Deploy matching core and dispatcher versions first. The Rust SDK encrypts the model exchange and requires current gateway, CPU/GPU attestation and a model-service signature. Responses are buffered and verified before Hermes or the discovery engine can consume tool calls. Temporary failures while fetching attestation or signatures can retry up to three times. Invalid evidence or policy failures stop immediately. A paid NEAR completion is never replayed to NEAR. Invalid signatures or attestation stop the role; the separately consented recovery route below handles temporary outages without accepting unverified NEAR output. Provider keys remain outside the container.
-
-The [Private TEE DeepSeek route](https://near.ai/models/deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated) lists $0.30 per million input tokens and $1.20 per million output tokens on 3 November 2026. The relay uses those uncached rates for its cost ceiling; recheck prices before deployment. A small evidence exercise verified compatibility, not a general cybersecurity ranking. Attestation covers the model service, not the Kali host or the accuracy of a finding. Operators still see the plaintext task. Linux releases include the native crypto verifier; the pinned builder links OpenSSL statically.
-
-### Primary model and optional backup
-
-The primary is the device’s paired `model`, matching `model_url` and private `live_provider_key_file`. Both DeepSeek orders are supported:
-
-| Provider | Model | API URL |
-| --- | --- | --- |
-| NEAR AI | `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` | `https://cloud-api.near.ai/v1` |
-| Venice | `deepseek-v4-1-flash-1017-uncensored` | `https://api.venice.ai/api/v1` |
-
-For a backup, set `secondary_model` to the other model and `secondary_key_file` to its private credential file. Configure both or neither. Keys must be mode 0600 and owned by the relay user; they stay outside containers. No provider order or credential belongs in repository deployment files.
-
-Ordinary signed heartbeats report the configured backup for agent cards and pool selection. Busy lease heartbeats preserve that metadata. This is a configuration declaration, not attestation or proof that the backup was used; actual use belongs in the assessment receipt. Update dispatcher and gateway before relays because older gateways reject the new optional metadata field. Set `PATCHRIOT_INFERENCE_BALANCED_POOLS=true` on dispatcher to assign new audits across both ready pools, or use the fixed routing settings below. These modes cannot be combined.
-
-Update core, dispatcher/gateway and relay first. Set the dispatcher’s `PATCHRIOT_INFERENCE_PRIMARY_MODEL` to the selected primary and optionally `PATCHRIOT_INFERENCE_SECONDARY_MODEL` to the backup. New checkout selects already approved devices declaring that primary. If none are available, checkout waits; it does not substitute another model. A model change requires a fresh device identity and approval. Keep the previous devices/configuration for queued work. A settings change applies only to new requests, not saved consent.
-
-Legacy configuration remains supported: `venice_fallback_key_file` on a NEAR relay and `PATCHRIOT_VENICE_FALLBACK_ENABLED=true` on dispatcher. Do not combine the old and new configuration fields. Old consent and receipts retain their original bytes; new requests save the exact optional `fallback_model`. Neither a key nor deployment settings grant permission to send a request to an unapproved provider.
-
-A temporary provider failure, rate limit or unavailable NEAR verification service permits one backup attempt before any model output reaches the agent. The role prefers the backup after recovery. If that backup has completed earlier calls and later suffers an eligible temporary failure, the role can return to its already-approved primary once. Further failures do not alternate providers; the next role starts with its own primary. Bad credentials, malformed input, invalid attestation/signatures, scope denials and exhausted budgets never trigger recovery. A NEAR backup uses the same encryption and verification as a NEAR primary. There is no alternating retry loop and no replay of target tools.
-
-**Initial failover uses one call allowance across its two providers.** A later return from a previously working backup consumes a new call slot, just like repeated-output recovery. Both attempts reserve money under the existing $30-per-role limit; an uncertain failed charge is not refunded in the estimate. Time limits and the final-report reserve still apply. The report, exports and retained work receipt record the fallback model, initial reason and updated attempt counts. Native SDK retries after explicit rate refusals also consume ordinary broker allowance: three consecutive refusals or more than six total stop discovery, with recovery counts retained in the native receipt. Budget, input, authentication and ambiguous errors are not turned into rate-limit retries.
-
-Venice lists this model as private, with uncached prices of $0.33/M input and $1.32/M output on 4 November 2026. These are provider declarations, not a Patchriot TEE verification. This route uses HTTPS and does not claim NEAR attestation or identical model weights. Recheck the [model catalogue](https://docs.venice.ai/api-reference/endpoint/models/list) and [privacy terms](https://docs.venice.ai/overview/privacy) before enabling it.
-
-A long repeating response can stop Hermes before it writes a report. The relay checks buffered model output before delivery and can use the consented backup for `provider_repetition`. NEAR verification still has to pass before its output is accepted. It does not retry website tools. A repeating backup response stops the call; the spending and time limits still apply.
+Test the browser path before approving its capabilities. This step is not part of the macOS local trial.
 
 </details>
 
-## Additional scoped checks
+<a id="keep-a-relay-running"></a>
 
-The dependency audit records two reviewed exceptions for the pinned NEAR SDK's JWT dependencies. Its production JWT consumer accepts ES384 and verifies NVIDIA public signatures. The RSA private-key operations covered by RUSTSEC-2023-0071 are unused. The older bigint covered by RUSTSEC-2026-0387 is confined to public-signature verification. Wallet signing and SDK ECDH use the patched bigint dependency. These upstream dependencies remain affected. CI checks the reviewed versions, reverse dependency paths and verification source before applying the exceptions. Reassess them when updating the SDK. [RSA advisory](https://rustsec.org/advisories/RUSTSEC-2023-0071), [bigint advisory](https://rustsec.org/advisories/RUSTSEC-2026-0387)
+## Operating safely
 
-Adapter 21 adds bounded HTTP method/origin controls, endpoint discovery from observed paths, a web scanner with passive analysis and a selected reflected-input rule for approved active GET queries, and API-schema-generated read cases. The signature stage uses six curated templates. Public discovery runs once. Verified account contexts add protected-resource checks under the same relay limits. Scanner output supplies leads for the existing investigator and fresh validator.
+| Command | Purpose |
+| --- | --- |
+| `status --state-dir PATH` | Check pairing and local pause state |
+| `doctor --state-dir PATH --agent-config FILE` | Inspect configuration, image and readiness |
+| `pause --state-dir PATH` / `resume --state-dir PATH` | Stop accepting work / resume contribution |
+| `skills --state-dir PATH --agent-config FILE` | Inspect capabilities available from the installed image |
+| `update-agent --state-dir PATH --agent-config FILE --candidate-config FILE` | Validate a locally installed immutable image before changing settings |
 
-After engine discovery, the web scanner receives up to four new successful GET inputs per verified account context, including query inputs exercised with generated test data. It skips previously scanned path/parameter combinations and preserves the account that produced each observation. This follow-up works without an uploaded API schema. It retains source evidence references and reserves five minutes for the final report. Missing credentials, POST workflows and application-specific business data still require their own supported access and input preparation.
+Use the [systemd examples](deploy/) on a dedicated Linux host. Their network policy is restrictive: configure only the dispatcher, provider, DNS and approved target access your installation needs. Pause and drain work before upgrading; retain device state so delivery retries cannot rerun a paid job. A different model requires a new paired identity. Staff capability approval and requester provider consent still apply.
 
-The handoff waits for an in-flight discovery reply to drain before starting short-timeout reviewer calls. It rejects queued discovery calls and respects the final-report reserve. If the optional scanner cannot read fresh access state, it records an explicit coverage gap without assuming authentication or discarding the saved investigation. A broker reply that cannot drain within the bounded wait still fails execution honestly.
+Containers are non-root, read-only at the root, have bounded memory/CPU/processes and no external network. The trusted broker rejects private-address targets, pins DNS and does not follow redirects automatically. Login access must be demonstrated against an anonymous control. Browser login does not support every SSO, MFA, CAPTCHA or wallet flow. POST requires explicit permission and is still capable of changing data.
 
-Report validation identifies citations that have no received HTTP response or do not belong to the current role. The existing bounded formatting repair receives those IDs, without target content or suggested replacement evidence. Unsupported claims stay in limitations; the validator still requires the corrected report to pass the same checks.
+## Contributing
 
-Scanner scratch files use the existing bounded work mount and are removed on exit. The web scanner starts in silent mode. Login preparation uses separate helper agents. Broker-confirmed protected access ends single-account preparation. Paired preparation requests a stop after six further tool completions to allow the optional identity check. A recorded 401/403 credential-login rejection ends preparation for that account. Account-change permission still requires the broker's distinct-identity proofs.
+For installation and a real audit using NEAR AI with Venice backup, follow the [complete core walkthrough](https://github.com/adaki2004/patchriot-core#run-locally).
 
-The final coverage ledger is constructed by the relay from recorded requests. Each observation identifies its URL, method, account context and evidence. Unverified vulnerability classes remain explicit obligations. The displayed ledger is size-bounded and reports omitted units. Complete request evidence remains in the normal private report. Model-authored completion cannot close a coverage obligation.
+<details>
+<summary>Checks after changing the code</summary>
 
-The web scanner sees selected headers and decoded text through a scoped mirror. Browser execution, cookie attributes, TLS and raw protocol behavior require faithful original-context evidence. API-schema generation exercises positive and negative OpenAPI inputs for GET, HEAD and OPTIONS operations. Observed GraphQL endpoints can receive introspection and generated query operations when POST is approved. Reference-account writes remain blocked; explicit GraphQL query POSTs can use the approved read-only account path. External schema references are rejected. All scanners share the existing request and time budgets. Deploy compatible core and dispatcher readers before the adapter 21 relay.
+Run these from the relay repository before proposing a code change. They check formatting, compiler warnings and automated tests; they do not pair agents or start an assessment.
 
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+```
 
-### ZAP inputs and current coverage
+Passing these checks is separate from verifying a live assessment against an authorized target. The local walkthrough describes that end-to-end test.
 
-The bundled ZAP adapter runs passive checks on selected recorded URLs. Grey-box scans use the broker's verified account context; the scanner receives scoped responses through the local mirror, not a credential file. A supplied username/password alone does not establish access. The relay must first verify the login against a protected resource.
+</details>
 
-Mirrors expose broker-owned `X-Patchriot-Authenticated`, `X-Patchriot-Account` and `X-Patchriot-Evidence-Id` response headers. Target-supplied headers with this prefix are discarded. A command without a visible token can still use injected access; access-control findings must compare the exact recorded account context with a fresh anonymous control. These headers contain no credentials and are not target security properties.
+[Security boundaries](SECURITY.md) · [License](LICENSE) · [Third-party credits](NOTICE)
 
-The broker returns decoded text, not raw binary downloads. Unsupported binary bodies are withheld from tool downloads, with `binary_response_not_supported` identifying a broker coverage gap; original response evidence, hashes and IDs remain unchanged. Mirrors return a clearly marked local 502 for that gap, not a claimed target error. HEAD checks and usable plain-text responses remain available, including text served as `application/octet-stream`. Agents must not attempt to reconstruct or decompress binary files from lossy text.
-
-For explicitly approved active scopes, the current adapter enables only the reflected-input rule on observed GET query parameters. Successful GET inputs discovered by the agent can seed the follow-up scan without a user-uploaded schema. Generated values must still pass the same method, origin, account and request limits. Missing inputs produce an explicit inapplicable outcome.
-
-This is narrower than ZAP's full active or API scan. ZAP's API scan accepts OpenAPI, SOAP or GraphQL definitions; its automation framework also supports authentication/session configuration and users. Those upstream capabilities are not an API-schema upload feature in Patchriot. The current separate schema generator uses observed definitions for bounded read cases. Stateful POST workflows, browser-only behavior and reliable session renewal require additional adapters and owned fixtures before broader scanning is enabled. Scanner execution has no model-token charge, but compute, storage and model interpretation still cost money. See [ZAP automation](https://www.zaproxy.org/docs/automate/), [API scan inputs](https://www.zaproxy.org/docs/docker/api-scan/) and [authentication configuration](https://www.zaproxy.org/docs/desktop/addons/automation-framework/authentication/).
-
-### Saved report delivery
-
-Completed results stay in the private outbox until the dispatcher acknowledges them. Completion uploads use gzip with a 90-second request deadline; heartbeats retain their shorter deadline. The server bounds both compressed bytes and expanded JSON, verifies the signed endpoint and applies the normal lease and exact-replay checks. An older server's missing compressed endpoint falls back to the original signed JSON request. Timeouts retain the same saved result and do not rerun inference. Deploy the compatible dispatcher/gateway first, and upgrade runners after their active execution ends.
-
-Downloads of prior reports explicitly advertise `Accept-Encoding: gzip` on the signed compressed-evidence route. This keeps intermediaries from expanding the response before delivery. Downloads have a five-minute transfer deadline while the independent heartbeat continues renewing the same lease; signature freshness and the server's execution deadline stay unchanged. The relay still checks the response encoding and independently bounds compressed and expanded bytes; the original JSON route remains the fallback only when the compressed route is missing. Transient live-evidence download failures retry inside that lease monitor after a cancellable five-second delay, before the paid execution marker. Revocation, expiry, shutdown, invalid evidence and permission refusals stop startup; a response arriving after cancellation cannot start the model. Download retries do not rerun the investigator or purchase model calls.
-
-## Optional requester context and perimeter access
-
-Adapter 22 advertises `run_context_v1`. Accepted requester context reaches the investigator, native engine and validator as untrusted data; links, nested/encoded instructions and claimed system messages do not change the saved scope. The model has no provider keys or direct target network access. Rust still checks origins, DNS, methods, headers, account permissions and redirects independently of model behavior.
-
-An optional HTTP Basic perimeter gate is injected only for its single approved origin, including anonymous application controls. It does not establish application authentication. The relay removes gate credentials from container input and redacts supplied secret forms from retained evidence and model messages. Page dependencies receive no gate header. Conflicting application Authorization headers fail explicitly rather than overwriting either credential. This protects the transport boundary; it is not a guarantee that all indirect instructions will be recognized or that model-written findings are correct.
-
-For an app with a separate owned API, adapter 23 accepts an explicit `browser_entry_origin` and additional approved `origins`. Both need authorization. `browser_resource_origins` are anonymous GET/HEAD dependencies only. The perimeter gate stays on the entry host, and a verified bearer session stays on the exact API origin that proved access. Older scope JSON remains valid; deploy matching protocol readers and runners before sending the new fields.
-
-Browser access checks also accept a small observed GraphQL query through `check --data`. The relay compares the same query with and without the private session. A public success, GraphQL type name or arbitrary error does not prove login. Token headers are redacted and replayed only to the verified API origin. Page-loading queries do not spend the bounded login-submission allowance. Deploy matching protocol readers before these runners.
+> **DON’T TRUST! VERIFY!** Inspect the relay, pinned image and host configuration yourself—or have your own security agent do it—before accepting private work. Operators can see the tasks they process. Containers reduce exposure; they are not VMs, TEEs or proof of operator honesty.
