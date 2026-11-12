@@ -7,11 +7,14 @@ RUN /opt/hermes/.venv/bin/python /tmp/install_nuclei.py
 
 FROM base
 USER root
+COPY debian.sources /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     openjdk-21-jre-headless curl jq ripgrep ffuf chromium \
     && rm -rf /var/lib/apt/lists/*
+COPY requirements.lock /tmp/requirements.lock
 RUN /opt/hermes/.venv/bin/python -m ensurepip --upgrade && \
-    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir playwright==1.60.0 schemathesis==4.33.1
+    /opt/hermes/.venv/bin/python -m pip install --no-cache-dir --only-binary=:all: \
+    --no-deps --require-hashes -r /tmp/requirements.lock
 # Pinned upstream scanner distribution, used only inside the scoped container.
 ADD --checksum=sha256:efe799aaa3627db683b43f00c9c210aea0b75c00cc8f0a0f0434d12bb3ddde5a https://github.com/zaproxy/zaproxy/releases/download/v2.17.0/ZAP_2.17.0_Linux.tar.gz /tmp/zap.tar.gz
 RUN mkdir -p /opt/zap && tar -xzf /tmp/zap.tar.gz -C /opt/zap --strip-components=1 && rm /tmp/zap.tar.gz

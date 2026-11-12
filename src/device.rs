@@ -1163,6 +1163,7 @@ fn agent_work(
                     &read_key(directory)?,
                     &format!("/v1/devices/{device_id}/work/evidence"),
                     patchriot_protocol::website_reviews::ReadWorkEvidence {
+                        nonce: uuid::Uuid::new_v4(),
                         lease_id: assignment.lease_id,
                     },
                     5 * 1024 * 1024,
@@ -1182,6 +1183,7 @@ fn agent_work(
                     &read_key(directory)?,
                     &format!("/v1/devices/{device_id}/work/source-evidence"),
                     patchriot_protocol::website_reviews::ReadWorkEvidence {
+                        nonce: uuid::Uuid::new_v4(),
                         lease_id: assignment.lease_id,
                     },
                     512 * 1024,
@@ -1203,6 +1205,7 @@ fn agent_work(
                             &read_key(directory)?,
                             &format!("/v1/devices/{device_id}/work/pentest-evidence"),
                             patchriot_protocol::website_reviews::ReadWorkEvidence {
+                                nonce: uuid::Uuid::new_v4(),
                                 lease_id: assignment.lease_id,
                             },
                             patchriot_protocol::pentests::MAX_EVIDENCE_BYTES as u64,

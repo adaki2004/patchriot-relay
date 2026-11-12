@@ -93,6 +93,9 @@ Interrupted execution and rejected delivery preserve one bounded recovery file, 
 
 ## Tool inventory and provenance
 
+The image pins its Hermes base digest, Debian package snapshot and hashes for every Python package added to that base. Rebuilds do not consult a rolling Debian mirror or resolve new Python dependencies. These pins make inputs reviewable; they do not prove byte-identical image outputs or that dependencies are free of vulnerabilities. Update the snapshot and lock deliberately, run the isolated image fixtures and install the resulting immutable digest.
+
+
 Adapter 25 runs the same anonymous baseline in both modes. Grey-box adds independently verified account contexts; a failed login never counts as authenticated coverage. The bounded discovery bundle has a ten-minute ceiling inside the original role budget. Each component records its name, version, request references and completion state. Hermes then tests evidence-based hypotheses; Recon validates findings and checks a few untested leads. Completion describes this selected plan, not exhaustive security coverage.
 
 Schema checks use approved OpenAPI server paths or Swagger base paths. An inferred API mount needs an observed JSON response and a missing-path control. The sample covers distinct read operations before adding input variations, with up to 48 generated cases within the remaining allowance. Publicly discovered schemas also feed verified account checks. Receipts retain tested, unsampled and deferred operations; a redirected alternate document does not invalidate a usable schema. POST remains available to agents under the saved permission, including JSON/form checks and permitted GraphQL queries. A schema alone does not authorize generated state-changing requests.
@@ -121,6 +124,22 @@ Official provenance and reputation reduce supply-chain uncertainty; neither make
 
 Pairing is for approved staff. Initialize a device, pair it through the administrator’s account, then approve its capabilities separately. Public contributors cannot enroll themselves in this beta. A company installation can use its own approved machines and private mesh.
 
+## Configuration
+
+The relay uses CLI arguments, its private state directory and a JSON settings file; it does **not** read `.env`. Copy [agent-settings.example.json](agent-settings.example.json) outside the checkout, replace its immutable image ID and key path, and select your provider from the routing table below. The example illustrates the NEAR route, not a production preference.
+
+| Setting | Purpose |
+| --- | --- |
+| `docker_socket` | Local Docker socket; access is privileged. Never mount it into task containers. |
+| `image` | Tested image’s exact `sha256:` ID from `docker image inspect`; tags are rejected. |
+| `model_url`, `model` | An allowed URL/model pair matching this device’s pairing declaration. |
+| `model_digest` | Model-file digest for local models; `provider-managed-not-attested` for API-managed weights. The NEAR route verifies its separate runtime attestation. |
+| `live_provider_key_file` | Absolute path to the primary provider key, mode `600`, owned by the relay user. Never supplied to the container. |
+| `secondary_model`, `secondary_key_file` | Optional backup pair; set both or neither, using the other supported DeepSeek route. Dispatcher consent must also allow it. |
+| `max_attempt_seconds` | Local per-role ceiling: defaults to 600, maximum 10800. The dispatcher’s saved allowance can be lower. |
+
+Use `doctor --state-dir STATE --agent-config SETTINGS` to check local readiness before `connect --agents --agent-config SETTINGS`. The hosted agent also needs `--website-reviews --live-tests` and staff approval; source access is a separate opt-in. Private key files, images and provider availability must be prepared before connection.
+
 ## Install and operate
 
 Expand the relevant section for releases, pairing, health checks or running a supervised service. These commands set up an agent machine; customers only need the hosted website.
@@ -138,6 +157,8 @@ sha256sum --ignore-missing --check SHA256SUMS &&
 ```
 
 The archive includes agent/sandbox setup files, service examples and license notices. Use `./patchriot-relay` instead of `cargo run --locked --` in the commands below. Matching relay and protocol source is attached separately; macOS users can build from source. Model weights and the external agent runtime are installed separately.
+
+Release checksums detect corruption but are not an independent signature: a repository/release compromise could replace both archive and checksums. Review the source at the recorded commit or build it yourself when you need an independent check.
 
 **Releases do not update running agents automatically.** Stop the relay before replacing its binary, preserve its state directory and configuration, then restart it under the same Unix account. You do not need to pair it again.
 
@@ -196,6 +217,8 @@ cargo run --locked -- connect --state-dir .local/relay-one
 </details>
 
 If the code expires, run `pair` again with the same `--state-dir` and use the new code. Keep the existing state: it contains your device key. A code claimed by another account requires that account or a separate device identity; refreshing the website cannot transfer it.
+
+After pairing, staff approve the specific work modes and tool capabilities they checked. A heartbeat can report a capability but cannot approve it. New capabilities after an image upgrade need a staff update; this is a readiness check, not a guarantee about model weights or operator honesty.
 
 The Ed25519 key stays in your private state directory. The relay connects outward; it needs no public inbound port. Use HTTPS or an authenticated tunnel outside loopback. Three devices on one machine should declare the same compute group.
 
