@@ -103,6 +103,14 @@ impl Settings {
         &self.model
     }
 
+    pub(crate) fn secondary_model_name(&self) -> Option<&str> {
+        self.secondary_model.as_deref().or_else(|| {
+            self.venice_fallback_key_file
+                .as_ref()
+                .map(|_| patchriot_protocol::pentests::VENICE_FALLBACK_MODEL)
+        })
+    }
+
     /// Inspects installed files only. Labels describe capabilities; they do not
     /// prove model weights, operator trust or successful penetration testing.
     pub(crate) fn installed_capabilities(&self) -> Result<Value, Box<dyn std::error::Error>> {

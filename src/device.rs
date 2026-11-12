@@ -53,7 +53,7 @@ fn os_release(text: &str) -> Option<(String, Option<String>)> {
     Some((field("NAME")?, field("VERSION_ID")))
 }
 
-fn reported_system() -> AgentSystem {
+fn reported_system(secondary_model: Option<&str>) -> AgentSystem {
     let release = if cfg!(target_os = "linux") {
         ["/etc/os-release", "/usr/lib/os-release"]
             .into_iter()
@@ -75,6 +75,7 @@ fn reported_system() -> AgentSystem {
         os_version,
         architecture: std::env::consts::ARCH.into(),
         relay_version: env!("CARGO_PKG_VERSION").into(),
+        secondary_model: secondary_model.map(str::to_owned),
     }
 }
 
@@ -552,7 +553,11 @@ fn pair(directory: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<String>, Error> {
+fn tick(
+    directory: &Path,
+    client: &reqwest::blocking::Client,
+    settings: Option<&crate::agent::Settings>,
+) -> Result<Option<String>, Error> {
     let _lock = state_lock(directory)?;
     let mut config = read_config(directory)?;
     let key = read_key(directory)?;
@@ -604,7 +609,17 @@ fn tick(directory: &Path, client: &reqwest::blocking::Client) -> Result<Option<S
         &key,
         &format!("/v1/devices/{id}/heartbeat"),
         Heartbeat {
-            system: Some(reported_system()),
+            // Busy lease heartbeats omit software metadata and preserve the
+            // configuration reported by the connection's ordinary heartbeat.
+            system: if settings.is_some()
+                || config.introduction.runtime == RuntimeKind::OwnedFixture
+            {
+                Some(reported_system(
+                    settings.and_then(crate::agent::Settings::secondary_model_name),
+                ))
+            } else {
+                None
+            },
             sequence: config.sequence,
             paused: config.paused,
             running: u16::from(config.active_assignment.as_ref().is_some_and(|a| {
@@ -1027,7 +1042,7 @@ fn monitor_lease(
             break;
         }
         if Instant::now() >= heartbeat_at {
-            match tick(directory, client) {
+            match tick(directory, client, None) {
                 Ok(Some(state)) if ["online", "busy"].contains(&state.as_str()) => {}
                 Err(error) if !terminal_remote_error(&error) => {
                     eprintln!("heartbeat retry pending")
@@ -1430,7 +1445,7 @@ pub fn execute(args: &[String]) -> Result<u8, Error> {
             let mut failures = 0;
             let mut recovered = false;
             loop {
-                let result = tick(&directory, &client).and_then(|state| {
+                let result = tick(&directory, &client, settings.as_ref()).and_then(|state| {
                     if (fixtures || agents)
                         && state
                             .as_deref()
@@ -1515,7 +1530,7 @@ mod tests {
             None
         );
         assert_eq!(super::os_release("NAME=\"broken\n"), None);
-        super::reported_system().validate().unwrap();
+        super::reported_system(None).validate().unwrap();
     }
     use super::*;
 
