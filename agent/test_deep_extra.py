@@ -59,6 +59,54 @@ class SurfaceTests(unittest.TestCase):
         self.assertEqual(detail['reachable_routes'], [])
         self.assertEqual(client.gaps, [])
 
+    def test_slow_surface_stops_before_its_next_probe_and_keeps_the_control(self):
+        clock = [1000.0]
+        calls = []
+        def fetch(method, url, headers=None, **kwargs):
+            clock[0] += 1.0
+            calls.append(url)
+            if 'missing' in url:
+                return reply(url, 404, 'missing')
+            return reply(url, body=' '.join('"/api/item%d"' % i for i in range(50)))
+        with patch('time.monotonic', lambda: clock[0]):
+            client = Requests(scope(), 1030.0, fetch, limit=48)
+            detail = extra.surface(client, [ORIGIN + '/'])
+        self.assertLess(clock[0], 1030.0)
+        self.assertIn('missing', calls[0])
+        self.assertGreater(detail['probed_routes'], 0)
+        self.assertGreater(detail['deferred_routes'], 0)
+        self.assertEqual(set(client.gaps), {'route_sample_limit'})
+
+    def test_last_request_overrunning_deadline_cannot_be_a_success(self):
+        clock = [1000.0]
+        def fetch(method, url, headers=None, **kwargs):
+            clock[0] += 35
+            return reply(url, 404, 'late')
+        with patch('time.monotonic', lambda: clock[0]):
+            client = Requests(scope(), 1030.0, fetch, limit=48)
+            extra.surface(client, [ORIGIN + '/'])
+        self.assertIn('scanner_budget_reached', client.gaps)
+
+    def test_surface_request_cap_is_a_sample_and_does_not_drop_control(self):
+        client = Client(self.fetch, limit=6)
+        detail = extra.surface(client, [ORIGIN + '/'])
+        self.assertLessEqual(client.calls, 6)
+        self.assertEqual(detail['missing_control_status'], 404)
+        self.assertGreater(detail['probed_routes'], 0)
+        self.assertIn('route_sample_limit', client.gaps)
+        self.assertNotIn('scanner_budget_reached', client.gaps)
+
+    def test_only_the_control_finishing_is_not_successful_surface_coverage(self):
+        clock = [1000.0]
+        def fetch(method, url, headers=None, **kwargs):
+            clock[0] += 28
+            return reply(url, 404, 'missing')
+        with patch('time.monotonic', lambda: clock[0]):
+            client = Requests(scope(), 1030.0, fetch, limit=48)
+            detail = extra.surface(client, [ORIGIN + '/'])
+        self.assertEqual(detail['probed_routes'], 0)
+        self.assertIn('surface_no_routes_probed', client.gaps)
+
 
 class BypassTests(unittest.TestCase):
     def test_protected_path_flip_is_reported_with_its_control(self):

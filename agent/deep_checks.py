@@ -13,7 +13,7 @@ import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from live_http import request
-from scoped_scanners import Requests, discovery, schema_checks, zap, scanner_failure_reason
+from scoped_scanners import Requests, discovery, schema_checks, zap, scanner_failure_reason, SAMPLING_LIMITS
 from web_tools import allowed, record
 
 VERSION = '1'
@@ -145,7 +145,7 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
         families = [
             ('patchriot-probes', '1', route_checks, 45, 32),
             ('ffuf', '2.1', discovery, 30, 24),
-            ('schemathesis', '4.33.1', schema_checks, 45, 32),
+            ('schemathesis', '4.33.1', schema_checks, 75, 64),
             ('zap', '2.17.0', zap, 100, 64),
         ]
     component_runs, details, all_evidence = [], [], {}
@@ -175,14 +175,20 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
                 continue
             # Anonymous parity first. Account contexts receive bounded slices of
             # remaining time; one slow scanner cannot consume final-report time.
-            remaining_slots = (len(families) - family_index) * len(selected) - context_index
-            slice_seconds = min(seconds, max(0, (deadline - time.monotonic()) / remaining_slots))
+            remaining_weight = (seconds * (len(selected) - context_index)
+                                + sum(f[3] for f in families[family_index + 1:]) * len(selected))
+            slice_seconds = min(seconds, max(0, (deadline - time.monotonic()) * seconds / remaining_weight))
             client = Requests(scope, min(deadline, time.monotonic() + slice_seconds), fetch,
                               account, limit=limit, discovery=True)
             context_started = time.monotonic()
             urls = seeds[account]
             if function == schema_checks:
-                urls = sorted(urls, key=lambda u: not bool(re.search('openapi|swagger|graphql', u, re.I)))
+                # A publicly observed schema also describes the signed-in API.
+                # Reuse its URL, never an anonymous response as login evidence.
+                urls = list(dict.fromkeys(urls + [u for u in seeds[None]
+                    if re.search('openapi|swagger|graphql', u, re.I)]))
+                urls = sorted(urls, key=lambda u: (not bool(re.search('openapi|swagger|graphql', u, re.I)),
+                                                  not urlsplit(u).path.endswith('.json')))
             try:
                 detail = function(client, urls)
                 if detail.get('reachable_urls'):
@@ -202,7 +208,7 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
                   'contexts': family_contexts, 'gaps': sorted(set(family_gaps))}
         details.append({'tool': tool, **detail})
         # Route sampling is an explicit coverage limitation, not a crashed tool.
-        failures = set(family_gaps) - {'route_sample_limit'}
+        failures = set(family_gaps) - SAMPLING_LIMITS
         receipt = record(tool, version, ['scoped', '--deep-suite' if deep else '--discovery-suite'],
                          family_started, family_observed, refs, json.dumps(detail), 0,
                          'incomplete' if failures else None)
@@ -223,11 +229,12 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
                    for e in all_evidence.values()):
             gaps.append('public_origin_untested:' + origin)
     auth_count = sum(count for name, count in counts.items() if name != 'anonymous')
-    incomplete = sorted(set(gaps) - {'route_sample_limit'})
+    incomplete = sorted(set(gaps) - SAMPLING_LIMITS)
     summary = {'engine': 'Patchriot deep checks' if deep else 'Patchriot scoped discovery',
         'receipt_schema': 1,
         'coverage_complete': not incomplete, 'stop_reason': 'checks_incomplete' if incomplete else 'done',
         'failure': 'incomplete' if incomplete else None, 'collection_errors': incomplete,
+        'sampling_limits': sorted(set(gaps) & SAMPLING_LIMITS),
         'authentication_requested': bool(scope.get('authentication')),
         'access_mode': 'anonymous_and_authenticated' if auth_count else 'anonymous',
         'anonymous_evidence_count': counts.get('anonymous', 0), 'authenticated_evidence_count': auth_count,
@@ -238,6 +245,8 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
             'Public checks precede verified account checks; missing access is never a clean grey-box pass.']}
     if 'route_sample_limit' in gaps:
         summary['limitations'].append('Route sampling stopped before another complete comparison would exceed the request or time allowance; inspect component samples for untested paths.')
+    if 'schema_case_sample_limit' in gaps:
+        summary['limitations'].append('API schema cases were sampled across eligible operations; inspect the schema receipt for tested and deferred counts. State-changing operations require agent review and existing permissions.')
     (directory / ('deep-results.json' if deep else 'discovery-results.json')).write_text(
         json.dumps({**summary, 'details': details}))
     receipt = record(suite_tool, VERSION, arguments, started, observed, sorted(all_evidence),

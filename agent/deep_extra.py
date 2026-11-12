@@ -40,13 +40,6 @@ def status(reply):
     return evidence.get('status'), evidence.get('headers', {}), reply.get('body', '')
 
 
-def fetch_all(client, urls, limit):
-    for url in urls[:limit]:
-        if client.calls >= client.limit:
-            return
-        yield url, client('GET', url)
-
-
 def script_urls(body, base, scope):
     found = []
     for raw in SCRIPT.findall(body or ''):
@@ -62,10 +55,23 @@ def surface(client, urls):
     A discovered route is only a lead: the missing-path control must differ.
     """
     discovered, scripts, secrets, tech = [], [], [], set()
-    bodies = []
-    for url, reply in fetch_all(client, urls, 6):
+    base = client.scope['origins'][0]
+    # Get the negative control first. Mining scripts must not consume the time
+    # needed to compare the routes they reveal.
+    if not client.can_start(2):
+        return {'state': 'blocked', 'reason': 'surface_control_unavailable'}
+    control = client('GET', base + '/patchriot-missing-' + MARKER.split('.')[0])
+    control_status, _, _ = status(control)
+    if control_status is None:
+        client.gaps.append('surface_control_unavailable')
+        return {'state': 'blocked', 'reason': 'surface_control_unavailable'}
+    pages_read, scripts_read = 0, 0
+    for url in urls[:6]:
+        if not client.can_start(2):
+            break
+        reply = client('GET', url)
+        pages_read += 1
         body = reply.get('body', '')
-        bodies.append(body)
         for lower, paths in TECH_PATHS.items():
             if lower in (body or '').lower():
                 tech.update(paths)
@@ -75,29 +81,35 @@ def surface(client, urls):
         map_url = next((s for s in SCRIPT.findall(body or '') if s.endswith('.map')), None)
         if map_url:
             scripts.append(map_url)
-    base = client.scope['origins'][0]
     seeds = list(dict.fromkeys(u for u in discovered if u))[:20]
     seeds.extend(base + path for path in GENERIC_PATHS + sorted(tech))
     for script in list(dict.fromkeys(scripts))[:10]:
+        if not client.can_start(2):
+            break
         reply = client('GET', script)
+        scripts_read += 1
         body = reply.get('body', '')
         seeds.extend(scoped_url(m, script, client.scope) for m in ROUTE.findall(body or ''))
         secrets.extend(SECRET_SHAPE.findall(body or ''))
-    control_status = None
-    if client.calls < client.limit:
-        control = base + '/patchriot-missing-' + MARKER.split('.')[0]
-        control_status, _, _ = status(client('GET', control))
-    reachable = []
-    for path in list(dict.fromkeys(p for p in seeds if p))[:24]:
-        if client.calls >= client.limit or client.deadline <= time.monotonic():
-            client.gaps.append('surface_probe_limit')
+    reachable, tested = [], []
+    candidates = list(dict.fromkeys(p for p in seeds if p))
+    for path in candidates[:24]:
+        if not client.can_start(1):
             break
         code, _, body = status(client('GET', path))
+        tested.append(path)
         if code and control_status and code == control_status and not body.strip():
             continue
         if code and control_status and code != control_status:
             reachable.append(path)
+    if len(tested) < len(candidates) or pages_read < len(urls) or scripts_read < len(set(scripts)):
+        client.gaps.append('route_sample_limit')
+    if not tested:
+        client.gaps.append('surface_no_routes_probed')
     return {'scripts': len(set(scripts)), 'discovered_routes': len(set(seeds)),
+            'pages_read': pages_read, 'scripts_read': scripts_read,
+            'candidate_routes': len(candidates), 'probed_routes': len(tested),
+            'deferred_routes': max(0, len(candidates) - len(tested)),
             'reachable_routes': reachable[:16], 'tech_paths': sorted(tech),
             'secret_shaped_strings': len(set(secrets)), 'missing_control_status': control_status,
             'reachable_urls': reachable,

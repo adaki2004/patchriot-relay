@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import deep_checks as deep
 
 class DiscoveryTests(unittest.TestCase):
@@ -112,6 +113,50 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(flow.node('public_signatures')['state'],'not_applicable')
             self.assertEqual(flow.node('public_analysis')['state'],'not_applicable')
             self.assertEqual(flow.node('public_mapping')['state'],'pending')
+
+    def test_grey_schema_checks_receive_the_public_schema_in_their_own_context(self):
+        calls = []
+        scope = {'origins': ['https://owned.example'], 'methods': ['GET'],
+                 'authentication': 'session', 'auth_check_path': '/private'}
+        def fetch(method, url, headers=None, **kwargs):
+            calls.append((url, kwargs.get('account'), kwargs.get('authenticated')))
+            return {'body': '{}', 'evidence': {'id': len(calls), 'method': method, 'url': url,
+                'status': 200, 'authenticated': kwargs.get('authenticated', False),
+                'account': kwargs.get('account')}}
+        def schema(client, urls):
+            self.assertIn('https://owned.example/api/openapi.json', urls)
+            client('GET', 'https://owned.example/api/openapi.json')
+            client.gaps.append('schema_case_sample_limit')
+            return {'executed_cases': 1, 'deferred_operations_count': 50}
+        with tempfile.TemporaryDirectory() as folder, patch.object(deep, 'schema_checks', schema):
+            receipt, parts = deep.run(scope, [], {'verified': True, 'protected_url': 'https://owned.example/private'},
+                time.monotonic() + 60, fetch=fetch, directory=Path(folder),
+                functions=[('schemathesis', 'fixture', schema, 20, 20)])
+        self.assertEqual([call[2] for call in calls], [False, True])
+        self.assertIsNone(receipt['failure'])
+        detail = json.loads(receipt['output_excerpt'])
+        self.assertEqual(detail['sampling_limits'], ['schema_case_sample_limit'])
+        self.assertTrue(any('sampled' in text for text in detail['limitations']))
+
+    def test_family_weights_share_the_existing_deadline_without_extending_it(self):
+        clock, slices = [1000.0], []
+        scope = {'origins': ['https://owned.example'], 'methods': ['GET'],
+                 'authentication': 'session', 'auth_check_path': '/private'}
+        def fetch(method, url, headers=None, **kwargs):
+            return {'body': '{}', 'evidence': {'id': len(slices) + 1, 'url': url, 'status': 200,
+                'authenticated': kwargs.get('authenticated', False), 'account': kwargs.get('account')}}
+        def family(client, urls):
+            duration = client.deadline - clock[0]
+            slices.append(duration)
+            client('GET', urls[0])
+            clock[0] += duration
+            return {'state': 'recorded'}
+        with tempfile.TemporaryDirectory() as folder, patch('time.monotonic', lambda: clock[0]):
+            deep.run(scope, [], {'verified': True, 'protected_url': 'https://owned.example/private'},
+                1060.0, fetch=fetch, directory=Path(folder),
+                functions=[('long', 'fixture', family, 90, 48), ('short', 'fixture', family, 30, 24)])
+        self.assertEqual(slices, [22.5, 22.5, 7.5, 7.5])
+        self.assertEqual(clock[0], 1060.0)
 
     @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE')=='1','requires built scanner image')
     def test_actual_scanner_bundle_black_and_grey_finish_without_external_network(self):

@@ -51,6 +51,127 @@ class ScopedScannerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 schema_cases.check_references({'schema': {'$ref': reference}})
 
+    def test_schema_bases_respect_declared_mounts_and_reject_external_servers(self):
+        url = 'https://owned.example/api/openapi.json'
+        for document, expected in [
+            ({**SCHEMA, 'servers': [{'url': '/v2'}]}, ['https://owned.example/v2']),
+            ({**SCHEMA, 'servers': [{'url': 'https://other.example/api'}]}, []),
+            ({**SCHEMA, 'servers': [{'url': 'http://127.0.0.1/api'}]}, []),
+            ({**SCHEMA, 'servers': [{'url': 'https://u:p@owned.example/api'}]}, []),
+            ({'swagger': '2.0', 'basePath': '/api', 'host': 'owned.example'}, ['https://owned.example/api']),
+            ({'swagger': '2.0', 'basePath': '/api', 'host': 'other.example'}, []),
+            ({'swagger': '2.0', 'host': 'other.example'}, []),
+        ]:
+            with self.subTest(document=document):
+                bases, declared = schema_cases.base_candidates(document, url, [])
+                self.assertTrue(declared)
+                self.assertEqual(bases, expected)
+
+    def test_schema_mount_requires_an_api_response_and_missing_path_control(self):
+        calls = []
+        def fetch(method, url, headers=None, **kwargs):
+            calls.append(url)
+            code, body = (200, '{"items":[]}') if url == 'https://owned.example/api/items' else (404, '{"error":"missing"}')
+            return {'body': body, 'evidence': {'id': len(calls), 'url': url, 'status': code}}
+        client = scanners.Requests(self.scope, time.monotonic() + 20, fetch)
+        base, source = scanners.schema_base(client, SCHEMA, 'https://owned.example/api/openapi.json',
+                                            ['https://owned.example/api/items'])
+        self.assertEqual((base, source), ('https://owned.example/api', 'verified_mount'))
+        self.assertTrue(any('patchriot-schema-missing-' in url for url in calls))
+
+    def test_json_catch_all_cannot_prove_a_schema_mount(self):
+        client = scanners.Requests(self.scope, time.monotonic() + 20,
+            lambda m, u, h=None, **kw: {'body': '{"ok":true}', 'evidence': {'id': 1, 'status': 200, 'url': u}})
+        self.assertEqual(scanners.schema_base(client, SCHEMA, 'https://owned.example/api/openapi.json', []),
+                         (None, 'schema_base_unverified'))
+
+    def test_good_schema_survives_a_redirected_alternate_and_keeps_case_counts(self):
+        document = {**SCHEMA, 'servers': [{'url': '/api'}]}
+        def fetch(method, url, headers=None, **kwargs):
+            value = self.fetch(method, url, headers, **kwargs)
+            if url.endswith('/api/openapi.json'):
+                value['body'] = json.dumps(document)
+            elif url.endswith('/openapi.json'):
+                value['evidence']['status'] = 301
+                value['evidence']['headers']['location'] = 'http://127.0.0.1/schema'
+            return value
+        def generate(argv, **kwargs):
+            self.assertEqual(argv[3], 'https://owned.example/api')
+            self.assertGreater(int(argv[4]), 12)
+            return {'exit_code': 0, 'failure': None, 'output': json.dumps({
+                'cases': [{'method': 'GET', 'url': argv[3] + '/items', 'operation': 'GET /items'}],
+                'gaps': [], 'sampling_limits': ['schema_case_sample_limit'],
+                'operations_total': 51, 'operations_eligible': 30, 'operations_selected': 1,
+                'deferred_operations_count': 21, 'deferred_operations': [{'operation': 'POST /items'}]})}
+        client = scanners.Requests(self.scope, time.monotonic() + 60, fetch, limit=64)
+        result = scanners.schema_checks(client, ['https://owned.example/api/openapi.json',
+            'https://owned.example/openapi.json'], execute=generate)
+        self.assertEqual(result['schemas'][0]['base_source'], 'declared_server')
+        self.assertEqual(result['schemas'][0]['executed_cases'], 1)
+        self.assertEqual(result['schemas'][0]['operations_total'], 51)
+        self.assertEqual(set(client.gaps), {'schema_case_sample_limit'})
+        self.assertTrue(all(method == 'GET' and url.startswith('https://owned.example/')
+                            for method, url, _, _ in self.calls))
+
+    def test_schema_with_only_unavailable_candidates_stays_incomplete(self):
+        def fetch(method, url, headers=None, **kwargs):
+            result = self.fetch(method, url, headers, **kwargs)
+            result['evidence']['status'] = 503
+            return result
+        client = scanners.Requests(self.scope, time.monotonic() + 10, fetch)
+        scanners.schema_checks(client, ['https://owned.example/openapi.json'], execute=Mock(side_effect=AssertionError()))
+        self.assertIn('schema_unavailable', client.gaps)
+
+    def test_reading_a_schema_without_executing_a_case_cannot_pass_as_a_sample(self):
+        clock = [1000.0]
+        def generate(argv, **kwargs):
+            clock[0] = 1019.9
+            return {'exit_code': 0, 'failure': None, 'output': json.dumps({
+                'cases': [{'method': 'GET', 'url': 'https://owned.example/items', 'operation': 'GET /items'}],
+                'gaps': [], 'operations_eligible': 1})}
+        with patch('time.monotonic', lambda: clock[0]):
+            client = scanners.Requests(self.scope, 1020.0, self.fetch)
+            result = scanners.schema_checks(client, ['https://owned.example/openapi.json'], execute=generate)
+        self.assertEqual(result['schemas'][0]['executed_cases'], 0)
+        self.assertIn('schema_no_cases_executed', client.gaps)
+
+    def test_schema_cannot_send_the_account_session_to_its_declared_external_server(self):
+        def fetch(method, url, headers=None, **kwargs):
+            result = self.fetch(method, url, headers, **kwargs)
+            result['body'] = json.dumps({**SCHEMA, 'servers': [{'url': 'https://other.example/api'}]})
+            return result
+        client = scanners.Requests(self.scope, time.monotonic() + 10, fetch, 'testing')
+        scanners.schema_checks(client, ['https://owned.example/api/openapi.json'], execute=Mock(side_effect=AssertionError()))
+        self.assertIn('no_approved_schema_server', client.gaps)
+        self.assertEqual(len(self.calls), 1)
+
+    @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
+    def test_real_mounted_schema_runs_reads_and_retains_the_write_handoff(self):
+        document = {**SCHEMA, 'paths': {**SCHEMA['paths'],
+            '/create': {'post': {'responses': {'201': {'description': 'Created'}}}}}}
+        def fetch(method, url, headers=None, **kwargs):
+            result = self.fetch(method, url, headers, **kwargs)
+            if url.endswith('/api/openapi.json'):
+                result['body'] = json.dumps(document)
+            elif '/api/items' in url:
+                result['body'] = '{"items":[]}'
+            else:
+                result['body'] = '{"error":"missing"}'
+                result['evidence']['status'] = 404
+            return result
+        sc = {**self.scope, 'methods': ['GET', 'POST']}
+        client = scanners.Requests(sc, time.monotonic() + 40, fetch, 'testing', limit=64)
+        result = scanners.schema_checks(client, ['https://owned.example/api/openapi.json',
+                                                'https://owned.example/api/items'])
+        doc = result['schemas'][0]
+        self.assertEqual(doc['base_url'], 'https://owned.example/api')
+        self.assertEqual(doc['base_source'], 'verified_mount')
+        self.assertEqual(doc['deferred_operations_count'], 1)
+        self.assertGreater(doc['executed_cases'], 0)
+        self.assertEqual(doc['operations_tested'], 1)
+        self.assertEqual(client.gaps, [])
+        self.assertTrue(all(method == 'GET' for method, _, _, _ in self.calls))
+
     def test_scanner_failures_keep_bounded_codes_and_withhold_arbitrary_details(self):
         for message, expected in [('scanner_api_internal_error', 'scanner_api_internal_error'),
                                   ('https://private.example/?token=secret', 'ValueError')]:
@@ -235,8 +356,33 @@ class ScopedScannerTests(unittest.TestCase):
     def test_real_schema_generator_produces_bounded_cases_offline(self):
         result = schema_cases.generate(SCHEMA, 'https://owned.example')
         self.assertTrue(result['cases'])
-        self.assertLessEqual(len(result['cases']), 12)
+        self.assertLessEqual(len(result['cases']), 48)
         self.assertTrue(all(c['method'] == 'GET' and c['url'].startswith('https://owned.example/items') for c in result['cases']))
+
+    @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
+    def test_real_schema_sample_covers_distinct_operations_and_preserves_post_for_agent_review(self):
+        document = {**SCHEMA, 'paths': {f'/items/{i}': {'get': {'responses': {'200': {'description': 'Owned list'}}}}
+                                         for i in range(51)}}
+        document['paths']['/items'] = {'post': {'responses': {'201': {'description': 'Creates an item'}}}}
+        result = schema_cases.generate(document, 'https://owned.example/api', max_cases=24, methods=['GET', 'POST'])
+        self.assertEqual(len(result['cases']), 24)
+        self.assertEqual(result['operations_selected'], 24)
+        self.assertEqual(result['operations_eligible'], 51)
+        self.assertEqual(result['deferred_operations_count'], 1)
+        self.assertIn('schema_case_sample_limit', result['sampling_limits'])
+        self.assertEqual(result['gaps'], [])
+        self.assertTrue(all(case['method'] == 'GET' and '/api/items/' in case['url'] for case in result['cases']))
+
+    @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
+    def test_operation_server_is_not_silently_rewritten_to_the_common_base(self):
+        document = {**SCHEMA, 'paths': {**SCHEMA['paths'], '/elsewhere': {
+            'get': {'servers': [{'url': 'https://other.example'}],
+                    'responses': {'200': {'description': 'Different API'}}}}}}
+        result = schema_cases.generate(document, 'https://owned.example/api')
+        self.assertEqual(result['operations_eligible'], 1)
+        self.assertEqual(result['deferred_operations_count'], 1)
+        self.assertEqual(result['deferred_operations'][0]['reason'], 'operation_server_requires_agent_review')
+        self.assertTrue(all('/api/items' in case['url'] for case in result['cases']))
 
     @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
     def test_real_graphql_generator_excludes_mutations(self):
@@ -244,7 +390,8 @@ class ScopedScannerTests(unittest.TestCase):
         schema = introspection_from_schema(build_schema('type Query { item(limit: Int): String } type Mutation { erase: String }'))
         result = schema_cases.generate(schema, 'https://owned.example/graphql')
         self.assertTrue(result['cases'])
-        self.assertIn('graphql_mutation_requires_disposable_inputs', result['gaps'])
+        self.assertEqual(result['deferred_operations_count'], 1)
+        self.assertEqual(result['deferred_operations'][0]['reason'], 'mutation_requires_agent_review')
         self.assertTrue(all(case['url'] == 'https://owned.example/graphql' and case['method'] == 'POST' for case in result['cases']))
         self.assertTrue(all('erase' not in case['data'] for case in result['cases']))
 
