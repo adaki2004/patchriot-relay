@@ -14,11 +14,11 @@ from workflow import Workflow, public_scope
 class WorkflowTests(unittest.TestCase):
     def test_grey_runs_the_same_anonymous_public_pipeline_in_the_same_order(self):
         black = {'origins':['https://owned.example'],'methods':['GET','HEAD','OPTIONS'],
-                 'tools':['artex_engine_v1'], 'objective':'Owned public fixture'}
+                 'tools':['scoped_discovery_v1'], 'objective':'Owned public fixture'}
         grey = dict(black, authentication='basic', auth_check_path='/private',
                     browser_login={'private':'fixture'}, session_login={'private':'fixture'},
                     wallet_login={'private':'fixture'}, objective='Signed-in work',
-                    tools=['artex_engine_v1','browser_login_v1','authenticated_http_v1'])
+                    tools=['scoped_discovery_v1','browser_login_v1','authenticated_http_v1'])
         self.assertEqual(public_scope(black), public_scope(grey))
         traces = []
         for scope in (black, grey):
@@ -48,6 +48,32 @@ class WorkflowTests(unittest.TestCase):
             traces.append(trace)
         self.assertEqual(*traces)
 
+    def test_deep_group_is_off_by_default_and_scheduled_only_when_selected(self):
+        import tempfile
+        from workflow import Workflow
+        scope={'origins':['https://owned.example'],'methods':['GET'],'tools':['scoped_discovery_v1']}
+        plan=live_review.discovery_plan('investigator',scope,[])
+        self.assertNotIn('patchriot-deep',[p['tool'] for p in plan])
+        with tempfile.TemporaryDirectory() as folder:
+            flow=Workflow(scope,plan,lambda _:None,Path(folder))
+            self.assertEqual(flow.node('public_deep')['state'],'not_applicable')
+            self.assertEqual(flow.value['version'],2)
+        selected=dict(scope,check_groups=['public_deep'])
+        plan=live_review.discovery_plan('investigator',selected,[])
+        self.assertEqual([p['tool'] for p in plan],['patchriot-deep'])
+        with tempfile.TemporaryDirectory() as folder:
+            flow=Workflow(selected,plan,lambda _:None,Path(folder))
+            self.assertEqual(flow.node('public_deep')['state'],'pending')
+            self.assertEqual(flow.node('public_analysis')['state'],'not_applicable')
+            self.assertEqual(flow.node('public_signatures')['state'],'not_applicable')
+        # A completed deep receipt is reusable by the next role.
+        completed={'role':'investigator','evidence':[{'id':1,'status':200,'url':'https://owned.example/x'}],
+                   'tool_runs':[{'tool':'patchriot-deep','exit_code':0,'evidence_ids':[1],
+                                 'arguments':['/patchriot/deep_checks.py','https://owned.example']}]}
+        action=next(p['action'] for p in live_review.discovery_plan('reproducer',selected,[completed])
+                    if p['tool']=='patchriot-deep')
+        self.assertEqual(action,'reuse')
+
     def test_reuse_rejects_authenticated_missing_or_other_origin_receipts(self):
         scope={'origins':['https://owned.example'],'tools':[]}
         good={'role':'investigator','evidence':[{'id':1,'status':200,'url':'https://owned.example/'}],
@@ -62,13 +88,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(action(bad),'recover')
 
     def test_combined_engine_reuse_requires_anonymous_evidence_too(self):
-        scope = {'origins': ['https://owned.example'], 'tools': ['artex_engine_v1']}
+        scope = {'origins': ['https://owned.example'], 'tools': ['scoped_discovery_v1']}
         previous = {'role': 'investigator', 'evidence': [
             {'id': 1, 'status': 401, 'url': 'https://owned.example/private'},
             {'id': 2, 'status': 200, 'url': 'https://owned.example/private', 'authenticated': True}],
-            'tool_runs': [{'tool': 'artex-engine', 'exit_code': 0, 'evidence_ids': [1, 2]}]}
+            'tool_runs': [{'tool': 'patchriot-discovery', 'exit_code': 0, 'evidence_ids': [1, 2]}]}
         def action():
-            return next(p['action'] for p in live_review.discovery_plan('reproducer', scope, [previous]) if p['tool'] == 'artex-engine')
+            return next(p['action'] for p in live_review.discovery_plan('reproducer', scope, [previous]) if p['tool'] == 'patchriot-discovery')
         self.assertEqual(action(), 'reuse')
         previous['tool_runs'][0]['evidence_ids'] = [2]
         self.assertEqual(action(), 'recover')

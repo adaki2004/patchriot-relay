@@ -185,7 +185,7 @@ class WebToolsTests(unittest.TestCase):
         ]
         replies = [io.BytesIO(json.dumps({'evidence':r, 'body':'full response not for the cache'}).encode()) for r in records]
         from urllib.error import HTTPError
-        exhausted = HTTPError('http://bridge/patchriot/artex/http', 429, 'budget', {},
+        exhausted = HTTPError('http://bridge/patchriot/discovery/http', 429, 'budget', {},
                               io.BytesIO(b'{"error":"engine_http_budget_reached"}'))
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(live_http, 'EVIDENCE_DIRECTORY', Path(temp) / 'http-evidence'), \

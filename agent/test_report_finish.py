@@ -18,10 +18,13 @@ class ReportFinishTests(unittest.TestCase):
             calls, events, turns = [], [], []
             def call(path, body):
                 calls.append((path, body))
-                return {'valid': accepted and body['report'] == 'repaired', 'schema': {'required': ['findings']}}
+                return {'valid': accepted and body['report'] == 'repaired', 'schema': {'required': ['findings']},
+                        'citation_issues': [{'finding_index': 0, 'unavailable_response_ids': [2, 999]}]}
             def run(prompt, conversation_history):
                 turns.append(prompt)
                 self.assertIn('Never invent IDs', prompt)
+                self.assertIn('recorded HTTP response status', prompt)
+                self.assertIn('"unavailable_response_ids": [2, 999]', prompt)
                 self.assertEqual(agent.max_iterations, 3)
                 self.assertLessEqual(agent.run_budget_seconds, 180)
                 conversation_history[0]['content'] = 'changed copy'

@@ -17,8 +17,8 @@ mod wallet;
 #[cfg(test)]
 pub const MODEL: &str = LiveProvider::MODELS[0];
 pub const MAX_FRAME: usize = 512 * 1024;
-pub const ENGINE_CHAT: &str = "/patchriot/artex/v1/chat/completions";
-const ENGINE_HTTP: &str = "/patchriot/artex/http";
+pub const ENGINE_CHAT: &str = "/patchriot/discovery/v1/chat/completions";
+const ENGINE_HTTP: &str = "/patchriot/discovery/http";
 pub const SUMMARY_CHAT: &str = "/patchriot/summary/v1/chat/completions";
 // Tool results are separate messages, not model calls. Keep a count bound in
 // addition to the byte limit without cutting the expanded role allowance in half.
@@ -101,19 +101,6 @@ const HTTP_RECORD_RESERVE: usize = 256 * 1024;
 const ENGINE_HTTP_LIMIT: usize = MAX_HTTP_REQUESTS - 500;
 const ENGINE_EVIDENCE_LIMIT: usize = HTTP_EVIDENCE_BUDGET - 2 * 1024 * 1024;
 pub type Progress = Mutex<LiveProgress>;
-
-/// Generated form data identifies an authorized test, not the internal engine.
-/// Reject before sending rather than changing a probe behind the report's back.
-fn engine_branded_data(body: &Value) -> bool {
-    let Some(data) = body.get("data").and_then(Value::as_str) else {
-        return false;
-    };
-    if let Ok(value) = serde_json::from_str::<Value>(data) {
-        return value.to_string().to_ascii_lowercase().contains("artex");
-    }
-    url::form_urlencoded::parse(data.as_bytes())
-        .any(|(_, value)| value.to_ascii_lowercase().contains("artex"))
-}
 
 fn assessment_format() -> Value {
     let text = |max| json!({"type":"string","minLength":1,"maxLength":max});
@@ -337,6 +324,7 @@ impl LiveBroker {
         &self,
         progress: &Progress,
         phase: LivePhase,
+        browser_exploration: Option<BrowserExploration>,
         completed_tools: u8,
         model_request: Option<LiveModelProgress>,
     ) {
@@ -354,34 +342,50 @@ impl LiveBroker {
                                 .as_ref()
                                 .and_then(|b| b.browser.lock().ok()?.proof.clone())
                         });
-                    workflow.checks[5].state = if proof.is_some() {
+                    let authentication = workflow
+                        .checks
+                        .iter_mut()
+                        .find(|c| c.id == CheckId::Authentication)
+                        .expect("validated workflow contains authentication");
+                    authentication.state = if proof.is_some() {
                         CheckState::Recorded
                     } else if count.evidence.iter().any(|e| e.login || e.authenticated) {
                         CheckState::Running
                     } else {
                         CheckState::Pending
                     };
-                    workflow.checks[5].evidence_count = if proof.is_some() { 2 } else { 0 };
+                    authentication.evidence_count = if proof.is_some() { 2 } else { 0 };
                     if count.evidence.iter().any(|e| {
                         e.authenticated
                             && !e.login
                             && proof.as_ref().is_none_or(|p| p.authenticated_id != e.id)
                     }) {
-                        workflow.checks[6].state = CheckState::Running;
+                        workflow
+                            .checks
+                            .iter_mut()
+                            .find(|c| c.id == CheckId::AuthenticatedChecks)
+                            .expect("validated workflow contains authenticated checks")
+                            .state = CheckState::Running;
                     }
                 }
                 // The outer investigator checks leads after discovery, before
                 // producing its report. That work belongs to evidence review;
                 // waiting until the result event hid this entire phase.
+                let review = workflow
+                    .checks
+                    .iter_mut()
+                    .find(|c| c.id == CheckId::EvidenceReview)
+                    .expect("validated workflow contains evidence review");
                 if matches!(phase, LivePhase::Investigating | LivePhase::Finishing)
-                    && workflow.checks[7].state == CheckState::Pending
+                    && review.state == CheckState::Pending
                 {
-                    workflow.checks[7].state = CheckState::Running;
+                    review.state = CheckState::Running;
                 }
             }
             *current = LiveProgress {
                 workflow,
                 phase,
+                browser_exploration,
                 http_requests: count.evidence.len() as u16,
                 inference_calls: count.calls,
                 completed_tools,
@@ -584,7 +588,11 @@ impl LiveBroker {
     pub fn chat(&self, request: &Request) -> Result<Value, &'static str> {
         let engine = request.path == ENGINE_CHAT;
         if !is_chat_path(&request.path)
-            || engine && !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1)
+            || engine
+                && !self
+                    .scope
+                    .tools
+                    .contains(&LiveToolProfile::ScopedDiscoveryV1)
         {
             return Err("engine_not_selected");
         }
@@ -715,7 +723,7 @@ impl LiveBroker {
             .ok_or("provider_budget_reached")?;
         {
             let mut count = self.counters.lock().map_err(|_| "counter_unavailable")?;
-            // ARTEX has its own response format and planner. Stop it cleanly
+            // Discovery calls have a separate response format. Stop them cleanly
             // instead of injecting the later reviewer's final-report schema.
             // Leave time and inference for that reviewer to check its leads.
             if engine && self.engine_budget_reached(&count, reservation) {
@@ -926,11 +934,13 @@ impl LiveBroker {
     }
 
     async fn engine_http(&self, mut body: Value) -> Result<Value, &'static str> {
-        if !self.scope.tools.contains(&LiveToolProfile::ArtexEngineV1) {
+        if !self
+            .scope
+            .tools
+            .contains(&LiveToolProfile::ScopedDiscoveryV1)
+            || !self.scope.runs_check(workflow::CheckId::PublicAnalysis)
+        {
             return Err("engine_not_selected");
-        }
-        if engine_branded_data(&body) {
-            return Err("use_authorized_security_test_data_instead_of_engine_branding");
         }
         {
             let count = self.counters.lock().map_err(|_| "counter_unavailable")?;
@@ -1425,7 +1435,7 @@ impl LiveBroker {
                             .http(request.body.clone().unwrap_or(Value::Null))
                             .await
                     }
-                    ("POST", "artex/http") => {
+                    ("POST", "discovery/http") => {
                         reference
                             .engine_http(request.body.clone().unwrap_or(Value::Null))
                             .await
@@ -1487,13 +1497,30 @@ impl LiveBroker {
                     .body
                     .as_ref()
                     .is_some_and(|v| v.get("repair") == Some(&Value::Bool(true)));
-                let valid = raw
+                let assessment = raw
                     .filter(|raw| raw.len() <= 32 * 1024)
-                    .and_then(parse_assessment)
+                    .and_then(parse_assessment);
+                let valid = assessment
+                    .as_ref()
                     .is_some_and(|a| a.valid_for(&count.evidence));
+                // Give the bounded formatting repair actionable, broker-owned
+                // diagnostics. Never supply replacement citations or target text.
+                let citation_issues: Vec<Value> = assessment
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|a| a.findings.iter().take(24).enumerate())
+                    .filter_map(|(index, finding)| {
+                        let unavailable: Vec<u32> = finding.evidence_ids.iter().copied()
+                            .filter(|id| !count.evidence.iter().any(|e| e.id == *id && e.status.is_some()))
+                            .take(24).collect();
+                        (finding.evidence_ids.is_empty() || !unavailable.is_empty()).then(||
+                            json!({"finding_index":index,"missing_citations":finding.evidence_ids.is_empty(),
+                                "unavailable_response_ids":unavailable}))
+                    }).collect();
                 (
                     200,
-                    json!({"valid":valid,"schema":assessment_format()["json_schema"]["schema"]}),
+                    json!({"valid":valid,"citation_issues":citation_issues,
+                        "schema":assessment_format()["json_schema"]["schema"]}),
                 )
             }
             ("GET", "/v1/models") => (
@@ -1581,7 +1608,9 @@ impl LiveBroker {
             run.arguments
                 .iter_mut()
                 .for_each(|v| *v = self.access.redact_limited(v, 4096).0);
-            let (cleaned, shortened) = self.access.redact_limited(&run.output_excerpt, 24 * 1024);
+            let (cleaned, shortened) = self
+                .access
+                .redact_tool_excerpt(&run.output_excerpt, 24 * 1024);
             run.output_truncated |= shortened;
             if cleaned != run.output_excerpt {
                 run.output_sha256 = hex::encode(Sha256::digest(cleaned.as_bytes()));
@@ -1709,8 +1738,8 @@ fn tool_records(events: &[Value], evidence: &[HttpEvidence]) -> (Vec<LiveToolRun
         let parsed = serde_json::from_value::<LiveToolRun>(event["data"]["run"].clone());
         if let Ok(run) = parsed {
             bytes += serde_json::to_vec(&run).map_or(usize::MAX / 16, |b| b.len());
-            if records.len() < 31 && bytes <= 512 * 1024 && run.valid(evidence) {
-                if run.tool == "artex-engine" {
+            if records.len() < 40 && bytes <= 512 * 1024 && run.valid(evidence) {
+                if matches!(run.tool.as_str(), "patchriot-discovery" | "patchriot-deep") {
                     records.retain(|previous: &LiveToolRun| {
                         !(previous.tool == run.tool
                             && previous.started_at == run.started_at
@@ -1999,7 +2028,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_engine_message_preserves_the_following_report() {
         let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         let request = json!({"type":"request","request":{"id":1,"method":"POST","path":ENGINE_CHAT,
             "body":{"model":MODEL,"messages":[{"role":"user","content":{"unsupported":"fixture"}}]}}});
         let script = format!(
@@ -2047,8 +2076,54 @@ mod tests {
         }
     }
     #[test]
+    fn saved_engine_receipt_remains_json_after_a_short_cookie_is_observed() {
+        let broker = broker();
+        broker.access.remember_secret("1".into()).unwrap();
+        broker
+            .access
+            .remember_secret("fixture-session-cookie".into())
+            .unwrap();
+        let output = json!({"receipt_schema":1,"coverage_complete":true,
+            "stop_reason":"done","anonymous_evidence_count":1,
+            "findings_preview":[{"description":"fixture-session-cookie"}]})
+        .to_string();
+        let run = json!({"tool":"patchriot-discovery","version":"fixture","arguments":[],
+            "started_at":1,"duration_ms":1,"exit_code":0,"failure":null,"evidence_ids":[],
+            "output_sha256":hex::encode(Sha256::digest(output.as_bytes())),
+            "output_excerpt":output,"output_truncated":false});
+        let report = AgentRun {
+            outcome: "completed",
+            events: vec![
+                json!({"event":"live_tool","data":{"run":run}}),
+                json!({"event":"phase","data":{"name":"agent_ready"}}),
+            ],
+            ..Default::default()
+        };
+        let settings: Settings = serde_json::from_value(json!({
+            "docker_socket":"/unused", "image":"fixture", "model_url":"https://example.com",
+            "model":"fixture", "model_digest":"fixture"
+        }))
+        .unwrap();
+        let saved = broker.result(&report, &settings, true, true);
+        let receipt = saved
+            .tool_runs
+            .iter()
+            .find(|r| r.tool == "patchriot-discovery")
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&receipt.output_excerpt).unwrap();
+        assert_eq!(parsed["coverage_complete"], true);
+        assert_eq!(parsed["receipt_schema"], 1);
+        assert_eq!(parsed["anonymous_evidence_count"], 1);
+        assert!(!receipt.output_excerpt.contains("fixture-session-cookie"));
+        assert_eq!(
+            receipt.output_sha256,
+            hex::encode(Sha256::digest(receipt.output_excerpt.as_bytes()))
+        );
+        assert!(!receipt.output_truncated);
+    }
+    #[test]
     fn engine_start_receipt_survives_interruption_and_is_replaced_on_completion() {
-        let mut run = json!({"tool":"artex-engine","version":"fixture","arguments":["/opt/artex/artex","https://example.com"],
+        let mut run = json!({"tool":"patchriot-discovery","version":"fixture","arguments":["/patchriot/deep_checks.py","https://example.com"],
             "started_at":1,"duration_ms":1,"exit_code":null,"failure":"incomplete","evidence_ids":[],
             "output_sha256":format!("{:x}", Sha256::digest(b"")),"output_excerpt":"","output_truncated":false});
         let mut events = vec![json!({"event":"live_tool","data":{"run":run}})];
@@ -2069,6 +2144,7 @@ mod tests {
         LiveBroker::new(
             file.path(),
             LiveScope {
+                check_groups: None,
                 authentication: None,
                 auth_check_path: None,
                 session_login: None,
@@ -2129,9 +2205,68 @@ mod tests {
         assert_eq!(observed.inference_calls, 0);
     }
     #[tokio::test]
+    async fn browser_activity_uses_explicit_events_and_never_completes_a_check() {
+        for (names, expected) in [
+            (
+                vec!["scoped_tools", "public_browser_preparation"],
+                Some(BrowserExploration::Running),
+            ),
+            (
+                vec![
+                    "scoped_tools",
+                    "public_browser_preparation",
+                    "scoped_discovery",
+                    "agent_ready",
+                ],
+                Some(BrowserExploration::Returned),
+            ),
+            (
+                vec![
+                    "scoped_tools",
+                    "access_preparation",
+                    "scoped_discovery",
+                    "agent_ready",
+                ],
+                None,
+            ),
+            (vec!["agent_ready", "public_browser_preparation"], None),
+        ] {
+            let events: Vec<_> = names
+                .iter()
+                .map(|name| json!({"type":"event","event":"phase","data":{"name":name}}))
+                .collect();
+            let script = events
+                .iter()
+                .map(|event| format!("printf '%s\\n' '{event}'"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\nsleep 0.1";
+            let mut command = std::process::Command::new("/bin/sh");
+            command.env_clear().args(["-c", &script]);
+            let progress = Progress::default();
+            let broker = broker();
+            let _report = supervise(
+                command,
+                Bridge::Live(broker),
+                &|| false,
+                Duration::from_secs(2),
+                None,
+                Some(&progress),
+            )
+            .await
+            .unwrap();
+            let snapshot = progress.lock().unwrap();
+            assert_eq!(snapshot.browser_exploration, expected, "{names:?}");
+            assert_eq!(snapshot.workflow, None);
+            assert_eq!(snapshot.inference_calls, 0);
+            assert_eq!(snapshot.completed_tools, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn bounded_model_requests_do_not_spend_the_retained_output_allowance() {
         let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT;
         // Actual framed requests, rejected locally by the already-used engine
         // budget. No model or website is called. Repeated conversation history
@@ -2140,7 +2275,7 @@ mod tests {
 import json,sys
 for i in range(1,76):
     print(json.dumps({'type':'request','request':{'id':i,'method':'POST',
-        'path':'/patchriot/artex/v1/chat/completions','body':{
+        'path':'/patchriot/discovery/v1/chat/completions','body':{
         'model':'abliterated-model-large-v2','messages':[{'role':'user','content':'x'*(480*1024)}]}}}),flush=True)
     for line in sys.stdin:
         if json.loads(line)['type']=='end': break
@@ -2196,7 +2331,7 @@ for _ in range(270): print(frame,flush=True)
     #[tokio::test]
     async fn rejected_engine_retries_do_not_consume_the_reviewers_call_allowance() {
         let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         broker.counters.lock().unwrap().calls = ENGINE_CALL_LIMIT;
         // Exercise the real supervised pipe and real 429 responses. The engine
         // has spent its allowance; these retries must never contact a provider
@@ -2204,7 +2339,7 @@ for _ in range(270): print(frame,flush=True)
         let script = r#"
             i=1
             while [ "$i" -le 60 ]; do
-                printf '%s\n' '{"type":"request","request":{"id":'"$i"',"method":"POST","path":"/patchriot/artex/v1/chat/completions","body":{"model":"abliterated-model-large-v2","messages":[{"role":"user","content":"fixture"}]}}}'
+                printf '%s\n' '{"type":"request","request":{"id":'"$i"',"method":"POST","path":"/patchriot/discovery/v1/chat/completions","body":{"model":"abliterated-model-large-v2","messages":[{"role":"user","content":"fixture"}]}}}'
                 while IFS= read -r frame; do
                     case "$frame" in *'"type":"end"'*) break ;; esac
                 done
@@ -2731,7 +2866,7 @@ for _ in range(270): print(frame,flush=True)
                 let mut broker = broker();
                 let owned = Arc::get_mut(&mut broker).unwrap();
                 owned.provider = provider;
-                owned.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+                owned.scope.tools.push(LiveToolProfile::ScopedDiscoveryV1);
                 let request = Request {
                     id: 1,
                     method: "POST".into(),
@@ -2885,7 +3020,7 @@ for _ in range(270): print(frame,flush=True)
         let inner = Arc::get_mut(&mut broker).unwrap();
         inner.scope.methods.push("POST".into());
         inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
-        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        inner.scope.tools.push(LiveToolProfile::ScopedDiscoveryV1);
         let input = json!({"method":"POST","url":"https://example.com/account",
             "headers":{"Content-Type":"application/json"},"data":r#"{"current_password":"fixture-old","new_password":"fixture-new"}"#});
         assert_eq!(
@@ -2921,7 +3056,7 @@ for _ in range(270): print(frame,flush=True)
         });
         let scope=serde_json::from_value::<LiveScope>(json!({"origins":["https://owned.example"],
             "methods":["GET","HEAD","OPTIONS"],"profile":"web_baseline_v1",
-            "tools":["artex_engine_v1","authenticated_http_v1"],"authentication":"basic","auth_check_path":"/private"})).unwrap().normalized().unwrap();
+            "tools":["scoped_discovery_v1","authenticated_http_v1"],"authentication":"basic","auth_check_path":"/private"})).unwrap().normalized().unwrap();
         let key = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(key.path(), "synthetic-fixture-provider-key").unwrap();
         let credentials = TestCredentials::Basic {
@@ -2968,12 +3103,22 @@ for _ in range(270): print(frame,flush=True)
                 source_role: None,
             })
             .collect();
-        let workflow = AssessmentWorkflow { version: 1, checks };
+        let workflow = AssessmentWorkflow { version: 2, checks };
         assert!(broker.accept_workflow(&serde_json::to_value(workflow).unwrap()));
         let progress = Progress::default();
-        broker.update_progress(&progress, LivePhase::Investigating, 0, None);
+        broker.update_progress(&progress, LivePhase::Investigating, None, 0, None);
         assert_eq!(
-            progress.lock().unwrap().workflow.as_ref().unwrap().checks[5].state,
+            progress
+                .lock()
+                .unwrap()
+                .workflow
+                .as_ref()
+                .unwrap()
+                .checks
+                .iter()
+                .find(|c| c.id == CheckId::Authentication)
+                .unwrap()
+                .state,
             CheckState::Pending
         );
         assert!(!broker.accept_workflow(&json!({"version":1,"checks":[]})));
@@ -2982,7 +3127,7 @@ for _ in range(270): print(frame,flush=True)
     fn evidence_review_starts_with_follow_up_investigation() {
         let broker = broker();
         let workflow = AssessmentWorkflow {
-            version: 1,
+            version: 2,
             checks: CheckId::ALL
                 .into_iter()
                 .map(|id| CheckProgress {
@@ -3001,55 +3146,142 @@ for _ in range(270): print(frame,flush=True)
             (LivePhase::Investigating, CheckState::Running),
             (LivePhase::Finishing, CheckState::Running),
         ] {
-            broker.update_progress(&progress, phase, 0, None);
+            broker.update_progress(&progress, phase, None, 0, None);
             let observed = progress.lock().unwrap();
             let checks = &observed.workflow.as_ref().unwrap().checks;
-            assert_eq!(checks[7].state, expected);
-            assert_eq!(checks[4].state, CheckState::Pending);
-            assert_eq!(checks[7].evidence_count, 0);
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|c| c.id == CheckId::EvidenceReview)
+                    .unwrap()
+                    .state,
+                expected
+            );
+            assert!(
+                checks
+                    .iter()
+                    .filter(|c| c.id != CheckId::EvidenceReview)
+                    .all(|c| c.state == CheckState::Pending)
+            );
+            assert!(checks.iter().all(|c| c.evidence_count == 0));
         }
         for state in [CheckState::Incomplete, CheckState::Recorded] {
             let mut saved = workflow.clone();
-            saved.checks[7].state = state;
+            saved
+                .checks
+                .iter_mut()
+                .find(|c| c.id == CheckId::EvidenceReview)
+                .unwrap()
+                .state = state;
             assert!(broker.accept_workflow(&serde_json::to_value(saved).unwrap()));
-            broker.update_progress(&progress, LivePhase::Investigating, 0, None);
+            broker.update_progress(&progress, LivePhase::Investigating, None, 0, None);
             assert_eq!(
-                progress.lock().unwrap().workflow.as_ref().unwrap().checks[7].state,
+                progress
+                    .lock()
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .checks
+                    .iter()
+                    .find(|c| c.id == CheckId::EvidenceReview)
+                    .unwrap()
+                    .state,
                 state
             );
         }
     }
-    #[tokio::test]
-    async fn engine_generated_identity_is_rejected_before_target_io() {
-        let mut broker = broker();
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
-        for data in [
-            r#"{"name":"ARTEX Test","email":"artex.test@example.com"}"#,
-            r#"{"name":"\u0041RTEX Test"}"#,
-            "name=%41rTeX+Test",
-        ] {
-            assert_eq!(
-                broker
-                    .engine_http(
-                        json!({"method":"POST","url":"https://example.com/contact","data":data})
-                    )
-                    .await
-                    .unwrap_err(),
-                "use_authorized_security_test_data_instead_of_engine_branding"
+    #[test]
+    fn sign_in_progress_never_overwrites_deep_scan_or_public_checks() {
+        for version in [1, 2] {
+            let mut broker = broker();
+            Arc::get_mut(&mut broker).unwrap().scope.authentication = Some(TestAuthKind::Basic);
+            let workflow = AssessmentWorkflow {
+                version,
+                checks: CheckId::ALL
+                    .into_iter()
+                    .filter(|id| version == 2 || *id != CheckId::PublicDeep)
+                    .map(|id| CheckProgress {
+                        id,
+                        state: CheckState::Pending,
+                        evidence_count: 0,
+                        source_role: None,
+                    })
+                    .collect(),
+            };
+            assert!(broker.accept_workflow(&serde_json::to_value(&workflow).unwrap()));
+            broker.browser.lock().unwrap().proof = Some(BrowserAccessProof {
+                authenticated_id: 1,
+                anonymous_id: 2,
+                check: BrowserAccessCheck::ProtectedResource,
+            });
+            let progress = Progress::default();
+            broker.update_progress(&progress, LivePhase::ScopedTools, None, 0, None);
+            let observed = progress.lock().unwrap();
+            let checks = &observed.workflow.as_ref().unwrap().checks;
+            let auth = checks
+                .iter()
+                .find(|c| c.id == CheckId::Authentication)
+                .unwrap();
+            assert_eq!(auth.state, CheckState::Recorded);
+            assert_eq!(auth.evidence_count, 2);
+            assert!(
+                checks
+                    .iter()
+                    .filter(|c| c.id != CheckId::Authentication)
+                    .all(|c| c.state == CheckState::Pending && c.evidence_count == 0)
             );
-            assert!(broker.counters.lock().unwrap().evidence.is_empty());
+            assert!(observed.workflow.as_ref().unwrap().valid());
         }
-        assert!(!engine_branded_data(
-            &json!({"data":r#"{"name":"Authorized security test","email":"security-test@example.com"}"#})
-        ));
+    }
+    #[tokio::test]
+    async fn unselected_discovery_is_rejected_before_target_io() {
+        let mut broker = broker();
+        let inner = Arc::get_mut(&mut broker).unwrap();
+        inner.scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
+        inner.scope.check_groups = Some(vec![workflow::CheckId::PublicMapping]);
+        assert_eq!(
+            broker
+                .engine_http(json!({"method":"GET","url":"https://example.com/"}))
+                .await
+                .unwrap_err(),
+            "engine_not_selected"
+        );
+        assert!(broker.counters.lock().unwrap().evidence.is_empty());
     }
 
     #[tokio::test]
-    async fn report_check_rejects_missing_and_invented_citations_and_closes_repair_tools() {
+    async fn report_check_explains_missing_and_unavailable_citations_and_closes_repair_tools() {
         let broker = broker();
+        for (id, status, error) in [
+            (1, Some(500), None),
+            (2, None, Some("target_request_failed")),
+        ] {
+            broker.counters.lock().unwrap().evidence.push(
+                serde_json::from_value(json!({
+                    "id":id,"method":"GET","url":"https://example.com/owned",
+                    "request_headers":{},"status":status,"headers":{},"body_excerpt":"",
+                    "body_sha256":null,"truncated":false,"error":error,"observed_at":1
+                }))
+                .unwrap(),
+            );
+        }
         let finding = json!({"title":"Owned fixture", "severity":"info", "support":"needs_review",
             "explanation":"Unverified", "reproduction":"GET /", "suggested_action":"Review"});
-        for ids in [None, Some(json!([])), Some(json!([999]))] {
+        for (ids, valid, issues) in [
+            (None, false, json!([])),
+            (
+                Some(json!([])),
+                false,
+                json!([{"finding_index":0,"missing_citations":true,"unavailable_response_ids":[]}]),
+            ),
+            (
+                Some(json!([1, 2, 999])),
+                false,
+                json!([{"finding_index":0,"missing_citations":false,"unavailable_response_ids":[2,999]}]),
+            ),
+            (Some(json!([1])), true, json!([])),
+        ] {
             let mut finding = finding.clone();
             if let Some(ids) = ids {
                 finding["evidence_ids"] = ids;
@@ -3074,10 +3306,10 @@ for _ in range(270): print(frame,flush=True)
                     bytes.extend(hex::decode(hex).unwrap());
                 }
             }
-            assert_eq!(
-                serde_json::from_slice::<Value>(&bytes).unwrap()["valid"],
-                false
-            );
+            let reply = serde_json::from_slice::<Value>(&bytes).unwrap();
+            assert_eq!(reply["valid"], valid);
+            assert_eq!(reply["citation_issues"], issues);
+            assert!(!reply.to_string().contains("example.com"));
         }
         let mut body = json!({"messages":[],"tools":[{"type":"function"}]});
         broker.finish_before_limit(&mut body).unwrap();
@@ -3106,7 +3338,7 @@ for _ in range(270): print(frame,flush=True)
             ),
         };
         assert_eq!(broker.chat(&request).unwrap_err(), "engine_not_selected");
-        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ArtexEngineV1];
+        Arc::get_mut(&mut broker).unwrap().scope.tools = vec![LiveToolProfile::ScopedDiscoveryV1];
         assert_eq!(
             broker
                 .engine_http(json!({"method":"GET","url":"https://outside.example/"}))

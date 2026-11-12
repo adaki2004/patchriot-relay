@@ -1285,7 +1285,7 @@ mod tests {
         let mut broker = broker("session");
         let inner = Arc::get_mut(&mut broker).unwrap();
         inner.test_target = Some(address);
-        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        inner.scope.tools.push(LiveToolProfile::ScopedDiscoveryV1);
         let public = json!({"method":"GET","url":"https://owned.example/public"});
         broker.engine_http(public.clone()).await.unwrap();
         let saved_bytes = broker.counters.lock().unwrap().evidence_bytes;
@@ -1517,7 +1517,7 @@ mod tests {
         let (address, server) = target_login(session_kind).await;
         let scope: LiveScope = serde_json::from_value(json!({"origins":["https://owned.example"],
             "methods":["GET","HEAD","OPTIONS","POST"], "profile":"web_active_v2",
-            "tools":["active_web_v2","artex_engine_v1","authenticated_http_v1","browser_login_v1","multi_account_v1"],
+            "tools":["active_web_v2","scoped_discovery_v1","authenticated_http_v1","browser_login_v1","multi_account_v1"],
             "authentication":"session","browser_login":{},"account_policy":{"allow_password_changes":true}})).unwrap();
         let key = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(key.path(), "synthetic-fixture-provider-key").unwrap();
@@ -1769,7 +1769,7 @@ mod tests {
         let mut broker = broker("session");
         let inner = Arc::get_mut(&mut broker).unwrap();
         inner.test_target = Some(address);
-        inner.scope.tools.push(LiveToolProfile::ArtexEngineV1);
+        inner.scope.tools.push(LiveToolProfile::ScopedDiscoveryV1);
         assert!(broker.verified_access().is_none());
         let signed =
             json!({"method":"GET","url":"https://owned.example/private","authenticated":true});
@@ -1822,10 +1822,10 @@ mod tests {
         let inner = Arc::get_mut(&mut broker).unwrap();
         inner.scope.methods.push("POST".into());
         inner.scope.profile = Some(AssessmentProfile::WebActiveV2);
-        inner
-            .scope
-            .tools
-            .extend([LiveToolProfile::ActiveWebV2, LiveToolProfile::ArtexEngineV1]);
+        inner.scope.tools.extend([
+            LiveToolProfile::ActiveWebV2,
+            LiveToolProfile::ScopedDiscoveryV1,
+        ]);
         inner.test_target = Some(listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             loop {
