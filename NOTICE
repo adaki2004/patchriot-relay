@@ -4,8 +4,16 @@ Copyright (c) 2026 Daniel Keszey
 Original material in this repository is licensed under AGPL-3.0-only. See LICENSE. No rights to third-party names, logos, model weights or customer content are granted by this notice.
 
 Design acknowledgement
-IdentityMD worker — https://github.com/Identity-md/worker
-The public worker's contributor lifecycle informed pairing, capability checks and result delivery. Patchriot's fixture runner is original implementation; no upstream worker code is included or represented as licensed for redistribution here.
+IMD / IdentityMD worker — https://github.com/Identity-md/worker
+The public worker's contributor lifecycle informed Patchriot's device pairing, capability checks and work delivery. Patchriot implements these concepts independently in Rust; this acknowledgement does not claim redistribution rights to other IMD repositories.
+
+Services and agent environment
+NEAR AI — https://near.ai — supported private inference route.
+NEAR Intents — https://docs.near-intents.org — cross-chain payment conversion through 1Click.
+Venice — https://venice.ai — supported inference route and configured backup.
+Nous Research / Hermes Agent — https://github.com/NousResearch/hermes-agent — agent runtime used inside the isolated runner.
+Kali Linux / OffSec — https://www.kali.org — operating environment for managed agent hosts.
+These acknowledgements identify integrations and inspiration, not endorsements. Each service, runtime, model and tool retains its own terms, trademarks and license; the notices below still apply.
 
 Rust dependencies are recorded in Cargo.toml and Cargo.lock. They retain their own licenses and notices; the Patchriot license does not replace them. This includes the separately Apache-2.0-licensed patchriot-protocol crate, Ed25519 implementation, HTTP/TLS client and operating-system bindings. Preserve the selected dependency licenses when distributing binaries.
 

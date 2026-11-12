@@ -4,6 +4,8 @@
   "model_url": "https://cloud-api.near.ai/v1",
   "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated",
   "model_digest": "provider-managed-not-attested",
-  "live_provider_key_file": "/absolute/private/primary.key",
-  "max_attempt_seconds": 3600
+  "live_provider_key_file": "/absolute/private/near-ai.key",
+  "secondary_model": "deepseek-v4-1-flash-1017-uncensored",
+  "secondary_key_file": "/absolute/private/venice.key",
+  "max_attempt_seconds": 900
 }
