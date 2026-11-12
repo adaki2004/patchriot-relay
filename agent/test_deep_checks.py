@@ -9,6 +9,23 @@ from unittest.mock import patch
 import deep_checks as deep
 
 class DiscoveryTests(unittest.TestCase):
+    def test_signed_in_browser_records_reach_the_public_comparison_pass(self):
+        scope = {'origins': ['https://owned.example'], 'methods': ['GET'], 'authentication': 'session'}
+        access = {'verified': True, 'protected_url': 'https://owned.example/private'}
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder); (directory / 'http-evidence').mkdir()
+            (directory / 'http-evidence' / '7.json').write_text(json.dumps({
+                'id': 7, 'method': 'GET', 'url': 'https://owned.example/api/orders/42',
+                'status': 200, 'authenticated': True, 'account': 'testing'}))
+            def comparison(client, urls):
+                self.assertEqual(client.verified_accounts, ['testing'])
+                self.assertEqual(client.observations[0]['evidence_id'], 7)
+                return {}
+            deep.run(scope, [], access, time.monotonic() + 30, directory=directory,
+                     functions=[('patchriot-cross-account', '1', comparison, 10, 4)])
+            examples = json.loads((directory / 'working-requests.json').read_text())['examples']
+            self.assertEqual(examples[0]['account'], 'testing')
+
     def exercise(self, grey=False, paired=False, broken=False):
         scope={'origins':['https://owned.example'],'methods':['GET','HEAD','OPTIONS'],
                'tools':['scoped_discovery_v1']}

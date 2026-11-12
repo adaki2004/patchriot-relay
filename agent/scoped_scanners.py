@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 from live_http import request
-from schema_cases import base_candidates, base_probe_paths
+from schema_cases import base_candidates, base_probe_paths, reusable_url
 from web_tools import ScopeMirror, allowed, capture, fetch_checked, record
 
 ZAP_VERSION = '2.17.0'
@@ -28,12 +28,63 @@ SCHEMA_VERSION = '4.33.1'
 SAMPLING_LIMITS = {'route_sample_limit', 'schema_case_sample_limit'}
 
 
+def working_requests(scope, records):
+    """Index successful recorded requests, without copying bodies or credentials.
+
+    POST entries describe field names for agent review; they are never replay
+    instructions. Keep account contexts separate, including public requests.
+    """
+    examples, seen = [], set()
+    for e in records:
+        if (not isinstance(e, dict) or e.get('login') or e.get('error')
+                or not isinstance(e.get('status'), int) or not 200 <= e['status'] < 300
+                or e.get('method') not in ('GET', 'POST') or not e.get('id')):
+            continue
+        url = e.get('url', '')
+        if not any(reusable_url(o, url) for o in scope['origins']):
+            continue
+        account = (e.get('account') or 'testing') if e.get('authenticated') else None
+        if account not in (None, 'testing', 'reference'):
+            continue
+        key = (e['method'], url, account)
+        if key in seen:
+            continue
+        seen.add(key)
+        item = {'method': e['method'], 'url': url, 'account': account,
+                'evidence_id': e['id'], 'status': e['status']}
+        if e['method'] == 'POST':
+            body = e.get('request_body_excerpt') or ''
+            try:
+                value = json.loads(body)
+                fields = list(value) if isinstance(value, dict) else []
+            except ValueError:
+                fields = [k for k, _ in parse_qsl(body)] if '=' in body else []
+            item['body_fields'] = [k for k in fields if re.fullmatch(r'[\w.-]{1,64}', k)][:20]
+            item['replay'] = 'requires_agent_review_and_existing_write_permission'
+        examples.append(item)
+    # Prefer API requests and signed-in examples over repeated static resources.
+    return sorted(examples, key=lambda e: (e['method'] != 'POST',
+        not bool(re.search(r'/api(?:/|$)|/graphql(?:/|$)', urlsplit(e['url']).path)),
+        e['account'] is None))[:96]
+
+
+def saved_requests(scope, directory):
+    records = []
+    for path in sorted((directory / 'http-evidence').glob('*.json')):
+        try:
+            records.append(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            continue
+    return working_requests(scope, records)
+
+
 class Requests:
     def __init__(self, scope, deadline, fetch=request, account=None, limit=48, discovery=True):
         self.scope, self.deadline, self.fetch = scope, deadline, fetch
         self.account, self.limit = account, limit
         self.discovery = discovery
         self.records, self.replies, self.gaps = [], {}, []
+        self.observations, self.verified_accounts = [], []
         self.calls = 0
         self.slowest_request_seconds = 0.0
         self.lock = threading.Lock()
@@ -312,8 +363,11 @@ def schema_checks(client, urls, execute=capture):
         with tempfile.TemporaryDirectory(prefix='patchriot-schema-') as directory:
             schema_path = Path(directory) / 'schema.json'
             schema_path.write_text(json.dumps(schema))
+            observations_path = Path(directory) / 'observed.json'
+            observations_path.write_text(json.dumps([e for e in client.observations
+                if e['method'] == 'GET' and e['account'] == client.account]))
             generated = execute([sys.executable, str(Path(__file__).with_name('schema_cases.py')), str(schema_path), base,
-                                 str(slots), ','.join(client.scope['methods'])],
+                                 str(slots), ','.join(client.scope['methods']), str(observations_path)],
                                 timeout=max(1, min(25, client.deadline - time.monotonic())))
             if generated['failure'] or generated['exit_code'] != 0:
                 client.gaps.append('schema_generation_incomplete')
@@ -328,6 +382,7 @@ def schema_checks(client, urls, execute=capture):
                 results.append({'evidence_id': evidence.get('id'), 'status': evidence.get('status'),
                                 'server_error': (evidence.get('status') or 0) >= 500,
                                 'generation_mode': case.get('generation_mode'), 'operation': case.get('operation'),
+                                'source_evidence_id': case.get('source_evidence_id'),
                                 'status_declared': str(evidence.get('status')) in case.get('expected_statuses', []) or 'default' in case.get('expected_statuses', []) or str(evidence.get('status', ''))[:1] + 'XX' in case.get('expected_statuses', [])})
             client.gaps.extend(cases['gaps'])
             client.gaps.extend(cases.get('sampling_limits', []))
@@ -337,6 +392,7 @@ def schema_checks(client, urls, execute=capture):
                               **{k: cases.get(k) for k in ['operations_total', 'operations_eligible', 'operations_selected',
                                   'case_limit', 'generation_modes_unavailable', 'deferred_operations_count', 'deferred_operations', 'limitations']},
                               'generated_cases': len(cases['cases']), 'attempted_cases': len(results) - before,
+                              'observed_baselines': sum(row.get('generation_mode') == 'observed' for row in results[before:]),
                               'executed_cases': sum(isinstance(row.get('status'), int) for row in results[before:]),
                               'operations_tested': len({row['operation'] for row in results[before:]
                                                        if isinstance(row.get('status'), int)}),

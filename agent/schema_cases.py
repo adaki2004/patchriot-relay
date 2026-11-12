@@ -3,12 +3,49 @@ import json
 from pathlib import Path
 import re
 import sys
-from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from web_tools import allowed
 
 READ_METHODS = ('GET', 'HEAD', 'OPTIONS')
 UNSAFE_READ = re.compile(r'(?:^|[/_-])(logout|signout|delete|destroy|reset|revoke|unsubscribe)(?:$|[/_.?-])', re.I)
+SENSITIVE_QUERY = re.compile(r'token|secret|password|passwd|signature|credential|api.?key|authorization|session|code|jwt', re.I)
+
+
+def reusable_url(origin, url):
+    """Exclude session links and action URLs from automatic replay."""
+    if not isinstance(url, str) or len(url) > 2048:
+        return False
+    try:
+        parts = urlsplit(url)
+        return (allowed(origin, url) and not parts.fragment and not UNSAFE_READ.search(unquote(parts.path))
+                and not re.search(r'login|signin|callback|oauth|/auth(?:/|$)', unquote(parts.path), re.I)
+                and not any(SENSITIVE_QUERY.search(k) for k, _ in parse_qsl(parts.query))
+                and not re.search(r'redacted|\[filtered\]', url, re.I))
+    except ValueError:
+        return False
+
+
+def observed_operation(operation, base, observations):
+    """Match a working URL to this operation; retain IDs instead of inventing them."""
+    if operation.method.upper() != 'GET':
+        return None
+    names = re.findall(r'\{([^{}]+)\}', operation.path)
+    parsed = urlsplit(base)
+    origin = parsed.scheme + '://' + parsed.netloc
+    pattern = re.escape(parsed.path.rstrip('/') + operation.path)
+    for name in names:
+        pattern = pattern.replace(re.escape('{' + name + '}'), '([^/]+)', 1)
+    for e in observations:
+        if e.get('method') != 'GET' or not reusable_url(origin, e.get('url')):
+            continue
+        match = re.fullmatch(pattern, urlsplit(e['url']).path)
+        if match:
+            parameters = {name: unquote(value) for name, value in zip(names, match.groups())}
+            if any('/' in v or v in ('.', '..') for v in parameters.values()):
+                continue
+            return e, parameters
+    return None
 
 
 def base_candidates(document, schema_url, observed_urls):
@@ -87,7 +124,7 @@ def check_references(value, depth=0):
             check_references(child, depth + 1)
 
 
-def generate(document, origin, max_cases=48, methods=READ_METHODS):
+def generate(document, origin, max_cases=48, methods=READ_METHODS, observations=()):
     import schemathesis
     from hypothesis import given, settings, Phase, HealthCheck
     from hypothesis.errors import Unsatisfiable
@@ -137,9 +174,18 @@ def generate(document, origin, max_cases=48, methods=READ_METHODS):
             if len(cases) >= max_cases:
                 sampled = True
                 break
+            observed = None if graphql_mode else observed_operation(operation, origin, observations)
+            responses = {} if graphql_mode else document.get('paths', {}).get(operation.path, {}).get(operation.method.lower(), {}).get('responses', {})
+            if observed and mode == schemathesis.GenerationMode.POSITIVE:
+                e, _ = observed
+                cases.append({'method': 'GET', 'url': e['url'], 'generation_mode': 'observed',
+                              'operation': operation.label, 'source_evidence_id': e.get('evidence_id'),
+                              'expected_statuses': list(responses)[:32]})
+                continue
             @settings(max_examples=1, derandomize=True, database=None, deadline=None,
                       phases=[Phase.generate], suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much])
-            @given(case=operation.as_strategy(generation_mode=mode))
+            @given(case=operation.as_strategy(generation_mode=mode,
+                **({'path_parameters': observed[1]} if observed else {})))
             def collect(case):
                 kwargs = schema.as_transport_kwargs(case, base_url=origin, headers={})
                 url = kwargs['url']
@@ -149,8 +195,9 @@ def generate(document, origin, max_cases=48, methods=READ_METHODS):
                 generated = {'method': case.method.upper(), 'url': url, 'generation_mode': mode.value,
                              'operation': operation.label}
                 if not graphql_mode:
-                    responses = document.get('paths', {}).get(operation.path, {}).get(operation.method.lower(), {}).get('responses', {})
                     generated['expected_statuses'] = list(responses)[:32]
+                    if observed:
+                        generated['source_evidence_id'] = observed[0].get('evidence_id')
                 if graphql_mode:
                     from graphql import parse, OperationDefinitionNode, OperationType
                     payload = kwargs.get('json', {})
@@ -184,4 +231,5 @@ if __name__ == '__main__':
     if len(raw) > 256 * 1024:
         raise ValueError('schema_size_limit')
     print(json.dumps(generate(json.loads(raw), sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 48,
-                              sys.argv[4].split(',') if len(sys.argv) > 4 else READ_METHODS)))
+                              sys.argv[4].split(',') if len(sys.argv) > 4 else READ_METHODS,
+                              json.loads(Path(sys.argv[5]).read_text()) if len(sys.argv) > 5 else [])))

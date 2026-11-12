@@ -7,9 +7,11 @@ time is divided by the deep_checks slot scheduler.
 """
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import re
+import json
 import time
 
 from scoped_scanners import Requests
+from schema_cases import reusable_url
 from web_tools import allowed  # noqa: F401
 from deep_checks import scoped_url
 
@@ -222,66 +224,105 @@ def inputs(client, urls):
             'limitations': ['Observed parameters or a small common-parameter sample; no wordlist mining, no payload execution, GET only.']}
 
 
-def normalise(text):
-    text = re.sub(r'[0-9a-f]{8,}', '#', text or '')
-    text = re.sub(r'\d+', '#', text)
-    return re.sub(r'\s+', ' ', text).strip()[:4000]
+def comparable_body(reply):
+    """Compare complete JSON without erasing object IDs or private field values."""
+    e = reply.get('evidence', {})
+    body = reply.get('body', '')
+    if (e.get('error') or reply.get('error') or e.get('truncated') or reply.get('body_truncated')
+            or not isinstance(body, str) or re.search(r'redacted|\[filtered\]', body, re.I)):
+        return None
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(value, (dict, list)) or not value or (isinstance(value, dict) and value.get('error')):
+        return None
+    return json.dumps(value, sort_keys=True, separators=(',', ':'))
+
+
+def access_matches(reply, account):
+    e = reply.get('evidence', {})
+    actual = (e.get('account') or 'testing') if e.get('authenticated') else None
+    return not e.get('login') and not e.get('error') and not reply.get('error') and actual == account
 
 
 def cross_account(client, urls):
-    """Fetch candidate objects as the first account, then the others."""
+    """Re-read observed objects in verified contexts, with a repeated baseline.
+
+    These are comparison leads. Ownership and whether data should be private
+    still need evidence; two configured account slots do not establish either.
+    """
     if client.account:
         return {'deferred': 'runs once per suite'}
     if not client.scope.get('authentication'):
         return {'not_applicable': 'No account was requested for this black-box test.'}
-    accounts = ['testing', 'reference'] if client.scope.get('account_policy') else ['testing']
-    seeds = [u for u in urls if OBJECT.search(urlsplit(u).path + '?' + urlsplit(u).query)][:8]
+    accounts = [a for a in ('testing', 'reference') if a in client.verified_accounts]
+    if not accounts:
+        return {'not_applicable': 'No verified account context is available.'}
+    seeds, seen = [], set()
+    for e in client.observations:
+        url, account = e.get('url', ''), e.get('account')
+        if (e.get('method') != 'GET' or account not in accounts or (url, account) in seen
+                or not any(reusable_url(o, url) for o in client.scope['origins'])
+                or not OBJECT.search(urlsplit(url).path + '?' + urlsplit(url).query)):
+            continue
+        seen.add((url, account)); seeds.append(e)
     if not seeds:
-        return {'not_applicable': 'No object-shaped route was observed; object access was not tested.'}
-    anonymous = client
-    sides = {'anonymous': anonymous}
-    for account in accounts:
-        sides[account] = Requests(client.scope, client.deadline, client.fetch, account,
-                                  limit=min(12, client.limit), discovery=True)
-    rows, compared = [], 0
-    for url in seeds:
-        if client.calls >= client.limit:
-            client.gaps.append('cross_account_limit')
+        return {'not_applicable': 'No successful signed-in object request was observed; object access was not tested.'}
+    sides = {a: Requests(client.scope, client.deadline, client.fetch, a,
+                         limit=min(12, client.limit), discovery=True) for a in accounts}
+    sides[None] = client
+
+    def fetch(account, url):
+        side = sides[account]
+        result = side('GET', url)
+        if account:
+            # Every account uses the same overall request and timing allowance.
+            client.calls += 1
+            client.slowest_request_seconds = max(client.slowest_request_seconds, side.slowest_request_seconds)
+            client.records.extend(side.records); side.records.clear()
+            client.replies.update(side.replies); side.replies.clear()
+            client.gaps.extend(side.gaps); side.gaps.clear()
+        return result
+
+    rows = []
+    for seed in seeds[:8]:
+        owner, url = seed['account'], seed['url']
+        others = [a for a in accounts if a != owner] + [None]
+        if not client.can_start(2 + len(others)):
             break
-        replies = {}
-        for name, side in sides.items():
-            replies[name] = side('GET', url)
-        codes = {name: status(reply)[0] for name, reply in replies.items()}
-        bodies = {name: normalise(reply.get('body', '')) for name, reply in replies.items()}
-        for left in accounts:
-            if left not in replies:
-                continue
-            compared += 1
-            left_ok = codes.get(left) and 200 <= codes[left] < 300
-            row = {'url': url, 'account': left, 'status': codes[left],
-                   'anonymous_status': codes.get('anonymous')}
-            for right in [a for a in accounts if a != left] + ['anonymous']:
-                if right == left:
-                    continue
-                right_ok = codes.get(right) and 200 <= codes[right] < 300
-                verdict = 'other'
-                if left_ok and right_ok:
-                    verdict = 'same' if bodies[left] == bodies[right] else 'differs'
-                elif left_ok and codes.get(right) in (401, 403, 404):
-                    verdict = 'denied_for_other'
-                elif left_ok:
-                    verdict = 'unreachable_for_other'
-                row[right] = verdict
-                row['compared_with'] = right
-            rows.append(row)
-    for name, side in sides.items():
-        if name != 'anonymous':
-            anonymous.records.extend(side.records)
-            anonymous.gaps.extend(side.gaps)
-    interesting = [r for r in rows if any(v == 'differs' or v == 'denied_for_other'
-                                          for k, v in r.items() if k in accounts + ['anonymous'])]
-    return {'compared': compared, 'interesting': interesting[:12], 'rows': rows[:16],
-            'limitations': ['At most eight objects and twelve requests per account; body differences are normalised, not proven disclosure.']}
+        if any(sides[a].calls + (2 if a == owner else 1) > sides[a].limit for a in accounts):
+            client.gaps.append('route_sample_limit'); break
+        baseline = fetch(owner, url)
+        comparisons = {a: fetch(a, url) for a in others}
+        repeated = fetch(owner, url)
+        baseline_body = comparable_body(baseline)
+        stable = (access_matches(baseline, owner) and access_matches(repeated, owner)
+                  and all(isinstance(status(r)[0], int) and 200 <= status(r)[0] < 300 for r in (baseline, repeated))
+                  and baseline_body is not None and baseline_body == comparable_body(repeated))
+        if not access_matches(baseline, owner) or not access_matches(repeated, owner):
+            client.gaps.append('account_comparison_context_unverified')
+        row = {'url': url, 'source_account': owner, 'source_evidence_id': seed.get('evidence_id'),
+               'baseline_evidence_id': baseline.get('evidence', {}).get('id'),
+               'repeat_evidence_id': repeated.get('evidence', {}).get('id'),
+               'baseline_stable': stable, 'ownership_requires_confirmation': True, 'comparisons': []}
+        for account, response in comparisons.items():
+            code = status(response)[0]
+            verdict = 'inconclusive'
+            if not access_matches(response, account):
+                client.gaps.append('account_comparison_context_unverified')
+            elif stable and code in (401, 403, 404):
+                verdict = 'denied'
+            elif stable and isinstance(code, int) and 200 <= code < 300 and comparable_body(response) is not None:
+                verdict = 'same_content' if baseline_body == comparable_body(response) else 'different_content'
+            row['comparisons'].append({'account': account or 'anonymous', 'status': code,
+                'evidence_id': response.get('evidence', {}).get('id'), 'result': verdict})
+        rows.append(row)
+    return {'compared': len(rows), 'rows': rows, 'verified_accounts': accounts,
+            'second_account_available': len(accounts) == 2,
+            'limitations': ['At most eight observed objects; twelve requests per account within one shared cap.',
+                'Only complete stable JSON is compared. Shared/public data and same-user accounts can match normally.',
+                'Ownership, distinct users and expected privacy require separate evidence before claiming a leak.']}
 
 
 FAMILIES = [

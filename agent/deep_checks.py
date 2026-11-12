@@ -13,7 +13,7 @@ import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from live_http import request
-from scoped_scanners import Requests, discovery, schema_checks, zap, scanner_failure_reason, SAMPLING_LIMITS
+from scoped_scanners import Requests, discovery, schema_checks, zap, scanner_failure_reason, SAMPLING_LIMITS, saved_requests, working_requests
 from web_tools import allowed, record
 
 VERSION = '1'
@@ -149,6 +149,7 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
             ('zap', '2.17.0', zap, 100, 64),
         ]
     component_runs, details, all_evidence = [], [], {}
+    observations = saved_requests(scope, directory)
     seeds = {account: evidence_seeds(scope, directory, account) for account, _ in selected}
     seeds[None] = list(dict.fromkeys(
         [origin + path for origin in scope['origins'] for path in COMMON] + seeds[None]))
@@ -180,6 +181,8 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
             slice_seconds = min(seconds, max(0, (deadline - time.monotonic()) * seconds / remaining_weight))
             client = Requests(scope, min(deadline, time.monotonic() + slice_seconds), fetch,
                               account, limit=limit, discovery=True)
+            client.observations = observations + working_requests(scope, all_evidence.values())
+            client.verified_accounts = [a for a, _ in selected if a]
             context_started = time.monotonic()
             urls = seeds[account]
             if function == schema_checks:
@@ -249,6 +252,9 @@ def run(scope, previous_tools, access, deadline, fetch=request, emit=lambda _: N
         summary['limitations'].append('API schema cases were sampled across eligible operations; inspect the schema receipt for tested and deferred counts. State-changing operations require agent review and existing permissions.')
     (directory / ('deep-results.json' if deep else 'discovery-results.json')).write_text(
         json.dumps({**summary, 'details': details}))
+    (directory / 'working-requests.json').write_text(json.dumps({
+        'examples': observations + working_requests(scope, all_evidence.values()),
+        'instructions': 'Use source evidence IDs to inspect working requests. Field names are hints, not bodies to replay. All changes still require the saved scope; never copy login secrets or automatically repeat writes.'}))
     receipt = record(suite_tool, VERSION, arguments, started, observed, sorted(all_evidence),
                      json.dumps(summary), 0, 'incomplete' if incomplete else None)
     emit(receipt)

@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import coverage_ledger
 import schema_cases
@@ -38,6 +39,44 @@ class ScopedScannerTests(unittest.TestCase):
         self.assertEqual(client('GET', 'https://owned.example/')['evidence']['account'], 'reference')
         self.assertIn('error', client('GET', 'https://owned.example/'))
         self.assertEqual(len(self.calls), 1)
+
+    def test_working_examples_retain_context_and_fields_without_body_values(self):
+        origin = self.scope['origins'][0]
+        base = {'id': 10, 'method': 'GET', 'url': origin + '/api/items/42', 'status': 200}
+        rows = [base, {**base, 'id': 11, 'authenticated': True, 'account': 'reference'},
+                {**base, 'id': 12, 'method': 'POST', 'request_body_excerpt': '{"title":"private-value","count":2}'},
+                {**base, 'id': 13, 'login': True}, {**base, 'url': origin + '/api/items/42?token=secret'},
+                {**base, 'url': origin + '/auth/callback?code=secret'},
+                {**base, 'url': origin + '/reset/42'}, {**base, 'url': 'https://elsewhere.example/api/items/42'},
+                {**base, 'status': 403}, {**base, 'error': 'failed'}]
+        examples = scanners.working_requests(self.scope, rows)
+        self.assertEqual(len(examples), 3)
+        post = next(e for e in examples if e['method'] == 'POST')
+        self.assertEqual(post['body_fields'], ['title', 'count'])
+        self.assertIn('existing_write_permission', post['replay'])
+        self.assertNotIn('private-value', json.dumps(examples))
+        self.assertEqual({e['account'] for e in examples}, {None, 'reference'})
+
+    def test_schema_receives_only_working_gets_from_its_own_context(self):
+        client = scanners.Requests(self.scope, time.monotonic() + 30, self.fetch, 'testing')
+        client.observations = [{'method': method, 'account': account, 'url': 'https://owned.example/items/42', 'evidence_id': i}
+            for i, (method, account) in enumerate([('GET', None), ('GET', 'testing'), ('GET', 'reference'), ('POST', 'testing')], 1)]
+        def generate(argv, **kwargs):
+            data = json.loads(Path(argv[6]).read_text())
+            self.assertEqual([e['evidence_id'] for e in data], [2])
+            return {'exit_code': 0, 'failure': None, 'output': '{"cases": [], "gaps": []}'}
+        with patch.object(scanners, 'schema_base', return_value=('https://owned.example', 'declared_server')):
+            scanners.schema_checks(client, ['https://owned.example/openapi.json'], execute=generate)
+
+    def test_observed_operation_matches_mounts_and_keeps_the_exact_origin(self):
+        operation = SimpleNamespace(method='get', path='/items/{id}')
+        base = 'https://owned.example/api'
+        for url, matches in [(base + '/items/42?limit=2', True),
+            ('https://owned.example/items/42', False), ('https://other.example/api/items/42', False),
+            (base + '/items/%2f', False), (base + '/items/42?token=private', False)]:
+            value = schema_cases.observed_operation(operation, base, [{'method': 'GET', 'url': url}])
+            self.assertEqual(value is not None, matches)
+            if matches: self.assertEqual(value[1], {'id': '42'})
 
     def test_probes_retain_controls_and_account_context(self):
         client = scanners.Requests(self.scope, time.monotonic() + 5, self.fetch)
@@ -358,6 +397,21 @@ class ScopedScannerTests(unittest.TestCase):
         self.assertTrue(result['cases'])
         self.assertLessEqual(len(result['cases']), 48)
         self.assertTrue(all(c['method'] == 'GET' and c['url'].startswith('https://owned.example/items') for c in result['cases']))
+
+    @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
+    def test_real_schema_uses_observed_ids_and_retains_a_fresh_baseline(self):
+        document = {**SCHEMA, 'paths': {'/items/{id}': {'get': {
+            'parameters': [{'name': 'id', 'in': 'path', 'required': True, 'schema': {'type': 'integer'}},
+                           {'name': 'limit', 'in': 'query', 'required': True, 'schema': {'type': 'integer', 'minimum': 0, 'maximum': 3}}],
+            'responses': {'200': {'description': 'Owned object'}}}}}}
+        url = 'https://owned.example/api/items/42?limit=2'
+        result = schema_cases.generate(document, 'https://owned.example/api', observations=[
+            {'method': 'GET', 'url': url, 'evidence_id': 123}])
+        self.assertEqual(result['cases'][0]['url'], url)
+        self.assertEqual(result['cases'][0]['generation_mode'], 'observed')
+        self.assertTrue(any(c['generation_mode'] == 'negative' for c in result['cases']))
+        self.assertTrue(all(c['source_evidence_id'] == 123 for c in result['cases']))
+        self.assertTrue(all('/items/42?' in c['url'] for c in result['cases']))
 
     @unittest.skipUnless(os.environ.get('PATCHRIOT_SCANNER_FIXTURE') == '1', 'requires built scanner image')
     def test_real_schema_sample_covers_distinct_operations_and_preserves_post_for_agent_review(self):

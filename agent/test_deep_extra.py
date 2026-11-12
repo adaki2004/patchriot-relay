@@ -154,46 +154,105 @@ class InputTests(unittest.TestCase):
 
 
 class CrossAccountTests(unittest.TestCase):
-    def sc(self):
-        return scope(authentication='session', account_policy={'allow_password_changes': False})
+    def client(self, fetch=None, accounts=('testing', 'reference'), limit=40):
+        client = Client(fetch or self.fetch, sc=scope(authentication='session',
+            account_policy={'allow_password_changes': False}), limit=limit)
+        client.verified_accounts = list(accounts)
+        client.observations = [{'method': 'GET', 'url': ORIGIN + '/api/orders/' + str(i),
+            'account': 'reference' if i == 2 else 'testing', 'evidence_id': i + 100} for i in (1, 2, 3)]
+        return client
 
-    def fetch(self, method, url, headers=None, account=None, **kwargs):
-        if url.endswith('/orders/2'):
-            return reply(url, 200, '{"owner":"b"}') if account == 'reference' else reply(url, 403, 'no')
-        if url.endswith('/orders/3'):
-            return reply(url, 200, '{"owner":"a"}' if account != 'reference' else '{"owner":"b"}')
-        return reply(url, 200, '{"owner":"a"}') if account != 'reference' else reply(url, 403, 'no')
+    def fetch(self, method, url, headers=None, account=None, authenticated=False, **kwargs):
+        owner = 'reference' if url.endswith('/2') else 'testing'
+        value = reply(url, 200 if authenticated and account == owner else 403,
+            json.dumps({'id': url.rsplit('/', 1)[-1], 'owner': owner}))
+        value['evidence'].update(authenticated=authenticated, account=account)
+        return value
 
-    def test_denied_object_for_the_other_account_is_flagged(self):
-        client = Client(self.fetch, sc=self.sc())
-        detail = extra.cross_account(client, [ORIGIN + '/api/orders/1', ORIGIN + '/api/orders/2',
-                                             ORIGIN + '/api/orders/3'])
-        verdicts = {value for row in detail['rows'] for key, value in row.items()
-                    if key in ('testing', 'reference', 'anonymous')}
-        self.assertIn('denied_for_other', verdicts)
-        self.assertIn('differs', verdicts)
-        # The account clients' records are merged so receipts stay honest.
-        self.assertGreaterEqual(len(client.records), 4)
+    def test_objects_are_repeated_in_the_original_context_with_fresh_comparison_ids(self):
+        client = self.client()
+        result = extra.cross_account(client, [ORIGIN + '/'])
+        self.assertEqual(result['compared'], 3)
+        self.assertEqual(client.calls, 12)
+        self.assertEqual(len(client.records), 12)
+        for row in result['rows']:
+            self.assertTrue(row['baseline_stable'])
+            self.assertTrue(row['ownership_requires_confirmation'])
+            self.assertNotEqual(row['baseline_evidence_id'], row['repeat_evidence_id'])
+            self.assertTrue(all(c['result'] == 'denied' for c in row['comparisons']))
 
-    def test_black_box_does_not_claim_account_checks_or_fail_for_no_account(self):
-        client = Client(self.fetch)
-        detail = extra.cross_account(client, [ORIGIN + '/api/orders/1'])
-        self.assertEqual(client.gaps, [])
-        self.assertIn('not_applicable', detail)
-        self.assertEqual(client.calls, 0)
-
-    def test_authenticated_transport_failures_are_not_lost_when_merging_accounts(self):
+    def test_public_shared_objects_are_leads_not_automatic_leaks(self):
         def fetch(method, url, headers=None, **kwargs):
-            if kwargs.get('authenticated'):
-                return {'error': 'transport_error'}
-            return reply(url)
-        client = Requests(self.sc(), time.monotonic() + 60, fetch, limit=40)
-        extra.cross_account(client, [ORIGIN + '/api/orders/1'])
+            value = reply(url, body='{"id":1,"visibility":"public"}')
+            value['evidence'].update(authenticated=kwargs['authenticated'], account=kwargs['account'])
+            return value
+        result = extra.cross_account(self.client(fetch), [])
+        self.assertTrue(all(r['ownership_requires_confirmation'] for r in result['rows']))
+        self.assertTrue(all(c['result'] == 'same_content' for r in result['rows'] for c in r['comparisons']))
+        self.assertIn('distinct users', ' '.join(result['limitations']))
+
+    def test_distinct_object_ids_are_not_normalized_into_the_same_body(self):
+        def fetch(method, url, headers=None, **kwargs):
+            value = reply(url, body='{"id":"' + ('aaaaaaaa-1234' if kwargs['account'] == 'testing' else 'bbbbbbbb-5678') + '"}')
+            value['evidence'].update(authenticated=kwargs['authenticated'], account=kwargs['account'])
+            return value
+        result = extra.cross_account(self.client(fetch), [])
+        self.assertEqual(result['rows'][0]['comparisons'][0]['result'], 'different_content')
+
+    def test_unstable_html_truncated_and_redacted_responses_cannot_prove_a_match(self):
+        for mode in ('unstable', 'html', 'truncated', 'redacted', 'empty', 'wrong_account'):
+            count = [0]
+            def fetch(method, url, headers=None, **kwargs):
+                count[0] += 1
+                value = reply(url, body=json.dumps({'id': count[0] if mode == 'unstable' else 1}))
+                value['evidence'].update(authenticated=kwargs['authenticated'], account=kwargs['account'])
+                if mode == 'html': value['body'] = '<html>generic shell</html>'
+                if mode == 'truncated': value['body_truncated'] = True
+                if mode == 'redacted': value['body'] = '{"id":"[REDACTED]"}'
+                if mode == 'empty': value['body'] = '{}'
+                if mode == 'wrong_account': value['evidence']['authenticated'] = False
+                return value
+            with self.subTest(mode=mode):
+                result = extra.cross_account(self.client(fetch), [])
+                self.assertTrue(all(not r['baseline_stable'] for r in result['rows']))
+                self.assertTrue(all(c['result'] == 'inconclusive' for r in result['rows'] for c in r['comparisons']))
+
+    def test_one_account_still_has_an_anonymous_control(self):
+        client = self.client(accounts=('testing',))
+        result = extra.cross_account(client, [])
+        self.assertFalse(result['second_account_available'])
+        self.assertEqual(result['compared'], 2)
+        self.assertTrue(all([c['account'] for c in r['comparisons']] == ['anonymous'] for r in result['rows']))
+        self.assertEqual(client.calls, 6)
+
+    def test_shared_budget_reserves_a_complete_group_and_skips_unsafe_candidates(self):
+        client = self.client(limit=6)
+        client.observations.insert(0, {'method': 'GET', 'url': ORIGIN + '/api/orders/1?token=private', 'account': 'testing'})
+        result = extra.cross_account(client, [])
+        self.assertEqual(client.calls, 4)
+        self.assertEqual(result['compared'], 1)
+        self.assertIn('route_sample_limit', client.gaps)
+        self.assertTrue(all('token=' not in e['url'] for e in client.records))
+
+    def test_black_or_unverified_or_unobserved_accounts_are_not_queried(self):
+        for setup in ('black', 'unverified', 'unobserved'):
+            client = self.client()
+            if setup == 'black': client.scope.pop('authentication')
+            if setup == 'unverified': client.verified_accounts = []
+            if setup == 'unobserved': client.observations = []
+            self.assertIn('not_applicable', extra.cross_account(client, [ORIGIN + '/api/orders/1']))
+            self.assertEqual(client.calls, 0)
+
+    def test_transport_failures_and_expired_contexts_remain_visible(self):
+        client = self.client(lambda *a, **kw: {'error': 'transport_error'})
+        result = extra.cross_account(client, [])
         self.assertIn('transport_error', client.gaps)
+        self.assertIn('account_comparison_context_unverified', client.gaps)
+        self.assertTrue(all(not r['baseline_stable'] for r in result['rows']))
 
     def test_runs_once_on_the_anonymous_pass(self):
-        client = Client(self.fetch, sc=self.sc(), account='testing')
-        self.assertIn('deferred', extra.cross_account(client, [ORIGIN + '/api/orders/1']))
+        client = self.client(); client.account = 'testing'
+        self.assertIn('deferred', extra.cross_account(client, []))
 
 
 class SuiteTests(unittest.TestCase):
